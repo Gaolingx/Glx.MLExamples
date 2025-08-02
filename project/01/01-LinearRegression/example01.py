@@ -49,7 +49,7 @@ def train_model():
     # 初始化模型、损失函数和优化器
     model = LinearRegressionModel()
     criterion = nn.MSELoss()  # 均方误差损失
-    optimizer = optim.SGD(model.parameters(), lr=1e-1)
+    optimizer = optim.SGD(model.parameters(), lr=5e-2)
 
     # 训练参数
     num_epochs = 500

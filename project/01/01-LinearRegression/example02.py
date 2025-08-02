@@ -4,6 +4,7 @@ import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 
+# 拟合非线性函数（正弦波加高斯噪声）
 
 # 1. 生成非线性数据集 (正弦函数 + 高斯噪声)
 def generate_dataset(num_samples=1000):
