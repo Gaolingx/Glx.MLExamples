@@ -4,12 +4,13 @@ import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 
+
 # 拟合非线性函数（正弦波加高斯噪声）
 
 # 1. 生成非线性数据集 (正弦函数 + 高斯噪声)
 def generate_dataset(num_samples=1000):
     np.random.seed(42)
-    x = np.linspace(-5, 5, num_samples)
+    x = np.linspace(-10, 10, num_samples)
     # 非线性函数: 正弦波 + 高斯噪声
     y = np.sin(x) * 2 + np.cos(x * 1.5) * 1.5 + 0.5 * np.random.normal(size=num_samples)
     return x, y
@@ -47,6 +48,9 @@ def train_model(model, x_train, y_train, epochs=1000, lr=0.01, batch_size=64):
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
+    # 添加学习率调度器 - 使用余弦退火
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
+
     # 训练循环
     losses = []
     print("开始训练...")
@@ -64,13 +68,17 @@ def train_model(model, x_train, y_train, epochs=1000, lr=0.01, batch_size=64):
 
             epoch_loss += loss.item()
 
+        # 更新学习率
+        scheduler.step()
+
         # 计算平均epoch loss
         epoch_loss /= len(dataloader)
         losses.append(epoch_loss)
 
         # 每10个epoch打印一次
         if (epoch + 1) % 10 == 0:
-            print(f'Epoch [{epoch + 1}/{epochs}], Loss: {epoch_loss:.6f}')
+            current_lr = scheduler.get_last_lr()[0]
+            print(f'Epoch [{epoch + 1}/{epochs}], Loss: {epoch_loss:.6f}, LR: {current_lr:.2e}')
 
     print("训练完成!")
     return losses
@@ -100,7 +108,7 @@ def plot_results(x, y_true, y_pred):
 # 主程序
 if __name__ == "__main__":
     # 生成数据集
-    x, y = generate_dataset(1500)
+    x, y = generate_dataset(2500)
 
     # 创建模型实例
     model = NonlinearRegressor(hidden_size=256)
@@ -110,7 +118,7 @@ if __name__ == "__main__":
         model,
         x, y,
         epochs=500,
-        lr=5e-5,
+        lr=1e-4,
         batch_size=128
     )
 
@@ -124,7 +132,7 @@ if __name__ == "__main__":
     plt.show()
 
     # 推理并可视化
-    test_x = np.linspace(-5.5, 5.5, 500)
+    test_x = np.linspace(-10.5, 10.5, 500)
     pred_y = predict(model, test_x)
 
     # 可视化拟合结果
