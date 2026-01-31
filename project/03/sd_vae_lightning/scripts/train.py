@@ -206,7 +206,7 @@ def main():
         max_epochs=train_config_section.get("num_epochs", 100),
         precision=train_config_section.get("precision", "16-mixed"),
         accumulate_grad_batches=train_config_section.get("accumulate_grad_batches", 1),
-        gradient_clip_val=train_config_section.get("gradient_clip_val", 1.0),
+        # gradient_clip_val=train_config_section.get("gradient_clip_val", 1.0),
         log_every_n_steps=logging_config.get("log_every_n_steps", 50),
         val_check_interval=logging_config.get("val_check_interval", 500),
         logger=logger,

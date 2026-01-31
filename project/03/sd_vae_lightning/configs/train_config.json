@@ -1,7 +1,7 @@
 {
     "training": {
         "seed": 42,
-        "batch_size": 4,
+        "batch_size": 1,
         "num_epochs": 100,
         "learning_rate": 4.5e-6,
         "disc_learning_rate": 4.5e-6,
@@ -20,7 +20,7 @@
         "disc_loss_type": "hinge"
     },
     "data": {
-        "dataset_name": "lambdalabs/pokemon-blip-captions",
+        "dataset_name": "huggan/flowers-102-categories",
         "image_column": "image",
         "resolution": 512,
         "center_crop": true,
@@ -33,7 +33,7 @@
         "mode": "min"
     },
     "logging": {
-        "log_every_n_steps": 50,
+        "log_every_n_steps": 5,
         "val_check_interval": 500,
         "log_images_every_n_steps": 500,
         "num_val_images": 4

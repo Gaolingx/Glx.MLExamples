@@ -1,36 +1,35 @@
 """
 AutoencoderKL - Variational Autoencoder with KL divergence loss.
-Compatible with Stable Diffusion 1.5 weights.
+Compatible with Stable Diffusion 1.5 weights using diffusers backend.
 """
 
 from typing import Optional, Tuple, Union, Dict, Any
 import json
 from pathlib import Path
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 
-from .vae import (
-    Encoder,
-    Decoder,
-    DiagonalGaussianDistribution,
-    DecoderOutput,
-)
+
+@dataclass
+class DecoderOutput:
+    """Output of decoding method."""
+    sample: torch.Tensor
 
 
+@dataclass
 class AutoencoderKLOutput:
     """Output of AutoencoderKL encode method."""
-
-    def __init__(self, latent_dist: DiagonalGaussianDistribution):
-        self.latent_dist = latent_dist
+    latent_dist: Any  # DiagonalGaussianDistribution
 
 
 class AutoencoderKL(nn.Module):
     """
-    Variational Autoencoder (VAE) with KL divergence loss for encoding images
-    into latents and decoding latent representations into images.
-
-    This implementation is compatible with Stable Diffusion 1.5 VAE weights.
+    Variational Autoencoder (VAE) with KL divergence loss.
+    
+    This is a wrapper around diffusers AutoencoderKL for compatibility
+    with Stable Diffusion 1.5 weights while providing a clean interface.
 
     Args:
         in_channels: Number of input image channels.
@@ -89,57 +88,48 @@ class AutoencoderKL(nn.Module):
         self.scaling_factor = scaling_factor
         self.latent_channels = latent_channels
 
-        # Encoder
-        self.encoder = Encoder(
-            in_channels=in_channels,
-            out_channels=latent_channels,
-            down_block_types=down_block_types,
-            block_out_channels=block_out_channels,
-            layers_per_block=layers_per_block,
-            act_fn=act_fn,
-            norm_num_groups=norm_num_groups,
-            double_z=True,
-            mid_block_add_attention=mid_block_add_attention,
-        )
+        # Use diffusers AutoencoderKL as backend
+        from diffusers import AutoencoderKL as DiffusersAutoencoderKL
 
-        # Decoder
-        self.decoder = Decoder(
-            in_channels=latent_channels,
+        self._vae = DiffusersAutoencoderKL(
+            in_channels=in_channels,
             out_channels=out_channels,
+            down_block_types=down_block_types,
             up_block_types=up_block_types,
             block_out_channels=block_out_channels,
             layers_per_block=layers_per_block,
-            norm_num_groups=norm_num_groups,
             act_fn=act_fn,
-            mid_block_add_attention=mid_block_add_attention,
+            latent_channels=latent_channels,
+            norm_num_groups=norm_num_groups,
+            sample_size=sample_size,
+            scaling_factor=scaling_factor,
         )
 
-        # Quantization convolutions
-        self.quant_conv = (
-            nn.Conv2d(2 * latent_channels, 2 * latent_channels, 1)
-            if use_quant_conv
-            else None
-        )
-        self.post_quant_conv = (
-            nn.Conv2d(latent_channels, latent_channels, 1)
-            if use_post_quant_conv
-            else None
-        )
+    @property
+    def encoder(self):
+        """Access encoder for gradient computation."""
+        return self._vae.encoder
 
-        # Tiling settings
-        self.use_slicing = False
-        self.use_tiling = False
-        self.tile_sample_min_size = sample_size
-        self.tile_latent_min_size = int(
-            sample_size / (2 ** (len(block_out_channels) - 1))
-        )
-        self.tile_overlap_factor = 0.25
+    @property
+    def decoder(self):
+        """Access decoder for gradient computation."""
+        return self._vae.decoder
+
+    @property
+    def quant_conv(self):
+        """Access quant_conv."""
+        return self._vae.quant_conv
+
+    @property
+    def post_quant_conv(self):
+        """Access post_quant_conv."""
+        return self._vae.post_quant_conv
 
     def encode(
         self,
         x: torch.Tensor,
         return_dict: bool = True,
-    ) -> Union[AutoencoderKLOutput, Tuple[DiagonalGaussianDistribution]]:
+    ) -> Union[AutoencoderKLOutput, Tuple]:
         """
         Encode images into latent distributions.
 
@@ -150,34 +140,10 @@ class AutoencoderKL(nn.Module):
         Returns:
             Latent distribution or tuple containing distribution.
         """
-        if self.use_slicing and x.shape[0] > 1:
-            # Process images one by one to save memory
-            encoded_slices = [self._encode(x_slice) for x_slice in x.split(1)]
-            h = torch.cat(encoded_slices)
-        else:
-            h = self._encode(x)
-
-        posterior = DiagonalGaussianDistribution(h)
-
+        result = self._vae.encode(x, return_dict=True)
         if not return_dict:
-            return (posterior,)
-
-        return AutoencoderKLOutput(latent_dist=posterior)
-
-    def _encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Internal encoding function."""
-        batch_size, num_channels, height, width = x.shape
-
-        if self.use_tiling and (
-            width > self.tile_sample_min_size or height > self.tile_sample_min_size
-        ):
-            return self._tiled_encode(x)
-
-        enc = self.encoder(x)
-        if self.quant_conv is not None:
-            enc = self.quant_conv(enc)
-
-        return enc
+            return (result.latent_dist,)
+        return AutoencoderKLOutput(latent_dist=result.latent_dist)
 
     def decode(
         self,
@@ -194,39 +160,10 @@ class AutoencoderKL(nn.Module):
         Returns:
             Decoded image or tuple containing image.
         """
-        if self.use_slicing and z.shape[0] > 1:
-            # Process latents one by one to save memory
-            decoded_slices = [self._decode(z_slice).sample for z_slice in z.split(1)]
-            decoded = torch.cat(decoded_slices)
-        else:
-            decoded = self._decode(z).sample
-
+        result = self._vae.decode(z, return_dict=True)
         if not return_dict:
-            return (decoded,)
-
-        return DecoderOutput(sample=decoded)
-
-    def _decode(
-        self,
-        z: torch.Tensor,
-        return_dict: bool = True,
-    ) -> Union[DecoderOutput, torch.Tensor]:
-        """Internal decoding function."""
-        if self.use_tiling and (
-            z.shape[-1] > self.tile_latent_min_size
-            or z.shape[-2] > self.tile_latent_min_size
-        ):
-            return self._tiled_decode(z, return_dict=return_dict)
-
-        if self.post_quant_conv is not None:
-            z = self.post_quant_conv(z)
-
-        dec = self.decoder(z)
-
-        if not return_dict:
-            return (dec,)
-
-        return DecoderOutput(sample=dec)
+            return (result.sample,)
+        return DecoderOutput(sample=result.sample)
 
     def forward(
         self,
@@ -300,130 +237,29 @@ class AutoencoderKL(nn.Module):
         z = z / self.scaling_factor
         return self.decode(z).sample
 
-    def _tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode using tiled approach for large images."""
-        overlap_size = int(self.tile_sample_min_size * (1 - self.tile_overlap_factor))
-        blend_extent = int(self.tile_latent_min_size * self.tile_overlap_factor)
-        row_limit = self.tile_latent_min_size - blend_extent
-
-        rows = []
-        for i in range(0, x.shape[2], overlap_size):
-            row = []
-            for j in range(0, x.shape[3], overlap_size):
-                tile = x[
-                    :,
-                    :,
-                    i : i + self.tile_sample_min_size,
-                    j : j + self.tile_sample_min_size,
-                ]
-                tile = self.encoder(tile)
-                if self.quant_conv is not None:
-                    tile = self.quant_conv(tile)
-                row.append(tile)
-            rows.append(row)
-
-        result_rows = []
-        for i, row in enumerate(rows):
-            result_row = []
-            for j, tile in enumerate(row):
-                if i > 0:
-                    tile = self._blend_v(rows[i - 1][j], tile, blend_extent)
-                if j > 0:
-                    tile = self._blend_h(row[j - 1], tile, blend_extent)
-                result_row.append(tile[:, :, :row_limit, :row_limit])
-            result_rows.append(torch.cat(result_row, dim=3))
-
-        return torch.cat(result_rows, dim=2)
-
-    def _tiled_decode(
-        self, z: torch.Tensor, return_dict: bool = True
-    ) -> Union[DecoderOutput, torch.Tensor]:
-        """Decode using tiled approach for large latents."""
-        overlap_size = int(self.tile_latent_min_size * (1 - self.tile_overlap_factor))
-        blend_extent = int(self.tile_sample_min_size * self.tile_overlap_factor)
-        row_limit = self.tile_sample_min_size - blend_extent
-
-        rows = []
-        for i in range(0, z.shape[2], overlap_size):
-            row = []
-            for j in range(0, z.shape[3], overlap_size):
-                tile = z[
-                    :,
-                    :,
-                    i : i + self.tile_latent_min_size,
-                    j : j + self.tile_latent_min_size,
-                ]
-                if self.post_quant_conv is not None:
-                    tile = self.post_quant_conv(tile)
-                decoded = self.decoder(tile)
-                row.append(decoded)
-            rows.append(row)
-
-        result_rows = []
-        for i, row in enumerate(rows):
-            result_row = []
-            for j, tile in enumerate(row):
-                if i > 0:
-                    tile = self._blend_v(rows[i - 1][j], tile, blend_extent)
-                if j > 0:
-                    tile = self._blend_h(row[j - 1], tile, blend_extent)
-                result_row.append(tile[:, :, :row_limit, :row_limit])
-            result_rows.append(torch.cat(result_row, dim=3))
-
-        dec = torch.cat(result_rows, dim=2)
-
-        if not return_dict:
-            return (dec,)
-
-        return DecoderOutput(sample=dec)
-
-    def _blend_v(
-        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
-    ) -> torch.Tensor:
-        """Blend two tensors vertically."""
-        blend_extent = min(a.shape[2], b.shape[2], blend_extent)
-        for y in range(blend_extent):
-            b[:, :, y, :] = a[:, :, -blend_extent + y, :] * (
-                1 - y / blend_extent
-            ) + b[:, :, y, :] * (y / blend_extent)
-        return b
-
-    def _blend_h(
-        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
-    ) -> torch.Tensor:
-        """Blend two tensors horizontally."""
-        blend_extent = min(a.shape[3], b.shape[3], blend_extent)
-        for x in range(blend_extent):
-            b[:, :, :, x] = a[:, :, :, -blend_extent + x] * (
-                1 - x / blend_extent
-            ) + b[:, :, :, x] * (x / blend_extent)
-        return b
-
     def enable_tiling(self):
         """Enable tiled VAE processing for memory efficiency."""
-        self.use_tiling = True
+        self._vae.enable_tiling()
 
     def disable_tiling(self):
         """Disable tiled VAE processing."""
-        self.use_tiling = False
+        self._vae.disable_tiling()
 
     def enable_slicing(self):
         """Enable sliced VAE processing for memory efficiency."""
-        self.use_slicing = True
+        self._vae.enable_slicing()
 
     def disable_slicing(self):
         """Disable sliced VAE processing."""
-        self.use_slicing = False
+        self._vae.disable_slicing()
 
     def enable_gradient_checkpointing(self):
         """Enable gradient checkpointing for memory efficiency."""
-        self.encoder.gradient_checkpointing = True
-        self.decoder.gradient_checkpointing = True
+        self._vae.enable_gradient_checkpointing()
 
     def disable_gradient_checkpointing(self):
         """Disable gradient checkpointing."""
-        self.encoder.gradient_checkpointing = False
-        self.decoder.gradient_checkpointing = False
+        self._vae.disable_gradient_checkpointing()
 
     def save_pretrained(self, save_directory: str):
         """
@@ -435,25 +271,15 @@ class AutoencoderKL(nn.Module):
         save_path = Path(save_directory)
         save_path.mkdir(parents=True, exist_ok=True)
 
-        # Save config
-        config_path = save_path / "config.json"
-        with open(config_path, "w") as f:
-            json.dump(self.config, f, indent=2)
-
-        # Save weights
-        weights_path = save_path / "diffusion_pytorch_model.safetensors"
-        try:
-            from safetensors.torch import save_file
-            save_file(self.state_dict(), str(weights_path))
-        except ImportError:
-            weights_path = save_path / "diffusion_pytorch_model.bin"
-            torch.save(self.state_dict(), weights_path)
+        # Use diffusers save method
+        self._vae.save_pretrained(str(save_path))
 
     @classmethod
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
         subfolder: Optional[str] = None,
+        torch_dtype: Optional[torch.dtype] = None,
         **kwargs,
     ) -> "AutoencoderKL":
         """
@@ -462,71 +288,42 @@ class AutoencoderKL(nn.Module):
         Args:
             pretrained_model_name_or_path: Path or HuggingFace model ID.
             subfolder: Optional subfolder within model path.
+            torch_dtype: Optional torch dtype.
             **kwargs: Additional config overrides.
 
         Returns:
             Loaded AutoencoderKL model.
         """
-        # Try loading from diffusers
-        try:
-            from diffusers import AutoencoderKL as DiffusersAutoencoder
+        from diffusers import AutoencoderKL as DiffusersAutoencoderKL
 
-            diffusers_vae = DiffusersAutoencoder.from_pretrained(
-                pretrained_model_name_or_path,
-                subfolder=subfolder,
-            )
+        # Load using diffusers
+        diffusers_vae = DiffusersAutoencoderKL.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder=subfolder,
+            torch_dtype=torch_dtype,
+            **kwargs,
+        )
 
-            # Create our model with same config
-            config = diffusers_vae.config
-            model = cls(
-                in_channels=config.in_channels,
-                out_channels=config.out_channels,
-                down_block_types=tuple(config.down_block_types),
-                up_block_types=tuple(config.up_block_types),
-                block_out_channels=tuple(config.block_out_channels),
-                layers_per_block=config.layers_per_block,
-                act_fn=config.act_fn,
-                latent_channels=config.latent_channels,
-                norm_num_groups=config.norm_num_groups,
-                sample_size=config.sample_size,
-                scaling_factor=config.scaling_factor,
-                use_quant_conv=getattr(config, "use_quant_conv", True),
-                use_post_quant_conv=getattr(config, "use_post_quant_conv", True),
-                mid_block_add_attention=getattr(
-                    config, "mid_block_add_attention", True
-                ),
-            )
+        # Create wrapper
+        config = diffusers_vae.config
+        model = cls(
+            in_channels=config.in_channels,
+            out_channels=config.out_channels,
+            down_block_types=tuple(config.down_block_types),
+            up_block_types=tuple(config.up_block_types),
+            block_out_channels=tuple(config.block_out_channels),
+            layers_per_block=config.layers_per_block,
+            act_fn=config.act_fn,
+            latent_channels=config.latent_channels,
+            norm_num_groups=config.norm_num_groups,
+            sample_size=config.sample_size,
+            scaling_factor=config.scaling_factor,
+        )
 
-            # Load weights
-            model.load_state_dict(diffusers_vae.state_dict())
-            return model
+        # Replace internal VAE with loaded one
+        model._vae = diffusers_vae
 
-        except Exception:
-            # Fall back to loading from local path
-            load_path = Path(pretrained_model_name_or_path)
-            if subfolder:
-                load_path = load_path / subfolder
-
-            # Load config
-            config_path = load_path / "config.json"
-            with open(config_path, "r") as f:
-                config = json.load(f)
-
-            config.update(kwargs)
-            model = cls(**config)
-
-            # Load weights
-            try:
-                from safetensors.torch import load_file
-
-                weights_path = load_path / "diffusion_pytorch_model.safetensors"
-                state_dict = load_file(str(weights_path))
-            except (ImportError, FileNotFoundError):
-                weights_path = load_path / "diffusion_pytorch_model.bin"
-                state_dict = torch.load(weights_path, map_location="cpu")
-
-            model.load_state_dict(state_dict)
-            return model
+        return model
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "AutoencoderKL":
@@ -552,11 +349,6 @@ class AutoencoderKL(nn.Module):
         Returns:
             Configuration dictionary.
         """
-        try:
-            from diffusers import AutoencoderKL as DiffusersAutoencoder
-
-            config = DiffusersAutoencoder.load_config(config_path)
-            return dict(config)
-        except Exception:
-            with open(config_path, "r") as f:
-                return json.load(f)
+        from diffusers import AutoencoderKL as DiffusersAutoencoderKL
+        config = DiffusersAutoencoderKL.load_config(config_path)
+        return dict(config)
