@@ -36,6 +36,11 @@ def train(args):
         num_epochs=args.epochs,
         num_negatives=args.num_negatives
     )
+    recall_config = RecallConfig(
+        top_k=args.top_k,
+        index_path=args.index_path,
+        model_path=args.model_path
+    )
     
     # 生成数据
     (user_item_pairs, user_features, item_features, 
@@ -101,8 +106,8 @@ def train(args):
     )
     
     # 保存索引
-    index.save('./index/hnsw')
-    print("Index saved to ./index/hnsw")
+    index.save(recall_config.index_path)
+    print(f"Index saved to {recall_config.index_path}")
     
     return model, index, user_features
 
@@ -193,6 +198,9 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--num_negatives', type=int, default=10)
+    parser.add_argument('--top_k', type=int, default=500)
+    parser.add_argument('--index_path', type=str, default="./index_files/hnsw.bin")
+    parser.add_argument('--model_path', type=str, default="./checkpoints/best_model.pt")
     parser.add_argument('--skip_benchmark', action='store_true')
     
     args = parser.parse_args()

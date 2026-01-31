@@ -77,5 +77,5 @@ class RecallConfig:
     top_k: int = 500
     
     # 索引路径
-    index_path: str = './index/hnsw.bin'
+    index_path: str = './index_files/hnsw.bin'
     model_path: str = './checkpoints/best_model.pt'
