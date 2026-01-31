@@ -1,5 +1,4 @@
+.DS_Store
 .venv/
 .idea/
 __pycache__/
-checkpoints/
-index_files/

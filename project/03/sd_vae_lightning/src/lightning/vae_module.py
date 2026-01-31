@@ -1,0 +1,585 @@
+"""
+PyTorch Lightning module for AutoencoderKL training and inference.
+Supports TensorBoard logging, checkpoint management, and various loss functions.
+"""
+
+from typing import Optional, Dict, Any, Tuple, List
+import json
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+from pytorch_lightning.utilities.types import STEP_OUTPUT
+import lpips
+import torchvision
+
+from ..models.autoencoder_kl import AutoencoderKL
+from ..models.vae import DiagonalGaussianDistribution
+
+
+class NLayerDiscriminator(nn.Module):
+    """
+    PatchGAN discriminator for adversarial training.
+
+    Args:
+        input_nc: Number of input channels.
+        ndf: Base number of discriminator filters.
+        n_layers: Number of layers in discriminator.
+    """
+
+    def __init__(
+        self,
+        input_nc: int = 3,
+        ndf: int = 64,
+        n_layers: int = 3,
+    ):
+        super().__init__()
+
+        layers = [
+            nn.Conv2d(input_nc, ndf, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, True),
+        ]
+
+        nf_mult = 1
+        for n in range(1, n_layers):
+            nf_mult_prev = nf_mult
+            nf_mult = min(2**n, 8)
+            layers += [
+                nn.Conv2d(
+                    ndf * nf_mult_prev,
+                    ndf * nf_mult,
+                    kernel_size=4,
+                    stride=2,
+                    padding=1,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(ndf * nf_mult),
+                nn.LeakyReLU(0.2, True),
+            ]
+
+        nf_mult_prev = nf_mult
+        nf_mult = min(2**n_layers, 8)
+
+        layers += [
+            nn.Conv2d(
+                ndf * nf_mult_prev,
+                ndf * nf_mult,
+                kernel_size=4,
+                stride=1,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(ndf * nf_mult),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(ndf * nf_mult, 1, kernel_size=4, stride=1, padding=1),
+        ]
+
+        self.model = nn.Sequential(*layers)
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        """Initialize weights with normal distribution."""
+        classname = m.__class__.__name__
+        if classname.find("Conv") != -1:
+            nn.init.normal_(m.weight.data, 0.0, 0.02)
+        elif classname.find("BatchNorm") != -1:
+            nn.init.normal_(m.weight.data, 1.0, 0.02)
+            nn.init.constant_(m.bias.data, 0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through discriminator."""
+        return self.model(x)
+
+
+class VAELightningModule(pl.LightningModule):
+    """
+    PyTorch Lightning module for training AutoencoderKL.
+
+    Supports:
+    - Reconstruction loss (L1/L2)
+    - Perceptual loss (LPIPS)
+    - KL divergence loss
+    - Adversarial loss with PatchGAN discriminator
+
+    Args:
+        config: Configuration dictionary containing model and training parameters.
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__()
+        self.save_hyperparameters(config)
+        self.config = config
+        
+        # Disable automatic optimization for GAN training
+        self.automatic_optimization = False
+
+        # Build VAE model
+        model_config = config.get("model", {})
+        pretrained_path = model_config.get("pretrained_model_name_or_path")
+
+        if pretrained_path:
+            self.vae = AutoencoderKL.from_pretrained(pretrained_path)
+        else:
+            self.vae = AutoencoderKL(
+                in_channels=model_config.get("in_channels", 3),
+                out_channels=model_config.get("out_channels", 3),
+                down_block_types=tuple(
+                    model_config.get(
+                        "down_block_types",
+                        [
+                            "DownEncoderBlock2D",
+                            "DownEncoderBlock2D",
+                            "DownEncoderBlock2D",
+                            "DownEncoderBlock2D",
+                        ],
+                    )
+                ),
+                up_block_types=tuple(
+                    model_config.get(
+                        "up_block_types",
+                        [
+                            "UpDecoderBlock2D",
+                            "UpDecoderBlock2D",
+                            "UpDecoderBlock2D",
+                            "UpDecoderBlock2D",
+                        ],
+                    )
+                ),
+                block_out_channels=tuple(
+                    model_config.get("block_out_channels", [128, 256, 512, 512])
+                ),
+                layers_per_block=model_config.get("layers_per_block", 2),
+                act_fn=model_config.get("act_fn", "silu"),
+                latent_channels=model_config.get("latent_channels", 4),
+                norm_num_groups=model_config.get("norm_num_groups", 32),
+                sample_size=model_config.get("sample_size", 512),
+                scaling_factor=model_config.get("scaling_factor", 0.18215),
+                use_quant_conv=model_config.get("use_quant_conv", True),
+                use_post_quant_conv=model_config.get("use_post_quant_conv", True),
+                mid_block_add_attention=model_config.get(
+                    "mid_block_add_attention", True
+                ),
+            )
+
+        # Build discriminator
+        loss_config = config.get("loss", {})
+        self.use_discriminator = loss_config.get("disc_weight", 0) > 0
+        if self.use_discriminator:
+            self.discriminator = NLayerDiscriminator(input_nc=3, ndf=64, n_layers=3)
+            self.disc_start_step = loss_config.get("disc_start_step", 50001)
+        else:
+            self.discriminator = None
+            self.disc_start_step = float("inf")
+
+        # Perceptual loss
+        self.perceptual_weight = loss_config.get("perceptual_weight", 0.5)
+        if self.perceptual_weight > 0:
+            self.perceptual_loss = lpips.LPIPS(net="vgg")
+            self.perceptual_loss.eval()
+            for param in self.perceptual_loss.parameters():
+                param.requires_grad = False
+        else:
+            self.perceptual_loss = None
+
+        # Loss weights
+        self.rec_loss_type = loss_config.get("rec_loss_type", "l2")
+        self.kl_weight = loss_config.get("kl_weight", 1e-6)
+        self.disc_weight = loss_config.get("disc_weight", 1.0)
+        self.disc_loss_type = loss_config.get("disc_loss_type", "hinge")
+
+        # Training config
+        train_config = config.get("training", {})
+        self.learning_rate = train_config.get("learning_rate", 4.5e-6)
+        self.disc_learning_rate = train_config.get("disc_learning_rate", 4.5e-6)
+
+        # Logging config
+        log_config = config.get("logging", {})
+        self.log_images_every_n_steps = log_config.get("log_images_every_n_steps", 500)
+        self.num_val_images = log_config.get("num_val_images", 4)
+
+        # Validation images storage
+        self.validation_step_outputs: List[Dict[str, torch.Tensor]] = []
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        sample_posterior: bool = True,
+    ) -> Tuple[torch.Tensor, DiagonalGaussianDistribution]:
+        """
+        Forward pass: encode and decode.
+
+        Args:
+            x: Input image tensor.
+            sample_posterior: Whether to sample from posterior.
+
+        Returns:
+            Tuple of (reconstructed image, posterior distribution).
+        """
+        posterior = self.vae.encode(x).latent_dist
+        if sample_posterior:
+            z = posterior.sample()
+        else:
+            z = posterior.mode()
+        dec = self.vae.decode(z).sample
+        return dec, posterior
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Encode image to latent.
+
+        Args:
+            x: Input image tensor (range [-1, 1]).
+
+        Returns:
+            Scaled latent tensor.
+        """
+        return self.vae.encode_to_latent(x, sample_posterior=True)
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Decode latent to image.
+
+        Args:
+            z: Scaled latent tensor.
+
+        Returns:
+            Decoded image tensor (range [-1, 1]).
+        """
+        return self.vae.decode_from_latent(z)
+
+    def compute_loss(
+        self,
+        targets: torch.Tensor,
+        reconstructions: torch.Tensor,
+        posterior: DiagonalGaussianDistribution,
+        optimizer_idx: int,
+        global_step: int,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute training loss.
+
+        Args:
+            targets: Original images.
+            reconstructions: Reconstructed images.
+            posterior: Latent distribution.
+            optimizer_idx: 0 for VAE, 1 for discriminator.
+            global_step: Current training step.
+
+        Returns:
+            Tuple of (loss, loss_dict).
+        """
+        loss_dict = {}
+
+        if optimizer_idx == 0:
+            # VAE losses
+            # Reconstruction loss
+            if self.rec_loss_type == "l2":
+                rec_loss = F.mse_loss(reconstructions, targets, reduction="none")
+            else:
+                rec_loss = F.l1_loss(reconstructions, targets, reduction="none")
+            rec_loss = rec_loss.mean()
+            loss_dict["rec_loss"] = rec_loss
+
+            # Perceptual loss
+            if self.perceptual_loss is not None and self.perceptual_weight > 0:
+                p_loss = self.perceptual_loss(reconstructions, targets).mean()
+                loss_dict["p_loss"] = p_loss
+            else:
+                p_loss = torch.tensor(0.0, device=targets.device)
+                loss_dict["p_loss"] = p_loss
+
+            # KL loss
+            kl_loss = posterior.kl().mean()
+            loss_dict["kl_loss"] = kl_loss
+
+            # Total NLL loss (reconstruction + perceptual)
+            nll_loss = rec_loss + self.perceptual_weight * p_loss
+            loss_dict["nll_loss"] = nll_loss
+
+            # Generator loss from discriminator
+            if (
+                self.discriminator is not None
+                and global_step >= self.disc_start_step
+            ):
+                logits_fake = self.discriminator(reconstructions)
+                g_loss = -logits_fake.mean()
+                loss_dict["g_loss"] = g_loss
+
+                # Adaptive weight based on gradient norms
+                last_layer = self.vae.decoder.conv_out.weight
+                nll_grads = torch.autograd.grad(
+                    nll_loss, last_layer, retain_graph=True
+                )[0]
+                g_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
+
+                d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
+                d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
+                d_weight = d_weight * self.disc_weight
+                loss_dict["disc_weight"] = d_weight
+
+                loss = nll_loss + self.kl_weight * kl_loss + d_weight * g_loss
+            else:
+                loss = nll_loss + self.kl_weight * kl_loss
+                loss_dict["g_loss"] = torch.tensor(0.0, device=targets.device)
+                loss_dict["disc_weight"] = torch.tensor(0.0, device=targets.device)
+
+            loss_dict["loss"] = loss
+            return loss, loss_dict
+
+        else:
+            # Discriminator loss
+            logits_real = self.discriminator(targets.detach())
+            logits_fake = self.discriminator(reconstructions.detach())
+
+            if self.disc_loss_type == "hinge":
+                d_loss_real = torch.mean(F.relu(1.0 - logits_real))
+                d_loss_fake = torch.mean(F.relu(1.0 + logits_fake))
+            else:  # vanilla
+                d_loss_real = F.binary_cross_entropy_with_logits(
+                    logits_real, torch.ones_like(logits_real)
+                )
+                d_loss_fake = F.binary_cross_entropy_with_logits(
+                    logits_fake, torch.zeros_like(logits_fake)
+                )
+
+            d_loss = 0.5 * (d_loss_real + d_loss_fake)
+            loss_dict["d_loss"] = d_loss
+            loss_dict["logits_real"] = logits_real.mean()
+            loss_dict["logits_fake"] = logits_fake.mean()
+
+            return d_loss, loss_dict
+
+    def training_step(
+        self, batch: Dict[str, torch.Tensor], batch_idx: int
+    ) -> STEP_OUTPUT:
+        """
+        Training step.
+
+        Args:
+            batch: Batch dictionary containing 'pixel_values'.
+            batch_idx: Batch index.
+
+        Returns:
+            Loss tensor.
+        """
+        targets = batch["pixel_values"]
+        optimizers = self.optimizers()
+        
+        # Handle single or multiple optimizers
+        if isinstance(optimizers, list):
+            opt_vae, opt_disc = optimizers
+        else:
+            opt_vae = optimizers
+            opt_disc = None
+
+        # Forward pass
+        reconstructions, posterior = self(targets, sample_posterior=True)
+
+        # Train VAE
+        opt_vae.zero_grad()
+        vae_loss, vae_loss_dict = self.compute_loss(
+            targets, reconstructions, posterior, optimizer_idx=0, global_step=self.global_step
+        )
+        self.manual_backward(vae_loss)
+        self.clip_gradients(
+            opt_vae,
+            gradient_clip_val=self.config.get("training", {}).get("gradient_clip_val", 1.0),
+            gradient_clip_algorithm="norm",
+        )
+        opt_vae.step()
+
+        # Log VAE losses
+        for key, value in vae_loss_dict.items():
+            self.log(f"train/{key}", value, on_step=True, on_epoch=True, prog_bar=True)
+
+        # Train discriminator
+        if (
+            self.discriminator is not None
+            and self.global_step >= self.disc_start_step
+            and opt_disc is not None
+        ):
+            opt_disc.zero_grad()
+            disc_loss, disc_loss_dict = self.compute_loss(
+                targets,
+                reconstructions.detach(),
+                posterior,
+                optimizer_idx=1,
+                global_step=self.global_step,
+            )
+            self.manual_backward(disc_loss)
+            self.clip_gradients(
+                opt_disc,
+                gradient_clip_val=self.config.get("training", {}).get("gradient_clip_val", 1.0),
+                gradient_clip_algorithm="norm",
+            )
+            opt_disc.step()
+
+            # Log discriminator losses
+            for key, value in disc_loss_dict.items():
+                self.log(
+                    f"train/{key}", value, on_step=True, on_epoch=True, prog_bar=False
+                )
+
+        # Log images periodically
+        if self.global_step % self.log_images_every_n_steps == 0:
+            self._log_images(targets, reconstructions, "train")
+
+        return vae_loss
+
+    def validation_step(
+        self, batch: Dict[str, torch.Tensor], batch_idx: int
+    ) -> STEP_OUTPUT:
+        """
+        Validation step.
+
+        Args:
+            batch: Batch dictionary containing 'pixel_values'.
+            batch_idx: Batch index.
+
+        Returns:
+            Loss dictionary.
+        """
+        targets = batch["pixel_values"]
+        reconstructions, posterior = self(targets, sample_posterior=False)
+
+        loss, loss_dict = self.compute_loss(
+            targets, reconstructions, posterior, optimizer_idx=0, global_step=self.global_step
+        )
+
+        # Log losses
+        for key, value in loss_dict.items():
+            self.log(f"val/{key}", value, on_step=False, on_epoch=True, prog_bar=True)
+
+        # Store for epoch end logging
+        if batch_idx < self.num_val_images:
+            self.validation_step_outputs.append(
+                {
+                    "targets": targets.detach().cpu(),
+                    "reconstructions": reconstructions.detach().cpu(),
+                }
+            )
+
+        return loss_dict
+
+    def on_validation_epoch_end(self) -> None:
+        """Log validation images at epoch end."""
+        if len(self.validation_step_outputs) > 0:
+            targets = torch.cat(
+                [out["targets"] for out in self.validation_step_outputs], dim=0
+            )
+            reconstructions = torch.cat(
+                [out["reconstructions"] for out in self.validation_step_outputs], dim=0
+            )
+            self._log_images(
+                targets[: self.num_val_images],
+                reconstructions[: self.num_val_images],
+                "val",
+            )
+            self.validation_step_outputs.clear()
+
+    def _log_images(
+        self,
+        targets: torch.Tensor,
+        reconstructions: torch.Tensor,
+        prefix: str,
+    ) -> None:
+        """
+        Log images to TensorBoard.
+
+        Args:
+            targets: Original images.
+            reconstructions: Reconstructed images.
+            prefix: Logging prefix ('train' or 'val').
+        """
+        if not self.logger:
+            return
+
+        # Denormalize images from [-1, 1] to [0, 1]
+        targets = (targets + 1) / 2
+        reconstructions = (reconstructions + 1) / 2
+
+        # Clamp values
+        targets = torch.clamp(targets, 0, 1)
+        reconstructions = torch.clamp(reconstructions, 0, 1)
+
+        # Create grid
+        n = min(4, targets.shape[0])
+        comparison = torch.cat([targets[:n], reconstructions[:n]], dim=0)
+        grid = torchvision.utils.make_grid(comparison, nrow=n, padding=2)
+
+        # Log to tensorboard
+        if hasattr(self.logger, "experiment"):
+            self.logger.experiment.add_image(
+                f"{prefix}/reconstruction",
+                grid,
+                self.global_step,
+            )
+
+    def configure_optimizers(self):
+        """Configure optimizers and schedulers."""
+        train_config = self.config.get("training", {})
+
+        # VAE optimizer
+        vae_params = list(self.vae.parameters())
+        opt_vae = torch.optim.AdamW(
+            vae_params,
+            lr=self.learning_rate,
+            betas=(train_config.get("adam_beta1", 0.9), train_config.get("adam_beta2", 0.999)),
+            weight_decay=train_config.get("weight_decay", 0.01),
+        )
+
+        if self.discriminator is not None:
+            # Discriminator optimizer
+            disc_params = list(self.discriminator.parameters())
+            opt_disc = torch.optim.AdamW(
+                disc_params,
+                lr=self.disc_learning_rate,
+                betas=(train_config.get("adam_beta1", 0.9), train_config.get("adam_beta2", 0.999)),
+                weight_decay=train_config.get("weight_decay", 0.01),
+            )
+            return [opt_vae, opt_disc]
+
+        return opt_vae
+
+    def save_pretrained(self, save_directory: str) -> None:
+        """
+        Save model to directory.
+
+        Args:
+            save_directory: Path to save directory.
+        """
+        self.vae.save_pretrained(save_directory)
+
+        # Save discriminator if exists
+        if self.discriminator is not None:
+            disc_path = Path(save_directory) / "discriminator.pt"
+            torch.save(self.discriminator.state_dict(), disc_path)
+
+    @classmethod
+    def load_from_checkpoint(
+        cls, checkpoint_path: str, config: Optional[Dict[str, Any]] = None, **kwargs
+    ) -> "VAELightningModule":
+        """
+        Load model from Lightning checkpoint.
+
+        Args:
+            checkpoint_path: Path to checkpoint file.
+            config: Optional config override.
+            **kwargs: Additional arguments.
+
+        Returns:
+            Loaded VAELightningModule.
+        """
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+        if config is None:
+            config = checkpoint.get("hyper_parameters", {})
+
+        model = cls(config)
+        model.load_state_dict(checkpoint["state_dict"])
+
+        return model
