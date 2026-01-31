@@ -1,4 +1,6 @@
 .venv/
 .idea/
 __pycache__/
-hnsw_index.bin
+checkpoints/
+hnsw.bin
+hnsw.meta
