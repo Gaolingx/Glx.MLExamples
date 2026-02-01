@@ -227,6 +227,29 @@ class VAELightningModule(pl.LightningModule):
         dec = self.vae.decode(z).sample
         return dec, posterior
 
+    def forward_with_latent(
+        self,
+        x: torch.Tensor,
+        sample_posterior: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, DiagonalGaussianDistribution]:
+        """
+        Forward pass: encode and decode, also return latent.
+
+        Args:
+            x: Input image tensor.
+            sample_posterior: Whether to sample from posterior.
+
+        Returns:
+            Tuple of (reconstructed image, latent tensor, posterior distribution).
+        """
+        posterior = self.vae.encode(x).latent_dist
+        if sample_posterior:
+            z = posterior.sample()
+        else:
+            z = posterior.mode()
+        dec = self.vae.decode(z).sample
+        return dec, z, posterior
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """
         Encode image to latent.
@@ -376,8 +399,8 @@ class VAELightningModule(pl.LightningModule):
             opt_vae = optimizers
             opt_disc = None
 
-        # Forward pass
-        reconstructions, posterior = self(targets, sample_posterior=True)
+        # Forward pass with latent
+        reconstructions, latent, posterior = self.forward_with_latent(targets, sample_posterior=True)
 
         # Train VAE
         opt_vae.zero_grad()
@@ -426,7 +449,7 @@ class VAELightningModule(pl.LightningModule):
 
         # Log images periodically
         if self.global_step % self.log_images_every_n_steps == 0:
-            self._log_images(targets, reconstructions, "train")
+            self._log_images(targets, reconstructions, latent, "train")
 
         return vae_loss
 
@@ -444,7 +467,7 @@ class VAELightningModule(pl.LightningModule):
             Loss dictionary.
         """
         targets = batch["pixel_values"]
-        reconstructions, posterior = self(targets, sample_posterior=False)
+        reconstructions, latent, posterior = self.forward_with_latent(targets, sample_posterior=False)
 
         loss, loss_dict = self.compute_loss(
             targets, reconstructions, posterior, optimizer_idx=0, global_step=self.global_step
@@ -460,6 +483,7 @@ class VAELightningModule(pl.LightningModule):
                 {
                     "targets": targets.detach().cpu(),
                     "reconstructions": reconstructions.detach().cpu(),
+                    "latent": latent.detach().cpu(),
                 }
             )
 
@@ -474,17 +498,67 @@ class VAELightningModule(pl.LightningModule):
             reconstructions = torch.cat(
                 [out["reconstructions"] for out in self.validation_step_outputs], dim=0
             )
+            latent = torch.cat(
+                [out["latent"] for out in self.validation_step_outputs], dim=0
+            )
             self._log_images(
                 targets[: self.num_val_images],
                 reconstructions[: self.num_val_images],
+                latent[: self.num_val_images],
                 "val",
             )
             self.validation_step_outputs.clear()
+
+    def _visualize_latent(
+        self,
+        latent: torch.Tensor,
+        target_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        """
+        Visualize latent space as an image.
+
+        Args:
+            latent: Latent tensor of shape (B, C, H, W).
+            target_size: Target size (H, W) to upsample to.
+
+        Returns:
+            Visualization tensor of shape (B, 3, H', W') normalized to [0, 1].
+        """
+        b, c, h, w = latent.shape
+
+        # Min-max normalize per image (across all channels)
+        latent_flat = latent.view(b, -1)
+        min_vals = latent_flat.min(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
+        max_vals = latent_flat.max(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
+        
+        # Avoid division by zero
+        range_vals = max_vals - min_vals
+        range_vals = torch.where(range_vals < 1e-5, torch.ones_like(range_vals), range_vals)
+        
+        latent_normalized = (latent - min_vals) / range_vals
+
+        # Use first 3 channels as RGB if available, otherwise use grayscale
+        if c >= 3:
+            latent_vis = latent_normalized[:, :3]
+        else:
+            # Repeat single channel to RGB
+            latent_vis = latent_normalized[:, :1].repeat(1, 3, 1, 1)
+
+        # Upsample to target size for consistent grid visualization
+        latent_vis = F.interpolate(
+            latent_vis,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        return latent_vis
 
     def _log_images(
         self,
         targets: torch.Tensor,
         reconstructions: torch.Tensor,
+        latent: torch.Tensor,
         prefix: str,
     ) -> None:
         """
@@ -493,6 +567,7 @@ class VAELightningModule(pl.LightningModule):
         Args:
             targets: Original images.
             reconstructions: Reconstructed images.
+            latent: Latent space tensor.
             prefix: Logging prefix ('train' or 'val').
         """
         if not self.logger:
@@ -506,9 +581,13 @@ class VAELightningModule(pl.LightningModule):
         targets = torch.clamp(targets, 0, 1)
         reconstructions = torch.clamp(reconstructions, 0, 1)
 
-        # Create grid
+        # Visualize latent space (upsample to match target size)
+        target_size = (targets.shape[2], targets.shape[3])
+        latent_vis = self._visualize_latent(latent, target_size)
+
+        # Create grid with 3 rows: targets, latent, reconstructions
         n = min(4, targets.shape[0])
-        comparison = torch.cat([targets[:n], reconstructions[:n]], dim=0)
+        comparison = torch.cat([targets[:n], latent_vis[:n], reconstructions[:n]], dim=0)
         grid = torchvision.utils.make_grid(comparison, nrow=n, padding=2)
 
         # Log to tensorboard
