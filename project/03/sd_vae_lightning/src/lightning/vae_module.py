@@ -17,7 +17,7 @@ import torchvision
 
 from ..models.autoencoder_kl import AutoencoderKL
 from ..models.vae import DiagonalGaussianDistribution
-from ..utils.metrics import PSNR, SSIM
+from ..utils.metrics import PSNR, SSIM, rFID
 
 
 class NLayerDiscriminator(nn.Module):
@@ -210,6 +210,9 @@ class VAELightningModule(pl.LightningModule):
         # Validation metrics
         self.psnr_metric = PSNR(data_range=2.0)  # [-1, 1] range
         self.ssim_metric = SSIM(data_range=2.0, channel=3)
+        
+        # rFID metric for reconstruction quality evaluation
+        self.rfid_metric = rFID(feature_dim=2048, reset_real_features=True)
 
         # Validation images storage
         self.validation_step_outputs: List[Dict[str, torch.Tensor]] = []
@@ -606,6 +609,10 @@ class VAELightningModule(pl.LightningModule):
         with torch.no_grad():
             psnr = self.psnr_metric(reconstructions, targets)
             ssim = self.ssim_metric(reconstructions, targets)
+            
+            # Update rFID metric with current batch
+            self.rfid_metric.update(targets, reconstructions)
+            
         loss_dict["psnr"] = psnr
         loss_dict["ssim"] = ssim
 
@@ -626,7 +633,12 @@ class VAELightningModule(pl.LightningModule):
         return loss_dict
 
     def on_validation_epoch_end(self) -> None:
-        """Log validation images at epoch end."""
+        """Log validation images and compute epoch-level metrics at epoch end."""
+        # Compute and log rFID score
+        rfid_score = self.rfid_metric.compute()
+        self.log("val/rfid", rfid_score, on_epoch=True, prog_bar=True)
+        self.rfid_metric.reset()
+        
         if len(self.validation_step_outputs) > 0:
             targets = torch.cat(
                 [out["targets"] for out in self.validation_step_outputs], dim=0
