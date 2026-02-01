@@ -17,6 +17,7 @@ import torchvision
 
 from ..models.autoencoder_kl import AutoencoderKL
 from ..models.vae import DiagonalGaussianDistribution
+from ..utils.metrics import PSNR, SSIM
 
 
 class NLayerDiscriminator(nn.Module):
@@ -192,6 +193,7 @@ class VAELightningModule(pl.LightningModule):
         self.kl_weight = loss_config.get("kl_weight", 1e-6)
         self.disc_weight = loss_config.get("disc_weight", 1.0)
         self.disc_loss_type = loss_config.get("disc_loss_type", "hinge")
+        self.disc_factor = loss_config.get("disc_factor", 1.0)
 
         # Training config
         train_config = config.get("training", {})
@@ -204,6 +206,10 @@ class VAELightningModule(pl.LightningModule):
         log_config = config.get("logging", {})
         self.log_images_every_n_steps = log_config.get("log_images_every_n_steps", 500)
         self.num_val_images = log_config.get("num_val_images", 4)
+
+        # Validation metrics
+        self.psnr_metric = PSNR(data_range=2.0)  # [-1, 1] range
+        self.ssim_metric = SSIM(data_range=2.0, channel=3)
 
         # Validation images storage
         self.validation_step_outputs: List[Dict[str, torch.Tensor]] = []
@@ -348,6 +354,7 @@ class VAELightningModule(pl.LightningModule):
         posterior: DiagonalGaussianDistribution,
         optimizer_idx: int,
         global_step: int,
+        training: bool = True,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Compute training loss.
@@ -358,6 +365,7 @@ class VAELightningModule(pl.LightningModule):
             posterior: Latent distribution.
             optimizer_idx: 0 for VAE, 1 for discriminator.
             global_step: Current training step.
+            training: Whether in training mode (enables gradient-based adaptive weight).
 
         Returns:
             Tuple of (loss, loss_dict).
@@ -384,16 +392,20 @@ class VAELightningModule(pl.LightningModule):
 
             # KL loss
             kl_loss = posterior.kl().mean()
-            loss_dict["kl_loss"] = kl_loss
+            loss_dict["kl_loss"] = kl_loss * self.kl_weight
 
             # Total NLL loss (reconstruction + perceptual)
             nll_loss = rec_loss + self.perceptual_weight * p_loss
             loss_dict["nll_loss"] = nll_loss
 
             # Generator loss from discriminator
+            disc_factor = self.disc_factor if global_step >= self.disc_start_step else 0.0
+            loss_dict["disc_factor"] = torch.tensor(disc_factor, device=targets.device)
+
             if (
                 self.discriminator is not None
                 and global_step >= self.disc_start_step
+                and training  # Only compute adversarial loss during training
             ):
                 logits_fake = self.discriminator(reconstructions)
                 g_loss = -logits_fake.mean()
@@ -411,7 +423,7 @@ class VAELightningModule(pl.LightningModule):
                 d_weight = d_weight * self.disc_weight
                 loss_dict["disc_weight"] = d_weight
 
-                loss = nll_loss + self.kl_weight * kl_loss + d_weight * g_loss
+                loss = nll_loss + self.kl_weight * kl_loss + d_weight * disc_factor * g_loss
             else:
                 loss = nll_loss + self.kl_weight * kl_loss
                 loss_dict["g_loss"] = torch.tensor(0.0, device=targets.device)
@@ -436,8 +448,10 @@ class VAELightningModule(pl.LightningModule):
                     logits_fake, torch.zeros_like(logits_fake)
                 )
 
-            d_loss = 0.5 * (d_loss_real + d_loss_fake)
+            disc_factor = self.disc_factor if global_step >= self.disc_start_step else 0.0
+            d_loss = disc_factor * 0.5 * (d_loss_real + d_loss_fake)
             loss_dict["d_loss"] = d_loss
+            loss_dict["disc_factor"] = torch.tensor(disc_factor, device=targets.device)
             loss_dict["d_loss_real"] = d_loss_real
             loss_dict["d_loss_fake"] = d_loss_fake
             loss_dict["logits_real"] = logits_real.mean()
@@ -500,7 +514,7 @@ class VAELightningModule(pl.LightningModule):
             # ========== Train VAE (Generator) ==========
             vae_loss, vae_loss_dict = self.compute_loss(
                 targets, reconstructions, posterior, 
-                optimizer_idx=0, global_step=self.global_step
+                optimizer_idx=0, global_step=self.global_step, training=True
             )
             
             # Scale loss for manual gradient accumulation
@@ -555,7 +569,7 @@ class VAELightningModule(pl.LightningModule):
                 
                 # Log discriminator losses
                 for key, value in disc_loss_dict.items():
-                    self.log(f"train/{key}", value, on_step=True, on_epoch=True, prog_bar=False)
+                    self.log(f"train/{key}", value, on_step=True, on_epoch=True, prog_bar=True)
                 
                 # Compute and log G/D loss ratio using cached g_loss from previous VAE step
                 if self._cached_g_loss is not None:
@@ -585,8 +599,15 @@ class VAELightningModule(pl.LightningModule):
         reconstructions, latent, posterior = self.forward_with_latent(targets, sample_posterior=False)
 
         loss, loss_dict = self.compute_loss(
-            targets, reconstructions, posterior, optimizer_idx=0, global_step=self.global_step
+            targets, reconstructions, posterior, optimizer_idx=0, global_step=self.global_step, training=False
         )
+
+        # Compute PSNR and SSIM
+        with torch.no_grad():
+            psnr = self.psnr_metric(reconstructions, targets)
+            ssim = self.ssim_metric(reconstructions, targets)
+        loss_dict["psnr"] = psnr
+        loss_dict["ssim"] = ssim
 
         # Log losses
         for key, value in loss_dict.items():
