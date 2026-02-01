@@ -104,6 +104,8 @@ class VAELightningModule(pl.LightningModule):
     - Perceptual loss (LPIPS)
     - KL divergence loss
     - Adversarial loss with PatchGAN discriminator
+    - Alternating training between VAE and Discriminator (official diffusers style)
+    - Manual gradient accumulation
 
     Args:
         config: Configuration dictionary containing model and training parameters.
@@ -114,7 +116,7 @@ class VAELightningModule(pl.LightningModule):
         self.save_hyperparameters(config)
         self.config = config
         
-        # Disable automatic optimization for GAN training
+        # Disable automatic optimization for GAN training with manual gradient accumulation
         self.automatic_optimization = False
 
         # Build VAE model
@@ -195,6 +197,8 @@ class VAELightningModule(pl.LightningModule):
         train_config = config.get("training", {})
         self.learning_rate = train_config.get("learning_rate", 4.5e-6)
         self.disc_learning_rate = train_config.get("disc_learning_rate", 4.5e-6)
+        self.accumulate_grad_batches = train_config.get("accumulate_grad_batches", 1)
+        self.gradient_clip_val = train_config.get("gradient_clip_val", 1.0)
 
         # Logging config
         log_config = config.get("logging", {})
@@ -203,6 +207,10 @@ class VAELightningModule(pl.LightningModule):
 
         # Validation images storage
         self.validation_step_outputs: List[Dict[str, torch.Tensor]] = []
+        
+        # Cache for G/D loss ratio computation across alternating steps
+        self._cached_g_loss: Optional[torch.Tensor] = None
+        self._cached_vae_loss_dict: Optional[Dict[str, torch.Tensor]] = None
 
     def forward(
         self,
@@ -273,6 +281,65 @@ class VAELightningModule(pl.LightningModule):
             Decoded image tensor (range [-1, 1]).
         """
         return self.vae.decode_from_latent(z)
+
+    def _compute_discriminator_win_rate(
+        self,
+        logits_real: torch.Tensor,
+        logits_fake: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute discriminator win rate metrics.
+
+        For hinge loss:
+        - Discriminator "wins" on real if logits_real > 0
+        - Discriminator "wins" on fake if logits_fake < 0
+
+        Args:
+            logits_real: Discriminator output for real images.
+            logits_fake: Discriminator output for fake/reconstructed images.
+
+        Returns:
+            Dictionary containing win rate metrics.
+        """
+        # Flatten logits for computation
+        logits_real_flat = logits_real.view(-1)
+        logits_fake_flat = logits_fake.view(-1)
+
+        # Compute accuracy for real samples (D should output > 0 for real)
+        real_correct = (logits_real_flat > 0).float()
+        win_rate_real = real_correct.mean()
+
+        # Compute accuracy for fake samples (D should output < 0 for fake)
+        fake_correct = (logits_fake_flat < 0).float()
+        win_rate_fake = fake_correct.mean()
+
+        # Overall win rate (average of real and fake accuracy)
+        win_rate = 0.5 * (win_rate_real + win_rate_fake)
+
+        return {
+            "win_rate": win_rate,
+            "win_rate_real": win_rate_real,
+            "win_rate_fake": win_rate_fake,
+        }
+
+    def _compute_loss_ratio(
+        self,
+        g_loss: torch.Tensor,
+        d_loss: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """
+        Compute the ratio between Generator and Discriminator losses.
+
+        Args:
+            g_loss: Generator loss.
+            d_loss: Discriminator loss.
+            eps: Small epsilon to avoid division by zero.
+
+        Returns:
+            G/D loss ratio.
+        """
+        return g_loss / (d_loss + eps)
 
     def compute_loss(
         self,
@@ -371,8 +438,14 @@ class VAELightningModule(pl.LightningModule):
 
             d_loss = 0.5 * (d_loss_real + d_loss_fake)
             loss_dict["d_loss"] = d_loss
+            loss_dict["d_loss_real"] = d_loss_real
+            loss_dict["d_loss_fake"] = d_loss_fake
             loss_dict["logits_real"] = logits_real.mean()
             loss_dict["logits_fake"] = logits_fake.mean()
+
+            # Compute discriminator win rate
+            win_rate_dict = self._compute_discriminator_win_rate(logits_real, logits_fake)
+            loss_dict.update(win_rate_dict)
 
             return d_loss, loss_dict
 
@@ -380,7 +453,14 @@ class VAELightningModule(pl.LightningModule):
         self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> STEP_OUTPUT:
         """
-        Training step.
+        Training step with alternating VAE/Discriminator training.
+        
+        Following the official diffusers implementation:
+        - Even accumulated steps: train VAE (generator)
+        - Odd accumulated steps: train Discriminator
+        - Before disc_start_step: always train VAE only
+        
+        Manual gradient accumulation is used to match the official behavior.
 
         Args:
             batch: Batch dictionary containing 'pixel_values'.
@@ -399,59 +479,94 @@ class VAELightningModule(pl.LightningModule):
             opt_vae = optimizers
             opt_disc = None
 
+        # Determine training phase based on accumulated step index
+        # accumulated_step_idx: which "logical" optimization step we're in
+        accumulated_step_idx = batch_idx // self.accumulate_grad_batches
+        is_last_accumulation_step = (batch_idx + 1) % self.accumulate_grad_batches == 0
+        
+        # Determine whether to train generator (VAE) or discriminator
+        # Even accumulated steps -> train VAE, Odd -> train Discriminator
+        # Always train VAE before disc_start_step
+        train_generator = (
+            (accumulated_step_idx % 2 == 0) or 
+            (self.global_step < self.disc_start_step) or
+            (self.discriminator is None)
+        )
+
         # Forward pass with latent
         reconstructions, latent, posterior = self.forward_with_latent(targets, sample_posterior=True)
 
-        # Train VAE
-        opt_vae.zero_grad()
-        vae_loss, vae_loss_dict = self.compute_loss(
-            targets, reconstructions, posterior, optimizer_idx=0, global_step=self.global_step
-        )
-        self.manual_backward(vae_loss)
-        self.clip_gradients(
-            opt_vae,
-            gradient_clip_val=self.config.get("training", {}).get("gradient_clip_val", 1.0),
-            gradient_clip_algorithm="norm",
-        )
-        opt_vae.step()
-
-        # Log VAE losses
-        for key, value in vae_loss_dict.items():
-            self.log(f"train/{key}", value, on_step=True, on_epoch=True, prog_bar=True)
-
-        # Train discriminator
-        if (
-            self.discriminator is not None
-            and self.global_step >= self.disc_start_step
-            and opt_disc is not None
-        ):
-            opt_disc.zero_grad()
-            disc_loss, disc_loss_dict = self.compute_loss(
-                targets,
-                reconstructions.detach(),
-                posterior,
-                optimizer_idx=1,
-                global_step=self.global_step,
+        if train_generator:
+            # ========== Train VAE (Generator) ==========
+            vae_loss, vae_loss_dict = self.compute_loss(
+                targets, reconstructions, posterior, 
+                optimizer_idx=0, global_step=self.global_step
             )
-            self.manual_backward(disc_loss)
-            self.clip_gradients(
-                opt_disc,
-                gradient_clip_val=self.config.get("training", {}).get("gradient_clip_val", 1.0),
-                gradient_clip_algorithm="norm",
-            )
-            opt_disc.step()
-
-            # Log discriminator losses
-            for key, value in disc_loss_dict.items():
-                self.log(
-                    f"train/{key}", value, on_step=True, on_epoch=True, prog_bar=False
+            
+            # Scale loss for manual gradient accumulation
+            scaled_loss = vae_loss / self.accumulate_grad_batches
+            self.manual_backward(scaled_loss)
+            
+            # Step optimizer only at accumulation boundary
+            if is_last_accumulation_step:
+                self.clip_gradients(
+                    opt_vae,
+                    gradient_clip_val=self.gradient_clip_val,
+                    gradient_clip_algorithm="norm",
                 )
-
-        # Log images periodically
-        if self.global_step % self.log_images_every_n_steps == 0:
-            self._log_images(targets, reconstructions, latent, "train")
-
-        return vae_loss
+                opt_vae.step()
+                opt_vae.zero_grad()
+            
+            # Log VAE losses
+            for key, value in vae_loss_dict.items():
+                self.log(f"train/{key}", value, on_step=True, on_epoch=True, prog_bar=True)
+            
+            # Cache g_loss and loss dict for G/D ratio computation in discriminator step
+            self._cached_g_loss = vae_loss_dict.get("g_loss", torch.tensor(0.0, device=targets.device))
+            self._cached_vae_loss_dict = vae_loss_dict
+            
+            # Log images periodically (only during VAE training steps)
+            if is_last_accumulation_step and self.global_step % self.log_images_every_n_steps == 0:
+                self._log_images(targets, reconstructions, latent, "train")
+            
+            return vae_loss
+        
+        else:
+            # ========== Train Discriminator ==========
+            if self.discriminator is not None and opt_disc is not None:
+                disc_loss, disc_loss_dict = self.compute_loss(
+                    targets, reconstructions, posterior,
+                    optimizer_idx=1, global_step=self.global_step,
+                )
+                
+                # Scale loss for manual gradient accumulation
+                scaled_loss = disc_loss / self.accumulate_grad_batches
+                self.manual_backward(scaled_loss)
+                
+                # Step optimizer only at accumulation boundary
+                if is_last_accumulation_step:
+                    self.clip_gradients(
+                        opt_disc,
+                        gradient_clip_val=self.gradient_clip_val,
+                        gradient_clip_algorithm="norm",
+                    )
+                    opt_disc.step()
+                    opt_disc.zero_grad()
+                
+                # Log discriminator losses
+                for key, value in disc_loss_dict.items():
+                    self.log(f"train/{key}", value, on_step=True, on_epoch=True, prog_bar=False)
+                
+                # Compute and log G/D loss ratio using cached g_loss from previous VAE step
+                if self._cached_g_loss is not None:
+                    g_loss = self._cached_g_loss
+                    d_loss = disc_loss_dict.get("d_loss", torch.tensor(1.0, device=targets.device))
+                    gd_ratio = self._compute_loss_ratio(g_loss, d_loss)
+                    self.log("train/gd_loss_ratio", gd_ratio, on_step=True, on_epoch=True, prog_bar=True)
+                
+                return disc_loss
+            
+            return None
 
     def validation_step(
         self, batch: Dict[str, torch.Tensor], batch_idx: int

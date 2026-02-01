@@ -9,7 +9,9 @@
         "gradient_clip_val": 1.0,
         "accumulate_grad_batches": 1,
         "precision": "16-mixed",
-        "num_workers": 4
+        "num_workers": 4,
+        "adam_beta1": 0.9,
+        "adam_beta2": 0.999
     },
     "loss": {
         "rec_loss_type": "l2",

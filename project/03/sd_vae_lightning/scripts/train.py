@@ -3,6 +3,11 @@
 Training script for AutoencoderKL with PyTorch Lightning.
 Supports TensorBoard logging, automatic checkpointing, and resuming from checkpoints.
 
+Features:
+- Alternating training between VAE and Discriminator (official diffusers style)
+- Manual gradient accumulation for proper alternating training
+- Supports mixed precision training
+
 Usage:
     python scripts/train.py --config configs/train_config.json
     python scripts/train.py --config configs/train_config.json --resume_from_checkpoint path/to/checkpoint.ckpt
@@ -200,13 +205,16 @@ def main():
         devices = "auto"
 
     # Create trainer
+    # NOTE: accumulate_grad_batches is set to 1 because we handle gradient accumulation
+    # manually in VAELightningModule.training_step() for proper alternating training
+    # between VAE and Discriminator (following official diffusers implementation)
     trainer = pl.Trainer(
         accelerator=accelerator,
         devices=devices,
         max_epochs=train_config_section.get("num_epochs", 100),
         precision=train_config_section.get("precision", "16-mixed"),
-        accumulate_grad_batches=train_config_section.get("accumulate_grad_batches", 1),
-        # gradient_clip_val=train_config_section.get("gradient_clip_val", 1.0),
+        accumulate_grad_batches=1,  # Manual accumulation in training_step
+        # gradient_clip_val handled manually in training_step
         log_every_n_steps=logging_config.get("log_every_n_steps", 50),
         val_check_interval=logging_config.get("val_check_interval", 500),
         logger=logger,
@@ -230,6 +238,8 @@ def main():
     # Train
     print("=" * 60)
     print("Starting VAE Training")
+    print(f"  - Alternating training: VAE (even steps) / Disc (odd steps)")
+    print(f"  - Gradient accumulation: {train_config_section.get('accumulate_grad_batches', 1)} steps")
     print(f"Output directory: {output_dir}")
     print(f"Log directory: {log_dir}")
     print(f"Checkpoint directory: {checkpoint_dir}")
