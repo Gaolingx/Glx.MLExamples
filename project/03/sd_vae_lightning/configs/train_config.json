@@ -18,8 +18,12 @@
         "kl_weight": 1e-6,
         "perceptual_weight": 0.5,
         "disc_weight": 1.0,
+        "disc_factor": 1.0,
         "disc_start_step": 50001,
-        "disc_loss_type": "hinge"
+        "disc_warmup_steps": 2000,
+        "disc_loss_type": "hinge",
+        "use_adaptive_disc_weight": true,
+        "adaptive_weight_max": 10.0
     },
     "data": {
         "dataset_name": "huggan/flowers-102-categories",

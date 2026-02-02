@@ -31,10 +31,10 @@ class NLayerDiscriminator(nn.Module):
     """
 
     def __init__(
-        self,
-        input_nc: int = 3,
-        ndf: int = 64,
-        n_layers: int = 3,
+            self,
+            input_nc: int = 3,
+            ndf: int = 64,
+            n_layers: int = 3,
     ):
         super().__init__()
 
@@ -46,7 +46,7 @@ class NLayerDiscriminator(nn.Module):
         nf_mult = 1
         for n in range(1, n_layers):
             nf_mult_prev = nf_mult
-            nf_mult = min(2**n, 8)
+            nf_mult = min(2 ** n, 8)
             layers += [
                 nn.Conv2d(
                     ndf * nf_mult_prev,
@@ -61,7 +61,7 @@ class NLayerDiscriminator(nn.Module):
             ]
 
         nf_mult_prev = nf_mult
-        nf_mult = min(2**n_layers, 8)
+        nf_mult = min(2 ** n_layers, 8)
 
         layers += [
             nn.Conv2d(
@@ -116,7 +116,7 @@ class VAELightningModule(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(config)
         self.config = config
-        
+
         # Disable automatic optimization for GAN training with manual gradient accumulation
         self.automatic_optimization = False
 
@@ -194,6 +194,9 @@ class VAELightningModule(pl.LightningModule):
         self.disc_weight = loss_config.get("disc_weight", 1.0)
         self.disc_loss_type = loss_config.get("disc_loss_type", "hinge")
         self.disc_factor = loss_config.get("disc_factor", 1.0)
+        self.use_adaptive_disc_weight = loss_config.get("use_adaptive_disc_weight", True)
+        self.disc_warmup_steps = loss_config.get("disc_warmup_steps", 1000)
+        self.adaptive_weight_max = loss_config.get("adaptive_weight_max", 10.0)
 
         # Training config
         train_config = config.get("training", {})
@@ -210,21 +213,21 @@ class VAELightningModule(pl.LightningModule):
         # Validation metrics
         self.psnr_metric = PSNR(data_range=2.0)  # [-1, 1] range
         self.ssim_metric = SSIM(data_range=2.0, channel=3)
-        
+
         # rFID metric for reconstruction quality evaluation
         self.rfid_metric = rFID(feature_dim=2048, reset_real_features=True)
 
         # Validation images storage
         self.validation_step_outputs: List[Dict[str, torch.Tensor]] = []
-        
+
         # Cache for G/D loss ratio computation across alternating steps
         self._cached_g_loss: Optional[torch.Tensor] = None
         self._cached_vae_loss_dict: Optional[Dict[str, torch.Tensor]] = None
 
     def forward(
-        self,
-        x: torch.Tensor,
-        sample_posterior: bool = True,
+            self,
+            x: torch.Tensor,
+            sample_posterior: bool = True,
     ) -> Tuple[torch.Tensor, DiagonalGaussianDistribution]:
         """
         Forward pass: encode and decode.
@@ -245,9 +248,9 @@ class VAELightningModule(pl.LightningModule):
         return dec, posterior
 
     def forward_with_latent(
-        self,
-        x: torch.Tensor,
-        sample_posterior: bool = True,
+            self,
+            x: torch.Tensor,
+            sample_posterior: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, DiagonalGaussianDistribution]:
         """
         Forward pass: encode and decode, also return latent.
@@ -292,9 +295,9 @@ class VAELightningModule(pl.LightningModule):
         return self.vae.decode_from_latent(z)
 
     def _compute_discriminator_win_rate(
-        self,
-        logits_real: torch.Tensor,
-        logits_fake: torch.Tensor,
+            self,
+            logits_real: torch.Tensor,
+            logits_fake: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute discriminator win rate metrics.
@@ -332,10 +335,10 @@ class VAELightningModule(pl.LightningModule):
         }
 
     def _compute_loss_ratio(
-        self,
-        g_loss: torch.Tensor,
-        d_loss: torch.Tensor,
-        eps: float = 1e-8,
+            self,
+            g_loss: torch.Tensor,
+            d_loss: torch.Tensor,
+            eps: float = 1e-8,
     ) -> torch.Tensor:
         """
         Compute the ratio between Generator and Discriminator losses.
@@ -350,14 +353,58 @@ class VAELightningModule(pl.LightningModule):
         """
         return g_loss / (d_loss + eps)
 
+    def _calculate_adaptive_weight(
+            self,
+            nll_loss: torch.Tensor,
+            g_loss: torch.Tensor,
+            last_layer: nn.Parameter,
+    ) -> torch.Tensor:
+        """
+        Calculate adaptive discriminator weight based on gradient norms.
+        
+        This balances the reconstruction loss and adversarial loss by computing
+        the ratio of their gradient norms w.r.t. the last decoder layer.
+        Following the approach from taming-transformers and diffusers.
+        
+        Args:
+            nll_loss: Reconstruction + perceptual loss (NLL loss).
+            g_loss: Generator adversarial loss.
+            last_layer: Last layer weights of decoder for gradient computation.
+        
+        Returns:
+            Adaptive weight for discriminator loss, scaled by disc_weight.
+        """
+        try:
+            nll_grads = torch.autograd.grad(
+                nll_loss, last_layer, retain_graph=True
+            )[0]
+            g_grads = torch.autograd.grad(
+                g_loss, last_layer, retain_graph=True
+            )[0]
+        except RuntimeError:
+            # Fallback if gradient computation fails
+            return torch.tensor(0.0, device=nll_loss.device)
+
+        nll_grad_norm = torch.norm(nll_grads)
+        g_grad_norm = torch.norm(g_grads)
+
+        if g_grad_norm < 1e-6:
+            d_weight = torch.tensor(1.0, device=nll_loss.device)
+        else:
+            d_weight = nll_grad_norm / (g_grad_norm + 1e-4)
+
+        d_weight = torch.clamp(d_weight, 0.0, self.adaptive_weight_max).detach()
+
+        return d_weight * self.disc_weight
+
     def compute_loss(
-        self,
-        targets: torch.Tensor,
-        reconstructions: torch.Tensor,
-        posterior: DiagonalGaussianDistribution,
-        optimizer_idx: int,
-        global_step: int,
-        training: bool = True,
+            self,
+            targets: torch.Tensor,
+            reconstructions: torch.Tensor,
+            posterior: DiagonalGaussianDistribution,
+            optimizer_idx: int,
+            global_step: int,
+            training: bool = True,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Compute training loss.
@@ -401,36 +448,48 @@ class VAELightningModule(pl.LightningModule):
             nll_loss = rec_loss + self.perceptual_weight * p_loss
             loss_dict["nll_loss"] = nll_loss
 
-            # Generator loss from discriminator
-            disc_factor = self.disc_factor if global_step >= self.disc_start_step else 0.0
+            # Compute disc_factor with warmup
+            if global_step < self.disc_start_step:
+                disc_factor = 0.0
+            elif global_step < self.disc_start_step + self.disc_warmup_steps:
+                # Linear warmup from 0 to disc_factor
+                warmup_progress = (global_step - self.disc_start_step) / self.disc_warmup_steps
+                disc_factor = warmup_progress * self.disc_factor
+            else:
+                disc_factor = self.disc_factor
+
             loss_dict["disc_factor"] = torch.tensor(disc_factor, device=targets.device)
 
             if (
-                self.discriminator is not None
-                and global_step >= self.disc_start_step
-                and training  # Only compute adversarial loss during training
+                    self.discriminator is not None
+                    and global_step >= self.disc_start_step
+                    and training
             ):
                 logits_fake = self.discriminator(reconstructions)
                 g_loss = -logits_fake.mean()
                 loss_dict["g_loss"] = g_loss
 
-                # Adaptive weight based on gradient norms
-                last_layer = self.vae.decoder.conv_out.weight
-                nll_grads = torch.autograd.grad(
-                    nll_loss, last_layer, retain_graph=True
-                )[0]
-                g_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
+                # Calculate discriminator weight
+                if self.use_adaptive_disc_weight:
+                    last_layer = self.vae.decoder.conv_out.weight
+                    d_weight = self._calculate_adaptive_weight(
+                        nll_loss, g_loss, last_layer
+                    )
+                    loss_dict["disc_weight"] = d_weight
+                else:
+                    d_weight = torch.tensor(self.disc_weight, device=targets.device)
+                    loss_dict["disc_weight"] = d_weight
 
-                d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
-                d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
-                d_weight = d_weight * self.disc_weight
-                loss_dict["disc_weight"] = d_weight
+                # Final weighted adversarial loss with warmup factor
+                g_loss_weighted = d_weight * disc_factor * g_loss
+                loss_dict["g_loss_weighted"] = g_loss_weighted
 
-                loss = nll_loss + self.kl_weight * kl_loss + d_weight * disc_factor * g_loss
+                loss = nll_loss + self.kl_weight * kl_loss + g_loss_weighted
             else:
                 loss = nll_loss + self.kl_weight * kl_loss
                 loss_dict["g_loss"] = torch.tensor(0.0, device=targets.device)
                 loss_dict["disc_weight"] = torch.tensor(0.0, device=targets.device)
+                loss_dict["g_loss_weighted"] = torch.tensor(0.0, device=targets.device)
 
             loss_dict["loss"] = loss
             return loss, loss_dict
@@ -451,7 +510,15 @@ class VAELightningModule(pl.LightningModule):
                     logits_fake, torch.zeros_like(logits_fake)
                 )
 
-            disc_factor = self.disc_factor if global_step >= self.disc_start_step else 0.0
+            # Compute disc_factor with warmup for discriminator too
+            if global_step < self.disc_start_step:
+                disc_factor = 0.0
+            elif global_step < self.disc_start_step + self.disc_warmup_steps:
+                warmup_progress = (global_step - self.disc_start_step) / self.disc_warmup_steps
+                disc_factor = warmup_progress * self.disc_factor
+            else:
+                disc_factor = self.disc_factor
+
             d_loss = disc_factor * 0.5 * (d_loss_real + d_loss_fake)
             loss_dict["d_loss"] = d_loss
             loss_dict["disc_factor"] = torch.tensor(disc_factor, device=targets.device)
@@ -467,7 +534,7 @@ class VAELightningModule(pl.LightningModule):
             return d_loss, loss_dict
 
     def training_step(
-        self, batch: Dict[str, torch.Tensor], batch_idx: int
+            self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> STEP_OUTPUT:
         """
         Training step with alternating VAE/Discriminator training.
@@ -488,7 +555,7 @@ class VAELightningModule(pl.LightningModule):
         """
         targets = batch["pixel_values"]
         optimizers = self.optimizers()
-        
+
         # Handle single or multiple optimizers
         if isinstance(optimizers, list):
             opt_vae, opt_disc = optimizers
@@ -500,14 +567,14 @@ class VAELightningModule(pl.LightningModule):
         # accumulated_step_idx: which "logical" optimization step we're in
         accumulated_step_idx = batch_idx // self.accumulate_grad_batches
         is_last_accumulation_step = (batch_idx + 1) % self.accumulate_grad_batches == 0
-        
+
         # Determine whether to train generator (VAE) or discriminator
         # Even accumulated steps -> train VAE, Odd -> train Discriminator
         # Always train VAE before disc_start_step
         train_generator = (
-            (accumulated_step_idx % 2 == 0) or 
-            (self.global_step < self.disc_start_step) or
-            (self.discriminator is None)
+                (accumulated_step_idx % 2 == 0) or
+                (self.global_step < self.disc_start_step) or
+                (self.discriminator is None)
         )
 
         # Forward pass with latent
@@ -516,14 +583,14 @@ class VAELightningModule(pl.LightningModule):
         if train_generator:
             # ========== Train VAE (Generator) ==========
             vae_loss, vae_loss_dict = self.compute_loss(
-                targets, reconstructions, posterior, 
+                targets, reconstructions, posterior,
                 optimizer_idx=0, global_step=self.global_step, training=True
             )
-            
+
             # Scale loss for manual gradient accumulation
             scaled_loss = vae_loss / self.accumulate_grad_batches
             self.manual_backward(scaled_loss)
-            
+
             # Step optimizer only at accumulation boundary
             if is_last_accumulation_step:
                 self.clip_gradients(
@@ -533,21 +600,21 @@ class VAELightningModule(pl.LightningModule):
                 )
                 opt_vae.step()
                 opt_vae.zero_grad()
-            
+
             # Log VAE losses
             for key, value in vae_loss_dict.items():
                 self.log(f"train/{key}", value, on_step=True, on_epoch=True, prog_bar=True)
-            
+
             # Cache g_loss and loss dict for G/D ratio computation in discriminator step
             self._cached_g_loss = vae_loss_dict.get("g_loss", torch.tensor(0.0, device=targets.device))
             self._cached_vae_loss_dict = vae_loss_dict
-            
+
             # Log images periodically (only during VAE training steps)
             if is_last_accumulation_step and self.global_step % self.log_images_every_n_steps == 0:
                 self._log_images(targets, reconstructions, latent, "train")
-            
+
             return vae_loss
-        
+
         else:
             # ========== Train Discriminator ==========
             if self.discriminator is not None and opt_disc is not None:
@@ -555,11 +622,11 @@ class VAELightningModule(pl.LightningModule):
                     targets, reconstructions, posterior,
                     optimizer_idx=1, global_step=self.global_step,
                 )
-                
+
                 # Scale loss for manual gradient accumulation
                 scaled_loss = disc_loss / self.accumulate_grad_batches
                 self.manual_backward(scaled_loss)
-                
+
                 # Step optimizer only at accumulation boundary
                 if is_last_accumulation_step:
                     self.clip_gradients(
@@ -569,24 +636,24 @@ class VAELightningModule(pl.LightningModule):
                     )
                     opt_disc.step()
                     opt_disc.zero_grad()
-                
+
                 # Log discriminator losses
                 for key, value in disc_loss_dict.items():
                     self.log(f"train/{key}", value, on_step=True, on_epoch=True, prog_bar=True)
-                
+
                 # Compute and log G/D loss ratio using cached g_loss from previous VAE step
                 if self._cached_g_loss is not None:
                     g_loss = self._cached_g_loss
                     d_loss = disc_loss_dict.get("d_loss", torch.tensor(1.0, device=targets.device))
                     gd_ratio = self._compute_loss_ratio(g_loss, d_loss)
                     self.log("train/gd_loss_ratio", gd_ratio, on_step=True, on_epoch=True, prog_bar=True)
-                
+
                 return disc_loss
-            
+
             return None
 
     def validation_step(
-        self, batch: Dict[str, torch.Tensor], batch_idx: int
+            self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> STEP_OUTPUT:
         """
         Validation step.
@@ -609,10 +676,10 @@ class VAELightningModule(pl.LightningModule):
         with torch.no_grad():
             psnr = self.psnr_metric(reconstructions, targets)
             ssim = self.ssim_metric(reconstructions, targets)
-            
+
             # Update rFID metric with current batch
             self.rfid_metric.update(targets, reconstructions)
-            
+
         loss_dict["psnr"] = psnr
         loss_dict["ssim"] = ssim
 
@@ -638,7 +705,7 @@ class VAELightningModule(pl.LightningModule):
         rfid_score = self.rfid_metric.compute()
         self.log("val/rfid", rfid_score, on_epoch=True, prog_bar=True)
         self.rfid_metric.reset()
-        
+
         if len(self.validation_step_outputs) > 0:
             targets = torch.cat(
                 [out["targets"] for out in self.validation_step_outputs], dim=0
@@ -658,9 +725,9 @@ class VAELightningModule(pl.LightningModule):
             self.validation_step_outputs.clear()
 
     def _visualize_latent(
-        self,
-        latent: torch.Tensor,
-        target_size: Tuple[int, int],
+            self,
+            latent: torch.Tensor,
+            target_size: Tuple[int, int],
     ) -> torch.Tensor:
         """
         Visualize latent space as an image.
@@ -678,11 +745,11 @@ class VAELightningModule(pl.LightningModule):
         latent_flat = latent.view(b, -1)
         min_vals = latent_flat.min(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
         max_vals = latent_flat.max(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
-        
+
         # Avoid division by zero
         range_vals = max_vals - min_vals
         range_vals = torch.where(range_vals < 1e-5, torch.ones_like(range_vals), range_vals)
-        
+
         latent_normalized = (latent - min_vals) / range_vals
 
         # Use first 3 channels as RGB if available, otherwise use grayscale
@@ -703,11 +770,11 @@ class VAELightningModule(pl.LightningModule):
         return latent_vis
 
     def _log_images(
-        self,
-        targets: torch.Tensor,
-        reconstructions: torch.Tensor,
-        latent: torch.Tensor,
-        prefix: str,
+            self,
+            targets: torch.Tensor,
+            reconstructions: torch.Tensor,
+            latent: torch.Tensor,
+            prefix: str,
     ) -> None:
         """
         Log images to TensorBoard.
@@ -788,7 +855,7 @@ class VAELightningModule(pl.LightningModule):
 
     @classmethod
     def load_from_checkpoint(
-        cls, checkpoint_path: str, config: Optional[Dict[str, Any]] = None, **kwargs
+            cls, checkpoint_path: str, config: Optional[Dict[str, Any]] = None, **kwargs
     ) -> "VAELightningModule":
         """
         Load model from Lightning checkpoint.
