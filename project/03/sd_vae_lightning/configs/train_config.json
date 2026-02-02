@@ -23,7 +23,8 @@
         "disc_warmup_steps": 2000,
         "disc_loss_type": "hinge",
         "use_adaptive_disc_weight": true,
-        "adaptive_weight_max": 10.0
+        "adaptive_weight_max": 10.0,
+        "disc_weight_ema_decay": 0.999
     },
     "data": {
         "dataset_name": "huggan/flowers-102-categories",

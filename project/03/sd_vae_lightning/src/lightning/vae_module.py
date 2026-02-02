@@ -197,6 +197,9 @@ class VAELightningModule(pl.LightningModule):
         self.use_adaptive_disc_weight = loss_config.get("use_adaptive_disc_weight", True)
         self.disc_warmup_steps = loss_config.get("disc_warmup_steps", 1000)
         self.adaptive_weight_max = loss_config.get("adaptive_weight_max", 10.0)
+        self.disc_weight_ema_decay = loss_config.get("disc_weight_ema_decay", None)
+        if self.disc_weight_ema_decay is not None:
+            self.register_buffer("disc_weight_ema", torch.tensor(1.0))
 
         # Training config
         train_config = config.get("training", {})
@@ -223,6 +226,9 @@ class VAELightningModule(pl.LightningModule):
         # Cache for G/D loss ratio computation across alternating steps
         self._cached_g_loss: Optional[torch.Tensor] = None
         self._cached_vae_loss_dict: Optional[Dict[str, torch.Tensor]] = None
+
+        # Training epoch metrics accumulator
+        self._train_epoch_metrics: Dict[str, List[torch.Tensor]] = {}
 
     def forward(
             self,
@@ -353,6 +359,28 @@ class VAELightningModule(pl.LightningModule):
         """
         return g_loss / (d_loss + eps)
 
+    def _update_disc_weight_ema(
+            self,
+            current_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Update discriminator weight EMA and return smoothed value.
+        Uses exponential moving average to smooth the adaptive discriminator
+        weight over training steps, reducing variance in the training signal.
+        Args:
+            current_weight: Current adaptive discriminator weight.
+        Returns:
+            EMA smoothed discriminator weight.
+        """
+        if self.disc_weight_ema_decay is None:
+            return current_weight
+        # Update EMA: ema = decay * ema + (1 - decay) * current
+        self.disc_weight_ema = (
+                self.disc_weight_ema_decay * self.disc_weight_ema +
+                (1.0 - self.disc_weight_ema_decay) * current_weight.detach()
+        )
+        return self.disc_weight_ema.clone()
+
     def _calculate_adaptive_weight(
             self,
             nll_loss: torch.Tensor,
@@ -475,6 +503,7 @@ class VAELightningModule(pl.LightningModule):
                     d_weight = self._calculate_adaptive_weight(
                         nll_loss, g_loss, last_layer
                     )
+                    d_weight = self._update_disc_weight_ema(d_weight)
                     loss_dict["disc_weight"] = d_weight
                 else:
                     d_weight = torch.tensor(self.disc_weight, device=targets.device)
@@ -532,6 +561,33 @@ class VAELightningModule(pl.LightningModule):
             loss_dict.update(win_rate_dict)
 
             return d_loss, loss_dict
+
+    def _accumulate_epoch_metrics(self, loss_dict: Dict[str, torch.Tensor], prefix: str) -> None:
+        """
+        Accumulate metrics for epoch-level logging.
+
+        Args:
+            loss_dict: Dictionary of loss values.
+            prefix: Prefix for metric keys.
+        """
+        for key, value in loss_dict.items():
+            metric_key = f"{prefix}/{key}"
+            if metric_key not in self._train_epoch_metrics:
+                self._train_epoch_metrics[metric_key] = []
+            self._train_epoch_metrics[metric_key].append(value.detach())
+
+    def on_train_epoch_start(self) -> None:
+        """Reset epoch metrics accumulator at the start of each epoch."""
+        self._train_epoch_metrics = {}
+
+    def on_train_epoch_end(self) -> None:
+        """Log epoch-level training metrics."""
+        for key, values in self._train_epoch_metrics.items():
+            if len(values) > 0:
+                stacked = torch.stack(values)
+                mean_value = stacked.mean()
+                self.log(f"epoch/{key}", mean_value, on_step=False, on_epoch=True, prog_bar=False)
+        self._train_epoch_metrics = {}
 
     def training_step(
             self, batch: Dict[str, torch.Tensor], batch_idx: int
@@ -601,9 +657,12 @@ class VAELightningModule(pl.LightningModule):
                 opt_vae.step()
                 opt_vae.zero_grad()
 
-            # Log VAE losses
+            # Log VAE losses (step-level only)
             for key, value in vae_loss_dict.items():
-                self.log(f"train/{key}", value, on_step=True, on_epoch=True, prog_bar=True)
+                self.log(f"train/{key}", value, on_step=True, on_epoch=False, prog_bar=True)
+
+            # Accumulate for epoch-level logging
+            self._accumulate_epoch_metrics(vae_loss_dict, "train")
 
             # Cache g_loss and loss dict for G/D ratio computation in discriminator step
             self._cached_g_loss = vae_loss_dict.get("g_loss", torch.tensor(0.0, device=targets.device))
@@ -637,16 +696,19 @@ class VAELightningModule(pl.LightningModule):
                     opt_disc.step()
                     opt_disc.zero_grad()
 
-                # Log discriminator losses
-                for key, value in disc_loss_dict.items():
-                    self.log(f"train/{key}", value, on_step=True, on_epoch=True, prog_bar=True)
-
-                # Compute and log G/D loss ratio using cached g_loss from previous VAE step
+                # Compute G/D loss ratio using cached g_loss from previous VAE step
                 if self._cached_g_loss is not None:
                     g_loss = self._cached_g_loss
                     d_loss = disc_loss_dict.get("d_loss", torch.tensor(1.0, device=targets.device))
                     gd_ratio = self._compute_loss_ratio(g_loss, d_loss)
-                    self.log("train/gd_loss_ratio", gd_ratio, on_step=True, on_epoch=True, prog_bar=True)
+                    disc_loss_dict["gd_loss_ratio"] = gd_ratio
+
+                # Log discriminator losses (step-level only)
+                for key, value in disc_loss_dict.items():
+                    self.log(f"train/{key}", value, on_step=True, on_epoch=False, prog_bar=True)
+
+                # Accumulate for epoch-level logging
+                self._accumulate_epoch_metrics(disc_loss_dict, "train")
 
                 return disc_loss
 
@@ -683,9 +745,9 @@ class VAELightningModule(pl.LightningModule):
         loss_dict["psnr"] = psnr
         loss_dict["ssim"] = ssim
 
-        # Log losses
+        # Log losses to epoch section
         for key, value in loss_dict.items():
-            self.log(f"val/{key}", value, on_step=False, on_epoch=True, prog_bar=True)
+            self.log(f"epoch/val/{key}", value, on_step=False, on_epoch=True, prog_bar=True)
 
         # Store for epoch end logging
         if batch_idx < self.num_val_images:
@@ -703,7 +765,7 @@ class VAELightningModule(pl.LightningModule):
         """Log validation images and compute epoch-level metrics at epoch end."""
         # Compute and log rFID score
         rfid_score = self.rfid_metric.compute()
-        self.log("val/rfid", rfid_score, on_epoch=True, prog_bar=True)
+        self.log("epoch/val/rfid", rfid_score, on_epoch=True, prog_bar=True)
         self.rfid_metric.reset()
 
         if len(self.validation_step_outputs) > 0:
