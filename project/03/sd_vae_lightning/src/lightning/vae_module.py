@@ -589,6 +589,22 @@ class VAELightningModule(pl.LightningModule):
                 self.log(f"epoch/{key}", mean_value, on_step=False, on_epoch=True, prog_bar=False)
         self._train_epoch_metrics = {}
 
+    def _compute_grad_norm(self, parameters) -> torch.Tensor:
+        """
+        Compute total gradient norm for given parameters.
+
+        Args:
+            parameters: Iterator of model parameters.
+
+        Returns:
+            Total L2 norm of gradients.
+        """
+        total_norm_sq = 0.0
+        for p in parameters:
+            if p.grad is not None:
+                total_norm_sq += p.grad.data.norm(2).item() ** 2
+        return torch.tensor(total_norm_sq ** 0.5)
+
     def training_step(
             self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> STEP_OUTPUT:
@@ -649,6 +665,7 @@ class VAELightningModule(pl.LightningModule):
 
             # Step optimizer only at accumulation boundary
             if is_last_accumulation_step:
+                grad_norm = self._compute_grad_norm(self.vae.parameters())
                 self.clip_gradients(
                     opt_vae,
                     gradient_clip_val=self.gradient_clip_val,
@@ -657,7 +674,8 @@ class VAELightningModule(pl.LightningModule):
                 opt_vae.step()
                 opt_vae.zero_grad()
 
-            # Log VAE losses (step-level only)
+                self.log("train/grad_norm_vae", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
+
             for key, value in vae_loss_dict.items():
                 self.log(f"train/{key}", value, on_step=True, on_epoch=False, prog_bar=True)
 
@@ -668,11 +686,7 @@ class VAELightningModule(pl.LightningModule):
             self._cached_g_loss = vae_loss_dict.get("g_loss", torch.tensor(0.0, device=targets.device))
             self._cached_vae_loss_dict = vae_loss_dict
 
-            # Log images periodically (only during VAE training steps)
-            if is_last_accumulation_step and self.global_step % self.log_images_every_n_steps == 0:
-                self._log_images(targets, reconstructions, latent, "train")
-
-            return vae_loss
+            result = vae_loss
 
         else:
             # ========== Train Discriminator ==========
@@ -688,15 +702,17 @@ class VAELightningModule(pl.LightningModule):
 
                 # Step optimizer only at accumulation boundary
                 if is_last_accumulation_step:
+                    grad_norm = self._compute_grad_norm(self.discriminator.parameters())
                     self.clip_gradients(
                         opt_disc,
                         gradient_clip_val=self.gradient_clip_val,
-                        gradient_clip_algorithm="norm",
+                        gradient_clip_algorithm="norm"
                     )
                     opt_disc.step()
                     opt_disc.zero_grad()
 
-                # Compute G/D loss ratio using cached g_loss from previous VAE step
+                    self.log("train/grad_norm_disc", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
+
                 if self._cached_g_loss is not None:
                     g_loss = self._cached_g_loss
                     d_loss = disc_loss_dict.get("d_loss", torch.tensor(1.0, device=targets.device))
@@ -709,10 +725,14 @@ class VAELightningModule(pl.LightningModule):
 
                 # Accumulate for epoch-level logging
                 self._accumulate_epoch_metrics(disc_loss_dict, "train")
+                result = disc_loss
+            else:
+                result = None
 
-                return disc_loss
+        if is_last_accumulation_step and self.global_step % self.log_images_every_n_steps == 0:
+            self._log_images(targets, reconstructions, latent, "train")
 
-            return None
+        return result
 
     def validation_step(
             self, batch: Dict[str, torch.Tensor], batch_idx: int
@@ -747,7 +767,7 @@ class VAELightningModule(pl.LightningModule):
 
         # Log losses to epoch section
         for key, value in loss_dict.items():
-            self.log(f"epoch/val/{key}", value, on_step=False, on_epoch=True, prog_bar=True)
+            self.log(f"val/{key}", value, on_step=False, on_epoch=True, prog_bar=True)
 
         # Store for epoch end logging
         if batch_idx < self.num_val_images:
@@ -765,7 +785,7 @@ class VAELightningModule(pl.LightningModule):
         """Log validation images and compute epoch-level metrics at epoch end."""
         # Compute and log rFID score
         rfid_score = self.rfid_metric.compute()
-        self.log("epoch/val/rfid", rfid_score, on_epoch=True, prog_bar=True)
+        self.log("val/rfid", rfid_score, on_epoch=True, prog_bar=True)
         self.rfid_metric.reset()
 
         if len(self.validation_step_outputs) > 0:
