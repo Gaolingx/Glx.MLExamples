@@ -21,7 +21,6 @@ from torch.optim.lr_scheduler import (
     CosineAnnealingWarmRestarts
 )
 from pytorch_lightning.utilities.types import STEP_OUTPUT
-from diffusers.training_utils import EMAModel
 import lpips
 import torchvision
 
@@ -284,12 +283,6 @@ class VAELightningModule(pl.LightningModule):
         self.accumulate_grad_batches = train_config.get("accumulate_grad_batches", 1)
         self.gradient_clip_val = train_config.get("gradient_clip_val", 1.0)
 
-        # EMA configuration
-        self.use_ema = train_config.get("use_ema", True)
-        self.ema_decay = train_config.get("ema_decay", 0.9999)
-        self.ema_update_interval = train_config.get("ema_update_interval", 1)
-        self.ema: Optional[EMAModel] = None  # Initialized in on_fit_start
-
         # Logging config
         log_config = config.get("logging", {})
         self.log_images_every_n_steps = log_config.get("log_images_every_n_steps", 500)
@@ -311,35 +304,6 @@ class VAELightningModule(pl.LightningModule):
 
         # Training epoch metrics accumulator
         self._train_epoch_metrics: Dict[str, List[torch.Tensor]] = {}
-
-    def on_fit_start(self) -> None:
-        """Initialize EMA model at the start of training."""
-        if self.use_ema:
-            if self.ema is None:
-                self.ema = EMAModel(
-                    self.vae.parameters(),
-                    decay=self.ema_decay,
-                    model_cls=AutoencoderKL,
-                    model_config=self.vae.config,
-                )
-
-            self.ema.to(self.device)
-
-    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        if self.use_ema and self.ema is not None:
-            checkpoint["ema_state"] = self.ema.state_dict()
-
-    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        if self.use_ema and "ema_state" in checkpoint:
-            if self.ema is None:
-                self.ema = EMAModel(
-                    self.vae.parameters(),
-                    decay=self.ema_decay,
-                    model_cls=AutoencoderKL,
-                    model_config=self.vae.config,
-                )
-
-            self.ema.load_state_dict(checkpoint["ema_state"])
 
     def forward(
             self,
@@ -781,10 +745,6 @@ class VAELightningModule(pl.LightningModule):
                 else:
                     vae_scheduler = schedulers
                 vae_scheduler.step()
-                # Update EMA
-                if self.use_ema and self.ema is not None:
-                    if self.global_step % self.ema_update_interval == 0:
-                        self.ema.step(self.vae.parameters())
 
                 self.log("train/grad_norm_vae", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
 
@@ -877,47 +837,36 @@ class VAELightningModule(pl.LightningModule):
             Loss dictionary.
         """
         targets = batch["pixel_values"]
+        reconstructions, latent, posterior = self.forward_with_latent(targets, sample_posterior=False)
 
-        # Use EMA weights for validation if available
-        if self.use_ema and self.ema is not None:
-            self.ema.store(self.vae.parameters())
-            self.ema.copy_to(self.vae.parameters())
+        loss, loss_dict = self.compute_loss(
+            targets, reconstructions, posterior, optimizer_idx=0, global_step=self.global_step, training=False
+        )
 
-        try:
-            reconstructions, latent, posterior = self.forward_with_latent(targets, sample_posterior=False)
+        # Compute PSNR and SSIM
+        with torch.no_grad():
+            psnr = self.psnr_metric(reconstructions, targets)
+            ssim = self.ssim_metric(reconstructions, targets)
 
-            loss, loss_dict = self.compute_loss(
-                targets, reconstructions, posterior, optimizer_idx=0, global_step=self.global_step, training=False
+            # Update rFID metric with current batch
+            self.rfid_metric.update(targets, reconstructions)
+
+        loss_dict["psnr"] = psnr
+        loss_dict["ssim"] = ssim
+
+        # Log losses
+        for key, value in loss_dict.items():
+            self.log(f"val/{key}", value, on_step=False, on_epoch=True, prog_bar=True)
+
+        # Store for epoch end logging
+        if batch_idx < self.num_val_images:
+            self.validation_step_outputs.append(
+                {
+                    "targets": targets.detach().cpu(),
+                    "reconstructions": reconstructions.detach().cpu(),
+                    "latent": latent.detach().cpu(),
+                }
             )
-
-            # Compute PSNR and SSIM
-            with torch.no_grad():
-                psnr = self.psnr_metric(reconstructions, targets)
-                ssim = self.ssim_metric(reconstructions, targets)
-
-                # Update rFID metric with current batch
-                self.rfid_metric.update(targets, reconstructions)
-
-            loss_dict["psnr"] = psnr
-            loss_dict["ssim"] = ssim
-
-            # Log losses to epoch section
-            for key, value in loss_dict.items():
-                self.log(f"val/{key}", value, on_step=False, on_epoch=True, prog_bar=True)
-
-            # Store for epoch end logging
-            if batch_idx < self.num_val_images:
-                self.validation_step_outputs.append(
-                    {
-                        "targets": targets.detach().cpu(),
-                        "reconstructions": reconstructions.detach().cpu(),
-                        "latent": latent.detach().cpu(),
-                    }
-                )
-        finally:
-            # Restore original weights
-            if self.use_ema and self.ema is not None:
-                self.ema.restore(self.vae.parameters())
 
         return loss_dict
 
@@ -1191,26 +1140,11 @@ class VAELightningModule(pl.LightningModule):
         Args:
             save_directory: Path to save directory.
         """
-        save_path = Path(save_directory)
-        save_path.mkdir(parents=True, exist_ok=True)
-
-        # Save VAE (optionally use EMA weights)
-        if self.use_ema and self.ema is not None:
-            self.ema.store(self.vae.parameters())
-            self.ema.copy_to(self.vae.parameters())
-
-            self.vae.save_pretrained(save_directory)
-
-            self.ema.restore(self.vae.parameters())
-
-            ema_path = save_path / "ema_state.pt"
-            torch.save(self.ema.state_dict(), ema_path)
-        else:
-            self.vae.save_pretrained(save_directory)
+        self.vae.save_pretrained(save_directory)
 
         # Save discriminator if exists
         if self.discriminator is not None:
-            disc_path = save_path / "discriminator.pt"
+            disc_path = Path(save_directory) / "discriminator.pt"
             torch.save(self.discriminator.state_dict(), disc_path)
 
     @classmethod
