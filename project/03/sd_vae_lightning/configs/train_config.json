@@ -1,7 +1,7 @@
 {
     "training": {
         "seed": 42,
-        "batch_size": 1,
+        "batch_size": 4,
         "num_epochs": 100,
         "learning_rate": 4.5e-6,
         "disc_learning_rate": 4.5e-6,
@@ -10,8 +10,24 @@
         "accumulate_grad_batches": 1,
         "precision": "16-mixed",
         "num_workers": 4,
-        "adam_beta1": 0.9,
-        "adam_beta2": 0.999
+        "adam_beta1": 0.5,
+        "adam_beta2": 0.9,
+        "use_ema": true,
+        "ema_decay": 0.9999,
+        "ema_update_interval": 1,
+        "lr_scheduler": "constant_with_warmup",
+        "disc_lr_scheduler": "constant_with_warmup",
+        "lr_warmup_steps": 500,
+        "max_train_steps": 100000,
+        "lr_num_cycles": 1,
+        "lr_power": 1.0
+    },
+    "discriminator": {
+        "input_nc": 3,
+        "ndf": 64,
+        "n_layers": 3,
+        "norm_type": "spectral_group",
+        "num_groups": 32
     },
     "loss": {
         "rec_loss_type": "l2",
@@ -20,11 +36,10 @@
         "disc_weight": 1.0,
         "disc_factor": 1.0,
         "disc_start_step": 50001,
-        "disc_warmup_steps": 2000,
         "disc_loss_type": "hinge",
         "use_adaptive_disc_weight": true,
-        "adaptive_weight_max": 10.0,
-        "disc_weight_ema_decay": 0.999
+        "adaptive_weight_max": 1.0,
+        "disc_weight_ema_decay": 0.99
     },
     "data": {
         "dataset_name": "huggan/flowers-102-categories",
@@ -42,7 +57,7 @@
     "logging": {
         "log_every_n_steps": 5,
         "val_check_interval": 500,
-        "log_images_every_n_steps": 500,
+        "log_images_every_n_steps": 100,
         "num_val_images": 4
     },
     "paths": {

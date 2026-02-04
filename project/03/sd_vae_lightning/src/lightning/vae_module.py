@@ -4,14 +4,24 @@ Supports TensorBoard logging, checkpoint management, and various loss functions.
 """
 
 from typing import Optional, Dict, Any, Tuple, List
-import json
+from copy import deepcopy
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+from torch.optim.lr_scheduler import (
+    LambdaLR,
+    CosineAnnealingLR,
+    LinearLR,
+    SequentialLR,
+    PolynomialLR,
+    ConstantLR,
+    CosineAnnealingWarmRestarts
+)
 from pytorch_lightning.utilities.types import STEP_OUTPUT
+from diffusers.training_utils import EMAModel
 import lpips
 import torchvision
 
@@ -28,6 +38,8 @@ class NLayerDiscriminator(nn.Module):
         input_nc: Number of input channels.
         ndf: Base number of discriminator filters.
         n_layers: Number of layers in discriminator.
+        norm_type: Normalization type.
+        num_groups: Number of groups for GroupNorm (default: 32).
     """
 
     def __init__(
@@ -35,12 +47,47 @@ class NLayerDiscriminator(nn.Module):
             input_nc: int = 3,
             ndf: int = 64,
             n_layers: int = 3,
+            norm_type: str = "spectral_group",
+            num_groups: int = 32,
     ):
         super().__init__()
+        self.norm_type = norm_type
+        self.n_layers = n_layers
 
+        use_spectral = norm_type in ("spectral", "spectral_group")
+
+        def get_norm_layer(num_features: int) -> nn.Module:
+            """Get appropriate normalization layer."""
+            if norm_type == "batch":
+                return nn.BatchNorm2d(num_features)
+            elif norm_type in ("group", "spectral_group"):
+                # Ensure num_groups doesn't exceed num_features
+                groups = min(num_groups, num_features)
+                # Ensure num_features is divisible by groups
+                while num_features % groups != 0 and groups > 1:
+                    groups //= 2
+                return nn.GroupNorm(num_groups=groups, num_channels=num_features)
+            elif norm_type == "layer":
+                # LayerNorm needs to be applied differently, use GroupNorm with groups=1
+                return nn.GroupNorm(num_groups=1, num_channels=num_features)
+            else:  # 'spectral' or 'none'
+                return nn.Identity()
+
+        def maybe_spectral_norm(layer: nn.Module) -> nn.Module:
+            """Apply spectral normalization if needed."""
+            if use_spectral:
+                return nn.utils.spectral_norm(layer)
+            return layer
+
+        # Determine if bias should be used (no bias when using normalization)
+        use_bias = norm_type in ("none", "spectral")
+
+        # First layer - no normalization typically
         layers = [
-            nn.Conv2d(input_nc, ndf, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(0.2, True),
+            maybe_spectral_norm(
+                nn.Conv2d(input_nc, ndf, kernel_size=4, stride=2, padding=1)
+            ),
+            nn.LeakyReLU(0.2, inplace=True),
         ]
 
         nf_mult = 1
@@ -48,53 +95,74 @@ class NLayerDiscriminator(nn.Module):
             nf_mult_prev = nf_mult
             nf_mult = min(2 ** n, 8)
             layers += [
-                nn.Conv2d(
-                    ndf * nf_mult_prev,
-                    ndf * nf_mult,
-                    kernel_size=4,
-                    stride=2,
-                    padding=1,
-                    bias=False,
+                maybe_spectral_norm(
+                    nn.Conv2d(
+                        ndf * nf_mult_prev,
+                        ndf * nf_mult,
+                        kernel_size=4,
+                        stride=2,
+                        padding=1,
+                        bias=use_bias,
+                    )
                 ),
-                nn.BatchNorm2d(ndf * nf_mult),
-                nn.LeakyReLU(0.2, True),
+                get_norm_layer(ndf * nf_mult),
+                nn.LeakyReLU(0.2, inplace=True),
             ]
 
         nf_mult_prev = nf_mult
         nf_mult = min(2 ** n_layers, 8)
 
         layers += [
-            nn.Conv2d(
-                ndf * nf_mult_prev,
-                ndf * nf_mult,
-                kernel_size=4,
-                stride=1,
-                padding=1,
-                bias=False,
+            maybe_spectral_norm(
+                nn.Conv2d(
+                    ndf * nf_mult_prev,
+                    ndf * nf_mult,
+                    kernel_size=4,
+                    stride=1,
+                    padding=1,
+                    bias=use_bias,
+                )
             ),
-            nn.BatchNorm2d(ndf * nf_mult),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(ndf * nf_mult, 1, kernel_size=4, stride=1, padding=1),
+            get_norm_layer(ndf * nf_mult),
+            nn.LeakyReLU(0.2, inplace=True),
         ]
 
-        self.model = nn.Sequential(*layers)
+        # Final output layer
+        self.features = nn.Sequential(*layers)
+        self.output_layer = maybe_spectral_norm(
+            nn.Conv2d(ndf * nf_mult, 1, kernel_size=4, stride=1, padding=1)
+        )
 
         # Initialize weights
-        self.apply(self._init_weights)
+        self._init_weights()
 
-    def _init_weights(self, m):
-        """Initialize weights with normal distribution."""
-        classname = m.__class__.__name__
-        if classname.find("Conv") != -1:
-            nn.init.normal_(m.weight.data, 0.0, 0.02)
-        elif classname.find("BatchNorm") != -1:
-            nn.init.normal_(m.weight.data, 1.0, 0.02)
-            nn.init.constant_(m.bias.data, 0)
+    def _init_weights(self) -> None:
+        """Initialize weights with appropriate scheme based on norm type."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                # Check if this layer has spectral norm applied
+                if hasattr(m, 'weight_orig'):
+                    # Spectral norm case - use orthogonal init
+                    nn.init.orthogonal_(m.weight_orig.data)
+                else:
+                    nn.init.normal_(m.weight.data, 0.0, 0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias.data, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.normal_(m.weight.data, 1.0, 0.02)
+                nn.init.constant_(m.bias.data, 0)
+            elif isinstance(m, nn.GroupNorm):
+                nn.init.constant_(m.weight.data, 1.0)
+                nn.init.constant_(m.bias.data, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through discriminator."""
-        return self.model(x)
+        features = self.features(x)
+        return self.output_layer(features)
 
+    def get_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Get intermediate features (useful for feature matching loss)."""
+        return self.features(x)
 
 class VAELightningModule(pl.LightningModule):
     """
@@ -171,8 +239,16 @@ class VAELightningModule(pl.LightningModule):
         # Build discriminator
         loss_config = config.get("loss", {})
         self.use_discriminator = loss_config.get("disc_weight", 0) > 0
+
         if self.use_discriminator:
-            self.discriminator = NLayerDiscriminator(input_nc=3, ndf=64, n_layers=3)
+            disc_config = config.get("discriminator", {})
+            self.discriminator = NLayerDiscriminator(
+                input_nc=disc_config.get("input_nc", 3),
+                ndf=disc_config.get("ndf", 64),
+                n_layers=disc_config.get("n_layers", 3),
+                norm_type=disc_config.get("norm_type", "spectral_group"),  # Default: stable for low bs
+                num_groups=disc_config.get("num_groups", 32),
+            )
             self.disc_start_step = loss_config.get("disc_start_step", 50001)
         else:
             self.discriminator = None
@@ -195,9 +271,9 @@ class VAELightningModule(pl.LightningModule):
         self.disc_loss_type = loss_config.get("disc_loss_type", "hinge")
         self.disc_factor = loss_config.get("disc_factor", 1.0)
         self.use_adaptive_disc_weight = loss_config.get("use_adaptive_disc_weight", True)
-        self.disc_warmup_steps = loss_config.get("disc_warmup_steps", 1000)
         self.adaptive_weight_max = loss_config.get("adaptive_weight_max", 10.0)
-        self.disc_weight_ema_decay = loss_config.get("disc_weight_ema_decay", None)
+        self.disc_weight_ema_decay = loss_config.get("disc_weight_ema_decay", 0.99)
+
         if self.disc_weight_ema_decay is not None:
             self.register_buffer("disc_weight_ema", torch.tensor(1.0))
 
@@ -207,6 +283,12 @@ class VAELightningModule(pl.LightningModule):
         self.disc_learning_rate = train_config.get("disc_learning_rate", 4.5e-6)
         self.accumulate_grad_batches = train_config.get("accumulate_grad_batches", 1)
         self.gradient_clip_val = train_config.get("gradient_clip_val", 1.0)
+
+        # EMA configuration
+        self.use_ema = train_config.get("use_ema", True)
+        self.ema_decay = train_config.get("ema_decay", 0.9999)
+        self.ema_update_interval = train_config.get("ema_update_interval", 1)
+        self.ema: Optional[EMAModel] = None  # Initialized in on_fit_start
 
         # Logging config
         log_config = config.get("logging", {})
@@ -229,6 +311,35 @@ class VAELightningModule(pl.LightningModule):
 
         # Training epoch metrics accumulator
         self._train_epoch_metrics: Dict[str, List[torch.Tensor]] = {}
+
+    def on_fit_start(self) -> None:
+        """Initialize EMA model at the start of training."""
+        if self.use_ema:
+            if self.ema is None:
+                self.ema = EMAModel(
+                    self.vae.parameters(),
+                    decay=self.ema_decay,
+                    model_cls=AutoencoderKL,
+                    model_config=self.vae.config,
+                )
+
+            self.ema.to(self.device)
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        if self.use_ema and self.ema is not None:
+            checkpoint["ema_state"] = self.ema.state_dict()
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        if self.use_ema and "ema_state" in checkpoint:
+            if self.ema is None:
+                self.ema = EMAModel(
+                    self.vae.parameters(),
+                    decay=self.ema_decay,
+                    model_cls=AutoencoderKL,
+                    model_config=self.vae.config,
+                )
+
+            self.ema.load_state_dict(checkpoint["ema_state"])
 
     def forward(
             self,
@@ -367,8 +478,10 @@ class VAELightningModule(pl.LightningModule):
         Update discriminator weight EMA and return smoothed value.
         Uses exponential moving average to smooth the adaptive discriminator
         weight over training steps, reducing variance in the training signal.
+
         Args:
             current_weight: Current adaptive discriminator weight.
+
         Returns:
             EMA smoothed discriminator weight.
         """
@@ -389,16 +502,16 @@ class VAELightningModule(pl.LightningModule):
     ) -> torch.Tensor:
         """
         Calculate adaptive discriminator weight based on gradient norms.
-        
+
         This balances the reconstruction loss and adversarial loss by computing
         the ratio of their gradient norms w.r.t. the last decoder layer.
         Following the approach from taming-transformers and diffusers.
-        
+
         Args:
             nll_loss: Reconstruction + perceptual loss (NLL loss).
             g_loss: Generator adversarial loss.
             last_layer: Last layer weights of decoder for gradient computation.
-        
+
         Returns:
             Adaptive weight for discriminator loss, scaled by disc_weight.
         """
@@ -451,7 +564,8 @@ class VAELightningModule(pl.LightningModule):
         loss_dict = {}
 
         if optimizer_idx == 0:
-            # VAE losses
+            # ========== VAE (Generator) losses ==========
+
             # Reconstruction loss
             if self.rec_loss_type == "l2":
                 rec_loss = F.mse_loss(reconstructions, targets, reduction="none")
@@ -476,16 +590,8 @@ class VAELightningModule(pl.LightningModule):
             nll_loss = rec_loss + self.perceptual_weight * p_loss
             loss_dict["nll_loss"] = nll_loss
 
-            # Compute disc_factor with warmup
-            if global_step < self.disc_start_step:
-                disc_factor = 0.0
-            elif global_step < self.disc_start_step + self.disc_warmup_steps:
-                # Linear warmup from 0 to disc_factor
-                warmup_progress = (global_step - self.disc_start_step) / self.disc_warmup_steps
-                disc_factor = warmup_progress * self.disc_factor
-            else:
-                disc_factor = self.disc_factor
-
+            # Compute disc_factor based on disc_start_step
+            disc_factor = self.disc_factor if global_step >= self.disc_start_step else 0.0
             loss_dict["disc_factor"] = torch.tensor(disc_factor, device=targets.device)
 
             if (
@@ -493,6 +599,7 @@ class VAELightningModule(pl.LightningModule):
                     and global_step >= self.disc_start_step
                     and training
             ):
+                # Generator adversarial loss
                 logits_fake = self.discriminator(reconstructions)
                 g_loss = -logits_fake.mean()
                 loss_dict["g_loss"] = g_loss
@@ -524,7 +631,8 @@ class VAELightningModule(pl.LightningModule):
             return loss, loss_dict
 
         else:
-            # Discriminator loss
+            # ========== Discriminator losses ==========
+
             logits_real = self.discriminator(targets.detach())
             logits_fake = self.discriminator(reconstructions.detach())
 
@@ -539,16 +647,11 @@ class VAELightningModule(pl.LightningModule):
                     logits_fake, torch.zeros_like(logits_fake)
                 )
 
-            # Compute disc_factor with warmup for discriminator too
-            if global_step < self.disc_start_step:
-                disc_factor = 0.0
-            elif global_step < self.disc_start_step + self.disc_warmup_steps:
-                warmup_progress = (global_step - self.disc_start_step) / self.disc_warmup_steps
-                disc_factor = warmup_progress * self.disc_factor
-            else:
-                disc_factor = self.disc_factor
+            # Compute disc_factor based on disc_start_step
+            disc_factor = self.disc_factor if global_step >= self.disc_start_step else 0.0
 
             d_loss = disc_factor * 0.5 * (d_loss_real + d_loss_fake)
+
             loss_dict["d_loss"] = d_loss
             loss_dict["disc_factor"] = torch.tensor(disc_factor, device=targets.device)
             loss_dict["d_loss_real"] = d_loss_real
@@ -610,12 +713,12 @@ class VAELightningModule(pl.LightningModule):
     ) -> STEP_OUTPUT:
         """
         Training step with alternating VAE/Discriminator training.
-        
+
         Following the official diffusers implementation:
         - Even accumulated steps: train VAE (generator)
         - Odd accumulated steps: train Discriminator
         - Before disc_start_step: always train VAE only
-        
+
         Manual gradient accumulation is used to match the official behavior.
 
         Args:
@@ -636,13 +739,10 @@ class VAELightningModule(pl.LightningModule):
             opt_disc = None
 
         # Determine training phase based on accumulated step index
-        # accumulated_step_idx: which "logical" optimization step we're in
         accumulated_step_idx = batch_idx // self.accumulate_grad_batches
         is_last_accumulation_step = (batch_idx + 1) % self.accumulate_grad_batches == 0
 
         # Determine whether to train generator (VAE) or discriminator
-        # Even accumulated steps -> train VAE, Odd -> train Discriminator
-        # Always train VAE before disc_start_step
         train_generator = (
                 (accumulated_step_idx % 2 == 0) or
                 (self.global_step < self.disc_start_step) or
@@ -674,10 +774,29 @@ class VAELightningModule(pl.LightningModule):
                 opt_vae.step()
                 opt_vae.zero_grad()
 
+                # Step the VAE learning rate scheduler
+                schedulers = self.lr_schedulers()
+                if isinstance(schedulers, list):
+                    vae_scheduler = schedulers[0]
+                else:
+                    vae_scheduler = schedulers
+                vae_scheduler.step()
+                # Update EMA
+                if self.use_ema and self.ema is not None:
+                    if self.global_step % self.ema_update_interval == 0:
+                        self.ema.step(self.vae.parameters())
+
                 self.log("train/grad_norm_vae", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
 
             for key, value in vae_loss_dict.items():
                 self.log(f"train/{key}", value, on_step=True, on_epoch=False, prog_bar=True)
+            # Log learning rate
+            schedulers = self.lr_schedulers()
+            if isinstance(schedulers, list):
+                vae_lr = schedulers[0].get_last_lr()[0]
+            else:
+                vae_lr = schedulers.get_last_lr()[0]
+            self.log("train/lr", vae_lr, on_step=True, on_epoch=False, prog_bar=False)
 
             # Accumulate for epoch-level logging
             self._accumulate_epoch_metrics(vae_loss_dict, "train")
@@ -711,6 +830,11 @@ class VAELightningModule(pl.LightningModule):
                     opt_disc.step()
                     opt_disc.zero_grad()
 
+                    # Step the discriminator learning rate scheduler
+                    schedulers = self.lr_schedulers()
+                    if isinstance(schedulers, list) and len(schedulers) > 1:
+                        disc_scheduler = schedulers[1]
+                        disc_scheduler.step()
                     self.log("train/grad_norm_disc", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
 
                 if self._cached_g_loss is not None:
@@ -722,6 +846,11 @@ class VAELightningModule(pl.LightningModule):
                 # Log discriminator losses (step-level only)
                 for key, value in disc_loss_dict.items():
                     self.log(f"train/{key}", value, on_step=True, on_epoch=False, prog_bar=True)
+                # Log discriminator learning rate
+                schedulers = self.lr_schedulers()
+                if isinstance(schedulers, list) and len(schedulers) > 1:
+                    disc_lr = schedulers[1].get_last_lr()[0]
+                    self.log("train/disc_lr", disc_lr, on_step=True, on_epoch=False, prog_bar=False)
 
                 # Accumulate for epoch-level logging
                 self._accumulate_epoch_metrics(disc_loss_dict, "train")
@@ -748,36 +877,47 @@ class VAELightningModule(pl.LightningModule):
             Loss dictionary.
         """
         targets = batch["pixel_values"]
-        reconstructions, latent, posterior = self.forward_with_latent(targets, sample_posterior=False)
 
-        loss, loss_dict = self.compute_loss(
-            targets, reconstructions, posterior, optimizer_idx=0, global_step=self.global_step, training=False
-        )
+        # Use EMA weights for validation if available
+        if self.use_ema and self.ema is not None:
+            self.ema.store(self.vae.parameters())
+            self.ema.copy_to(self.vae.parameters())
 
-        # Compute PSNR and SSIM
-        with torch.no_grad():
-            psnr = self.psnr_metric(reconstructions, targets)
-            ssim = self.ssim_metric(reconstructions, targets)
+        try:
+            reconstructions, latent, posterior = self.forward_with_latent(targets, sample_posterior=False)
 
-            # Update rFID metric with current batch
-            self.rfid_metric.update(targets, reconstructions)
-
-        loss_dict["psnr"] = psnr
-        loss_dict["ssim"] = ssim
-
-        # Log losses to epoch section
-        for key, value in loss_dict.items():
-            self.log(f"val/{key}", value, on_step=False, on_epoch=True, prog_bar=True)
-
-        # Store for epoch end logging
-        if batch_idx < self.num_val_images:
-            self.validation_step_outputs.append(
-                {
-                    "targets": targets.detach().cpu(),
-                    "reconstructions": reconstructions.detach().cpu(),
-                    "latent": latent.detach().cpu(),
-                }
+            loss, loss_dict = self.compute_loss(
+                targets, reconstructions, posterior, optimizer_idx=0, global_step=self.global_step, training=False
             )
+
+            # Compute PSNR and SSIM
+            with torch.no_grad():
+                psnr = self.psnr_metric(reconstructions, targets)
+                ssim = self.ssim_metric(reconstructions, targets)
+
+                # Update rFID metric with current batch
+                self.rfid_metric.update(targets, reconstructions)
+
+            loss_dict["psnr"] = psnr
+            loss_dict["ssim"] = ssim
+
+            # Log losses to epoch section
+            for key, value in loss_dict.items():
+                self.log(f"val/{key}", value, on_step=False, on_epoch=True, prog_bar=True)
+
+            # Store for epoch end logging
+            if batch_idx < self.num_val_images:
+                self.validation_step_outputs.append(
+                    {
+                        "targets": targets.detach().cpu(),
+                        "reconstructions": reconstructions.detach().cpu(),
+                        "latent": latent.detach().cpu(),
+                    }
+                )
+        finally:
+            # Restore original weights
+            if self.use_ema and self.ema is not None:
+                self.ema.restore(self.vae.parameters())
 
         return loss_dict
 
@@ -908,6 +1048,23 @@ class VAELightningModule(pl.LightningModule):
             weight_decay=train_config.get("weight_decay", 0.01),
         )
 
+        # Get scheduler config
+        lr_scheduler_type = train_config.get("lr_scheduler", "constant_with_warmup")
+        lr_warmup_steps = train_config.get("lr_warmup_steps", 500)
+        lr_num_cycles = train_config.get("lr_num_cycles", 1)
+        lr_power = train_config.get("lr_power", 1.0)
+        # Estimate max training steps for scheduler
+        # This can be overridden by trainer's max_steps
+        max_train_steps = train_config.get("max_train_steps", 100000)
+        # Create VAE lr scheduler
+        vae_scheduler = self._get_scheduler(
+            optimizer=opt_vae,
+            scheduler_type=lr_scheduler_type,
+            num_warmup_steps=lr_warmup_steps,
+            num_training_steps=max_train_steps,
+            num_cycles=lr_num_cycles,
+            power=lr_power,
+        )
         if self.discriminator is not None:
             # Discriminator optimizer
             disc_params = list(self.discriminator.parameters())
@@ -917,9 +1074,115 @@ class VAELightningModule(pl.LightningModule):
                 betas=(train_config.get("adam_beta1", 0.9), train_config.get("adam_beta2", 0.999)),
                 weight_decay=train_config.get("weight_decay", 0.01),
             )
-            return [opt_vae, opt_disc]
+            # Get discriminator scheduler config (can be different from VAE)
+            disc_lr_scheduler_type = train_config.get("disc_lr_scheduler", lr_scheduler_type)
+            # Create discriminator lr scheduler
+            disc_scheduler = self._get_scheduler(
+                optimizer=opt_disc,
+                scheduler_type=disc_lr_scheduler_type,
+                num_warmup_steps=lr_warmup_steps,
+                num_training_steps=max_train_steps,
+                num_cycles=lr_num_cycles,
+                power=lr_power,
+            )
+            return (
+                [opt_vae, opt_disc],
+                [
+                    {"scheduler": vae_scheduler, "interval": "step", "frequency": 1},
+                    {"scheduler": disc_scheduler, "interval": "step", "frequency": 1},
+                ],
+            )
+        return {
+            "optimizer": opt_vae,
+            "lr_scheduler": {
+                "scheduler": vae_scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
 
-        return opt_vae
+    def _get_scheduler(
+            self,
+            optimizer: torch.optim.Optimizer,
+            scheduler_type: str,
+            num_warmup_steps: int,
+            num_training_steps: int,
+            num_cycles: int = 1,
+            power: float = 1.0,
+    ):
+        """
+        Create a learning rate scheduler.
+        Mirrors the behavior of diffusers.optimization.get_scheduler.
+        Args:
+            optimizer: The optimizer to schedule.
+            scheduler_type: Type of scheduler ('constant', 'constant_with_warmup', 
+                          'linear', 'cosine', 'cosine_with_restarts', 'polynomial').
+            num_warmup_steps: Number of warmup steps.
+            num_training_steps: Total number of training steps.
+            num_cycles: Number of cycles for cosine_with_restarts.
+            power: Power for polynomial scheduler.
+        Returns:
+            Learning rate scheduler.
+        """
+        if num_warmup_steps > 0:
+            warmup_scheduler = LinearLR(
+                optimizer,
+                start_factor=1e-10,
+                end_factor=1.0,
+                total_iters=num_warmup_steps
+            )
+        else:
+            warmup_scheduler = None
+
+        decay_steps = max(1, num_training_steps - num_warmup_steps)
+
+        if scheduler_type == "constant":
+            main_scheduler = ConstantLR(optimizer, factor=1.0, total_iters=decay_steps)
+
+        elif scheduler_type == "constant_with_warmup":
+            main_scheduler = ConstantLR(optimizer, factor=1.0, total_iters=decay_steps)
+
+        elif scheduler_type == "linear":
+            main_scheduler = PolynomialLR(
+                optimizer,
+                total_iters=decay_steps,
+                power=1.0
+            )
+
+        elif scheduler_type == "cosine":
+            main_scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=decay_steps,
+                eta_min=0.0
+            )
+
+        elif scheduler_type == "cosine_with_restarts":
+            cycle_steps = int(num_training_steps / max(1, num_cycles))
+            main_scheduler = CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=cycle_steps,
+                T_mult=1,
+                eta_min=0.0
+            )
+
+        elif scheduler_type == "polynomial":
+            main_scheduler = PolynomialLR(
+                optimizer,
+                total_iters=decay_steps,
+                power=power
+            )
+
+        else:
+            raise ValueError(f"Unknown scheduler type: {scheduler_type}")
+
+        if warmup_scheduler is not None:
+            return SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, main_scheduler],
+                milestones=[num_warmup_steps]
+            )
+        else:
+            return main_scheduler
 
     def save_pretrained(self, save_directory: str) -> None:
         """
@@ -928,11 +1191,26 @@ class VAELightningModule(pl.LightningModule):
         Args:
             save_directory: Path to save directory.
         """
-        self.vae.save_pretrained(save_directory)
+        save_path = Path(save_directory)
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        # Save VAE (optionally use EMA weights)
+        if self.use_ema and self.ema is not None:
+            self.ema.store(self.vae.parameters())
+            self.ema.copy_to(self.vae.parameters())
+
+            self.vae.save_pretrained(save_directory)
+
+            self.ema.restore(self.vae.parameters())
+
+            ema_path = save_path / "ema_state.pt"
+            torch.save(self.ema.state_dict(), ema_path)
+        else:
+            self.vae.save_pretrained(save_directory)
 
         # Save discriminator if exists
         if self.discriminator is not None:
-            disc_path = Path(save_directory) / "discriminator.pt"
+            disc_path = save_path / "discriminator.pt"
             torch.save(self.discriminator.state_dict(), disc_path)
 
     @classmethod
