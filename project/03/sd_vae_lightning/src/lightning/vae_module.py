@@ -11,18 +11,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from torch.optim.lr_scheduler import (
-    LambdaLR,
-    CosineAnnealingLR,
-    LinearLR,
-    SequentialLR,
-    PolynomialLR,
-    ConstantLR,
-    CosineAnnealingWarmRestarts
-)
+from torch.optim.lr_scheduler import LambdaLR
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 import lpips
 import torchvision
+import math
 
 from ..models.autoencoder_kl import AutoencoderKL
 from ..models.vae import DiagonalGaussianDistribution
@@ -163,6 +156,7 @@ class NLayerDiscriminator(nn.Module):
         """Get intermediate features (useful for feature matching loss)."""
         return self.features(x)
 
+
 class VAELightningModule(pl.LightningModule):
     """
     PyTorch Lightning module for training AutoencoderKL.
@@ -271,10 +265,6 @@ class VAELightningModule(pl.LightningModule):
         self.disc_factor = loss_config.get("disc_factor", 1.0)
         self.use_adaptive_disc_weight = loss_config.get("use_adaptive_disc_weight", True)
         self.adaptive_weight_max = loss_config.get("adaptive_weight_max", 10.0)
-        self.disc_weight_ema_decay = loss_config.get("disc_weight_ema_decay", 0.99)
-
-        if self.disc_weight_ema_decay is not None:
-            self.register_buffer("disc_weight_ema", torch.tensor(1.0))
 
         # Training config
         train_config = config.get("training", {})
@@ -434,30 +424,6 @@ class VAELightningModule(pl.LightningModule):
         """
         return g_loss / (d_loss + eps)
 
-    def _update_disc_weight_ema(
-            self,
-            current_weight: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Update discriminator weight EMA and return smoothed value.
-        Uses exponential moving average to smooth the adaptive discriminator
-        weight over training steps, reducing variance in the training signal.
-
-        Args:
-            current_weight: Current adaptive discriminator weight.
-
-        Returns:
-            EMA smoothed discriminator weight.
-        """
-        if self.disc_weight_ema_decay is None:
-            return current_weight
-        # Update EMA: ema = decay * ema + (1 - decay) * current
-        self.disc_weight_ema = (
-                self.disc_weight_ema_decay * self.disc_weight_ema +
-                (1.0 - self.disc_weight_ema_decay) * current_weight.detach()
-        )
-        return self.disc_weight_ema.clone()
-
     def _calculate_adaptive_weight(
             self,
             nll_loss: torch.Tensor,
@@ -574,7 +540,6 @@ class VAELightningModule(pl.LightningModule):
                     d_weight = self._calculate_adaptive_weight(
                         nll_loss, g_loss, last_layer
                     )
-                    d_weight = self._update_disc_weight_ema(d_weight)
                     loss_dict["disc_weight"] = d_weight
                 else:
                     d_weight = torch.tensor(self.disc_weight, device=targets.device)
@@ -1073,65 +1038,62 @@ class VAELightningModule(pl.LightningModule):
         Returns:
             Learning rate scheduler.
         """
-        if num_warmup_steps > 0:
-            warmup_scheduler = LinearLR(
-                optimizer,
-                start_factor=1e-10,
-                end_factor=1.0,
-                total_iters=num_warmup_steps
-            )
-        else:
-            warmup_scheduler = None
-
-        decay_steps = max(1, num_training_steps - num_warmup_steps)
-
         if scheduler_type == "constant":
-            main_scheduler = ConstantLR(optimizer, factor=1.0, total_iters=decay_steps)
-
+            return LambdaLR(optimizer, lambda _: 1.0)
         elif scheduler_type == "constant_with_warmup":
-            main_scheduler = ConstantLR(optimizer, factor=1.0, total_iters=decay_steps)
+            def lr_lambda(current_step: int):
+                if current_step < num_warmup_steps:
+                    return float(current_step) / float(max(1, num_warmup_steps))
+                return 1.0
 
+            return LambdaLR(optimizer, lr_lambda)
         elif scheduler_type == "linear":
-            main_scheduler = PolynomialLR(
-                optimizer,
-                total_iters=decay_steps,
-                power=1.0
-            )
+            def lr_lambda(current_step: int):
+                if current_step < num_warmup_steps:
+                    return float(current_step) / float(max(1, num_warmup_steps))
+                return max(
+                    0.0,
+                    float(num_training_steps - current_step) /
+                    float(max(1, num_training_steps - num_warmup_steps))
+                )
 
+            return LambdaLR(optimizer, lr_lambda)
         elif scheduler_type == "cosine":
-            main_scheduler = CosineAnnealingLR(
-                optimizer,
-                T_max=decay_steps,
-                eta_min=0.0
-            )
+            def lr_lambda(current_step: int):
+                if current_step < num_warmup_steps:
+                    return float(current_step) / float(max(1, num_warmup_steps))
+                progress = float(current_step - num_warmup_steps) / float(
+                    max(1, num_training_steps - num_warmup_steps)
+                )
+                return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
+            return LambdaLR(optimizer, lr_lambda)
         elif scheduler_type == "cosine_with_restarts":
-            cycle_steps = int(num_training_steps / max(1, num_cycles))
-            main_scheduler = CosineAnnealingWarmRestarts(
-                optimizer,
-                T_0=cycle_steps,
-                T_mult=1,
-                eta_min=0.0
-            )
+            def lr_lambda(current_step: int):
+                if current_step < num_warmup_steps:
+                    return float(current_step) / float(max(1, num_warmup_steps))
+                progress = float(current_step - num_warmup_steps) / float(
+                    max(1, num_training_steps - num_warmup_steps)
+                )
+                return max(0.0, 0.5 * (1.0 + math.cos(math.pi * ((progress * num_cycles) % 1.0))))
 
+            return LambdaLR(optimizer, lr_lambda)
         elif scheduler_type == "polynomial":
-            main_scheduler = PolynomialLR(
-                optimizer,
-                total_iters=decay_steps,
-                power=power
-            )
+            def lr_lambda(current_step: int):
+                if current_step < num_warmup_steps:
+                    return float(current_step) / float(max(1, num_warmup_steps))
+                lr_range = 1.0 - 0.0  # end_lr = 0.0
+                decay_steps = num_training_steps - num_warmup_steps
+                pct_remaining = 1 - (current_step - num_warmup_steps) / decay_steps
+                return lr_range * pct_remaining ** power
 
+            return LambdaLR(optimizer, lr_lambda)
         else:
-            raise ValueError(f"Unknown scheduler type: {scheduler_type}")
-
-        if warmup_scheduler is not None:
-            return SequentialLR(
-                optimizer,
-                schedulers=[warmup_scheduler, main_scheduler],
-                milestones=[num_warmup_steps]
+            raise ValueError(
+                f"Unknown scheduler type: {scheduler_type}. "
+                f"Choose from: constant, constant_with_warmup, linear, cosine, "
+                f"cosine_with_restarts, polynomial"
             )
-        else:
-            return main_scheduler
 
     def save_pretrained(self, save_directory: str) -> None:
         """
