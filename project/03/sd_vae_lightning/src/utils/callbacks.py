@@ -6,6 +6,7 @@ Includes image logging, checkpoint management, and training monitoring.
 from typing import Optional, Dict, Any, Tuple
 from pathlib import Path
 import json
+import os
 
 import torch
 import torch.nn.functional as F
@@ -179,9 +180,18 @@ class VAECheckpointCallback(ModelCheckpoint):
             hf_dir = Path(filepath).parent / "hf_checkpoint"
             hf_dir.mkdir(parents=True, exist_ok=True)
 
-            # Save VAE
-            if hasattr(trainer.lightning_module, "vae"):
-                trainer.lightning_module.vae.save_pretrained(str(hf_dir))
+            pl_module = trainer.lightning_module
+            vae_save_dir = hf_dir / "vae"
+            pl_module.vae.save_pretrained(str(vae_save_dir))
+
+            if getattr(pl_module, "use_ema", False) and getattr(pl_module, "ema", None) is not None:
+                ema_save_dir = hf_dir / "vae_ema"
+                print(f"Saving EMA weights to {ema_save_dir}...")
+
+                pl_module.ema.store(pl_module.vae.parameters())
+                pl_module.ema.copy_to(pl_module.vae.parameters())
+                pl_module.vae.save_pretrained(str(ema_save_dir))
+                pl_module.ema.restore(pl_module.vae.parameters())
 
             # Save training config
             config_path = hf_dir / "training_config.json"
