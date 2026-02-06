@@ -7,16 +7,23 @@ Usage:
     # Reconstruct an image
     python scripts/inference.py --input image.jpg --output reconstructed.jpg
 
+    # Reconstruct multiple images (batch)
+    python scripts/inference.py --input images_dir/ --output output_dir/ --batch_size 4
+
     # Encode to latent
     python scripts/inference.py --input image.jpg --encode --output latent.pt
 
-    # Decode from latent
-    python scripts/inference.py --input latent.pt --decode --output decoded.jpg
+    # Decode from latent (batch)
+    python scripts/inference.py --input latents_dir/ --decode --output decoded_dir/
+
+    # Custom resolution (non-square)
+    python scripts/inference.py --input image.jpg --output out.jpg --width 768 --height 512
 """
 
 import argparse
 import sys
 from pathlib import Path
+from typing import List, Tuple, Optional, Iterator
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -26,9 +33,14 @@ import torch
 import numpy as np
 from PIL import Image
 from torchvision import transforms
+from tqdm import tqdm
 
 from src.models.autoencoder_kl import AutoencoderKL
 from src.lightning.vae_module import VAELightningModule
+
+# Supported file extensions
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+LATENT_EXTENSIONS = {".pt", ".pth"}
 
 
 def parse_args():
@@ -50,13 +62,13 @@ def parse_args():
         "--input",
         type=str,
         required=True,
-        help="Input image path or latent tensor path",
+        help="Input image/latent path or directory for batch processing",
     )
     parser.add_argument(
         "--output",
         type=str,
         required=True,
-        help="Output path",
+        help="Output path or directory",
     )
     parser.add_argument(
         "--encode",
@@ -68,11 +80,30 @@ def parse_args():
         action="store_true",
         help="Decode latent to image",
     )
+    # Resolution options
     parser.add_argument(
         "--resolution",
         type=int,
         default=512,
-        help="Image resolution",
+        help="Image resolution (square, used if --width/--height not set)",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="Image width (must be divisible by 8)",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        help="Image height (must be divisible by 8)",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Batch size for processing multiple inputs",
     )
     parser.add_argument(
         "--device",
@@ -87,7 +118,46 @@ def parse_args():
         choices=["float16", "float32", "bfloat16"],
         help="Model dtype",
     )
+    parser.add_argument(
+        "--no_metrics",
+        action="store_true",
+        help="Skip metrics computation for reconstruction",
+    )
+    parser.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Suppress per-file output, show only progress bar",
+    )
     return parser.parse_args()
+
+
+def get_resolution(args) -> Tuple[int, int]:
+    """
+    Get target resolution (width, height) from arguments.
+    Ensures dimensions are divisible by 8 (VAE requirement).
+
+    Returns:
+        Tuple of (width, height).
+    """
+    if args.width is not None and args.height is not None:
+        width, height = args.width, args.height
+    elif args.width is not None:
+        width, height = args.width, args.width
+    elif args.height is not None:
+        width, height = args.height, args.height
+    else:
+        width, height = args.resolution, args.resolution
+
+    # Ensure divisible by 8
+    orig_width, orig_height = width, height
+    width = (width // 8) * 8
+    height = (height // 8) * 8
+
+    if width != orig_width or height != orig_height:
+        print(f"Adjusted resolution: {orig_width}x{orig_height} -> {width}x{height} (must be divisible by 8)")
+
+    return width, height
 
 
 def load_model(args) -> AutoencoderKL:
@@ -112,13 +182,12 @@ def load_model(args) -> AutoencoderKL:
     return model
 
 
-def load_image(path: str, resolution: int) -> torch.Tensor:
-    """Load and preprocess image."""
+def load_image(path: str, width: int, height: int) -> torch.Tensor:
+    """Load and preprocess image with custom resolution."""
     image = Image.open(path).convert("RGB")
 
     transform = transforms.Compose([
-        transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-        transforms.CenterCrop(resolution),
+        transforms.Resize((height, width), interpolation=transforms.InterpolationMode.BILINEAR),
         transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5]),  # Scale to [-1, 1]
     ])
@@ -132,12 +201,242 @@ def save_image(tensor: torch.Tensor, path: str) -> None:
     tensor = (tensor + 1) / 2
     tensor = torch.clamp(tensor, 0, 1)
 
+    # Handle batch dimension
+    if tensor.dim() == 4:
+        tensor = tensor.squeeze(0)
+
     # Convert to numpy
-    tensor = tensor.squeeze(0).cpu().permute(1, 2, 0).numpy()
+    tensor = tensor.cpu().permute(1, 2, 0).numpy()
     tensor = (tensor * 255).astype(np.uint8)
+
+    # Ensure output directory exists
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
 
     # Save
     Image.fromarray(tensor).save(path)
+
+
+def get_input_paths(input_path: str, mode: str = "image") -> List[Path]:
+    """
+    Get list of input paths from file or directory.
+
+    Args:
+        input_path: Single file or directory.
+        mode: "image" or "latent" to filter extensions.
+
+    Returns:
+        Sorted list of Path objects.
+    """
+    path = Path(input_path)
+
+    if path.is_file():
+        return [path]
+    elif path.is_dir():
+        extensions = IMAGE_EXTENSIONS if mode == "image" else LATENT_EXTENSIONS
+        files = [f for f in path.iterdir() if f.suffix.lower() in extensions]
+        return sorted(files)
+    else:
+        raise ValueError(f"Input path does not exist: {input_path}")
+
+
+def get_output_path(input_path: Path, output_arg: str, new_suffix: Optional[str] = None) -> Path:
+    """
+    Determine output path based on input and output arguments.
+
+    Args:
+        input_path: Original input path.
+        output_arg: Output argument (file or directory).
+        new_suffix: New file extension (e.g., ".pt", ".png").
+
+    Returns:
+        Output Path object.
+    """
+    output = Path(output_arg)
+
+    # If output has a file extension, treat as file
+    if output.suffix and output.suffix.lower() in IMAGE_EXTENSIONS | LATENT_EXTENSIONS:
+        return output
+
+    # Treat as directory
+    output.mkdir(parents=True, exist_ok=True)
+
+    stem = input_path.stem
+    suffix = new_suffix if new_suffix else input_path.suffix
+    return output / f"{stem}{suffix}"
+
+
+def batch_iterator(items: List, batch_size: int) -> Iterator[List]:
+    """Yield successive batches from items list."""
+    for i in range(0, len(items), batch_size):
+        yield items[i:i + batch_size]
+
+
+def encode_images(
+        model: AutoencoderKL,
+        input_paths: List[Path],
+        output_arg: str,
+        width: int,
+        height: int,
+        batch_size: int,
+        device: str,
+        quiet: bool = False,
+) -> None:
+    """Encode images to latents with batch support."""
+    model_dtype = model.encoder.conv_in.weight.dtype
+
+    num_batches = (len(input_paths) + batch_size - 1) // batch_size
+    pbar = tqdm(
+        batch_iterator(input_paths, batch_size),
+        total=num_batches,
+        desc="Encoding",
+        unit="batch",
+    )
+
+    for batch_paths in pbar:
+        # Update progress bar with current batch info
+        pbar.set_postfix({"files": f"{batch_paths[0].name}..."})
+
+        # Load batch
+        images = [load_image(str(p), width, height) for p in batch_paths]
+        batch_tensor = torch.cat(images, dim=0).to(device, dtype=model_dtype)
+
+        with torch.no_grad():
+            latents = model.encode_to_latent(batch_tensor, sample_posterior=True)
+
+        # Save each latent
+        for i, path in enumerate(batch_paths):
+            output_path = get_output_path(path, output_arg, ".pt")
+            torch.save(latents[i:i + 1].cpu(), output_path)
+            if not quiet:
+                tqdm.write(f"  {path.name} -> {output_path.name} (shape: {tuple(latents[i].shape)})")
+
+
+def decode_latents(
+        model: AutoencoderKL,
+        input_paths: List[Path],
+        output_arg: str,
+        batch_size: int,
+        device: str,
+        quiet: bool = False,
+) -> None:
+    """Decode latents to images with batch support."""
+    model_dtype = model.decoder.conv_in.weight.dtype
+
+    num_batches = (len(input_paths) + batch_size - 1) // batch_size
+    pbar = tqdm(
+        batch_iterator(input_paths, batch_size),
+        total=num_batches,
+        desc="Decoding",
+        unit="batch",
+    )
+
+    for batch_paths in pbar:
+        # Update progress bar with current batch info
+        pbar.set_postfix({"files": f"{batch_paths[0].name}..."})
+
+        # Load batch of latents
+        latents = [torch.load(p, map_location=device) for p in batch_paths]
+        batch_latent = torch.cat(latents, dim=0).to(dtype=model_dtype)
+
+        with torch.no_grad():
+            images = model.decode_from_latent(batch_latent)
+
+        # Save each image
+        for i, path in enumerate(batch_paths):
+            output_path = get_output_path(path, output_arg, ".png")
+            save_image(images[i:i + 1], str(output_path))
+            if not quiet:
+                tqdm.write(f"  {path.name} -> {output_path.name}")
+
+
+def reconstruct_images(
+        model: AutoencoderKL,
+        input_paths: List[Path],
+        output_arg: str,
+        width: int,
+        height: int,
+        batch_size: int,
+        device: str,
+        compute_metrics: bool = True,
+        quiet: bool = False,
+) -> None:
+    """Reconstruct images with batch support and optional metrics."""
+    model_dtype = model.encoder.conv_in.weight.dtype
+
+    # Lazy load metrics
+    metrics = None
+    all_psnr, all_ssim, all_lpips = [], [], []
+
+    if compute_metrics:
+        from src.utils.metrics import VAEMetrics
+        metrics = VAEMetrics(data_range=2.0, use_lpips=True)
+
+    num_batches = (len(input_paths) + batch_size - 1) // batch_size
+    pbar = tqdm(
+        batch_iterator(input_paths, batch_size),
+        total=num_batches,
+        desc="Reconstructing",
+        unit="batch",
+    )
+
+    latent_shape_logged = False
+
+    for batch_paths in pbar:
+        # Load batch
+        images = [load_image(str(p), width, height) for p in batch_paths]
+        batch_tensor = torch.cat(images, dim=0).to(device, dtype=model_dtype)
+
+        with torch.no_grad():
+            # Encode
+            latents = model.encode_to_latent(batch_tensor, sample_posterior=True)
+
+            # Decode
+            reconstructions = model.decode_from_latent(latents)
+
+        # Log latent shape once
+        if not latent_shape_logged:
+            tqdm.write(f"Latent shape: {tuple(latents.shape)}")
+            latent_shape_logged = True
+
+        # Save reconstructions and compute metrics
+        batch_cpu = batch_tensor.cpu()
+        recon_cpu = reconstructions.cpu()
+
+        batch_psnr = []
+        for i, path in enumerate(batch_paths):
+            output_path = get_output_path(path, output_arg, ".png")
+            save_image(recon_cpu[i:i + 1], str(output_path))
+
+            if metrics is not None:
+                psnr, ssim, lpips_val = metrics.compute_reconstruction_metrics(
+                    recon_cpu[i:i + 1], batch_cpu[i:i + 1]
+                )
+                all_psnr.append(psnr)
+                all_ssim.append(ssim)
+                batch_psnr.append(psnr)
+                if lpips_val is not None:
+                    all_lpips.append(lpips_val)
+
+                if not quiet:
+                    lpips_str = f", LPIPS: {lpips_val:.4f}" if lpips_val else ""
+                    tqdm.write(
+                        f"  {path.name} -> {output_path.name} | PSNR: {psnr:.2f} dB, SSIM: {ssim:.4f}{lpips_str}")
+            elif not quiet:
+                tqdm.write(f"  {path.name} -> {output_path.name}")
+
+        # Update progress bar with batch metrics
+        if batch_psnr:
+            pbar.set_postfix({"avg_psnr": f"{np.mean(batch_psnr):.2f} dB"})
+
+    # Print summary metrics
+    if metrics is not None and len(all_psnr) > 0:
+        print(f"\n{'=' * 50}")
+        print(f"Summary ({len(all_psnr)} images)")
+        print(f"{'=' * 50}")
+        print(f"  PSNR:  {np.mean(all_psnr):.2f} dB (±{np.std(all_psnr):.2f})")
+        print(f"  SSIM:  {np.mean(all_ssim):.4f} (±{np.std(all_ssim):.4f})")
+        if all_lpips:
+            print(f"  LPIPS: {np.mean(all_lpips):.4f} (±{np.std(all_lpips):.4f})")
 
 
 def main():
@@ -148,64 +447,59 @@ def main():
     if args.encode and args.decode:
         raise ValueError("Cannot specify both --encode and --decode")
 
+    # Get resolution
+    width, height = get_resolution(args)
+    print(f"Resolution: {width}x{height}")
+
     # Load model
-    print(f"Loading model from: {args.model_path or args.checkpoint_path}")
+    print(f"Loading model from: {args.checkpoint_path or args.model_path}")
     model = load_model(args)
+    print(f"Device: {args.device}, dtype: {args.dtype}")
+
+    # Get input paths and show count
+    if args.decode:
+        input_paths = get_input_paths(args.input, mode="latent")
+    else:
+        input_paths = get_input_paths(args.input, mode="image")
+    print(f"Found {len(input_paths)} input file(s)\n")
 
     if args.encode:
-        # Encode image to latent
-        print(f"Encoding image: {args.input}")
-        image = load_image(args.input, args.resolution)
-        image = image.to(args.device, dtype=model.encoder.conv_in.weight.dtype)
-
-        with torch.no_grad():
-            latent = model.encode_to_latent(image, sample_posterior=True)
-
-        print(f"Latent shape: {latent.shape}")
-        torch.save(latent.cpu(), args.output)
-        print(f"Saved latent to: {args.output}")
+        encode_images(
+            model=model,
+            input_paths=input_paths,
+            output_arg=args.output,
+            width=width,
+            height=height,
+            batch_size=args.batch_size,
+            device=args.device,
+            quiet=args.quiet,
+        )
 
     elif args.decode:
-        # Decode latent to image
-        print(f"Decoding latent: {args.input}")
-        latent = torch.load(args.input, map_location=args.device)
-        latent = latent.to(model.decoder.conv_in.weight.dtype)
-
-        with torch.no_grad():
-            image = model.decode_from_latent(latent)
-
-        save_image(image, args.output)
-        print(f"Saved image to: {args.output}")
+        decode_latents(
+            model=model,
+            input_paths=input_paths,
+            output_arg=args.output,
+            batch_size=args.batch_size,
+            device=args.device,
+            quiet=args.quiet,
+        )
 
     else:
         # Reconstruct image (encode + decode)
-        print(f"Reconstructing image: {args.input}")
-        image = load_image(args.input, args.resolution)
-        image = image.to(args.device, dtype=model.encoder.conv_in.weight.dtype)
-
-        with torch.no_grad():
-            # Encode
-            latent = model.encode_to_latent(image, sample_posterior=True)
-            print(f"Latent shape: {latent.shape}")
-
-            # Decode
-            reconstruction = model.decode_from_latent(latent)
-
-        save_image(reconstruction, args.output)
-        print(f"Saved reconstruction to: {args.output}")
-
-        # Compute metrics
-        from src.utils.metrics import VAEMetrics
-        metrics = VAEMetrics(data_range=2.0, use_lpips=True)
-        image = image.cpu()
-        reconstruction = reconstruction.cpu()
-        psnr, ssim, lpips_val = metrics.compute_reconstruction_metrics(
-            reconstruction, image
+        reconstruct_images(
+            model=model,
+            input_paths=input_paths,
+            output_arg=args.output,
+            width=width,
+            height=height,
+            batch_size=args.batch_size,
+            device=args.device,
+            compute_metrics=not args.no_metrics,
+            quiet=args.quiet,
         )
-        print(f"PSNR: {psnr:.2f} dB")
-        print(f"SSIM: {ssim:.4f}")
-        if lpips_val is not None:
-            print(f"LPIPS: {lpips_val:.4f}")
+
+    print("\n✓ Done!")
 
 
 if __name__ == "__main__":

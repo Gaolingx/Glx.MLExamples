@@ -14,6 +14,7 @@ from PIL import Image
 
 try:
     from datasets import load_dataset
+
     HAS_DATASETS = True
 except ImportError:
     HAS_DATASETS = False
@@ -30,10 +31,10 @@ class VAEDataset(Dataset):
     """
 
     def __init__(
-        self,
-        data: Any,
-        transform: Optional[Callable] = None,
-        image_column: str = "image",
+            self,
+            data: Any,
+            transform: Optional[Callable] = None,
+            image_column: str = "image",
     ):
         self.data = data
         self.transform = transform

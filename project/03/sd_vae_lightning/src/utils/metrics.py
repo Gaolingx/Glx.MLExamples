@@ -43,7 +43,7 @@ class PSNR:
         self.data_range = data_range
 
     def __call__(
-        self, pred: torch.Tensor, target: torch.Tensor
+            self, pred: torch.Tensor, target: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute PSNR between prediction and target.
@@ -73,10 +73,10 @@ class SSIM:
     """
 
     def __init__(
-        self,
-        data_range: float = 1.0,
-        window_size: int = 11,
-        channel: int = 3,
+            self,
+            data_range: float = 1.0,
+            window_size: int = 11,
+            channel: int = 3,
     ):
         if not HAS_TORCHMETRICS_SSIM:
             raise ImportError(
@@ -91,13 +91,13 @@ class SSIM:
         self._dtype: Optional[torch.dtype] = None
 
     def _get_metric(
-        self, device: torch.device, dtype: torch.dtype
+            self, device: torch.device, dtype: torch.dtype
     ) -> StructuralSimilarityIndexMeasure:
         """Get cached metric or create new one if needed."""
         if (
-            self._ssim_metric is None
-            or self._device != device
-            or self._dtype != dtype
+                self._ssim_metric is None
+                or self._device != device
+                or self._dtype != dtype
         ):
             self._ssim_metric = StructuralSimilarityIndexMeasure(
                 data_range=self.data_range,
@@ -108,7 +108,7 @@ class SSIM:
         return self._ssim_metric
 
     def __call__(
-        self, pred: torch.Tensor, target: torch.Tensor
+            self, pred: torch.Tensor, target: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute SSIM between prediction and target.
@@ -127,24 +127,24 @@ class SSIM:
 class rFID:
     """
     Reconstruction FID (rFID) metric.
-    
+
     Computes Frechet Inception Distance between original and reconstructed
     images to measure how well the VAE preserves the image distribution.
-    
+
     Args:
         feature_dim: Feature dimension for Inception network (64, 192, 768, or 2048).
         reset_real_features: Whether to reset real features after each compute.
     """
-    
+
     def __init__(
-        self,
-        feature_dim: int = 2048,
-        reset_real_features: bool = True,
+            self,
+            feature_dim: int = 2048,
+            reset_real_features: bool = True,
     ):
         self.feature_dim = feature_dim
         self.reset_real_features = reset_real_features
         self.fid = None
-        
+
         if HAS_FID:
             try:
                 self.fid = FrechetInceptionDistance(
@@ -159,45 +159,45 @@ class rFID:
                     "Install with: pip install torch-fidelity"
                 )
                 self.fid = None
-            
+
     def update(
-        self,
-        real: torch.Tensor,
-        fake: torch.Tensor,
+            self,
+            real: torch.Tensor,
+            fake: torch.Tensor,
     ) -> None:
         """
         Update FID statistics with a batch of real and reconstructed images.
-        
+
         Args:
             real: Original images in range [-1, 1].
             fake: Reconstructed images in range [-1, 1].
         """
         if self.fid is None:
             return
-        
+
         # Move FID to correct device if needed
         if next(self.fid.parameters()).device != real.device:
             self.fid = self.fid.to(real.device)
-            
+
         # Normalize from [-1, 1] to [0, 1] and clamp
         real = torch.clamp((real + 1) / 2, 0, 1)
         fake = torch.clamp((fake + 1) / 2, 0, 1)
-        
+
         # Update FID metric
         self.fid.update(real, real=True)
         self.fid.update(fake, real=False)
-        
+
     def compute(self) -> torch.Tensor:
         """
         Compute rFID score.
-        
+
         Returns:
             rFID score (lower is better).
         """
         if self.fid is None:
             return torch.tensor(float("nan"))
         return self.fid.compute()
-        
+
     def reset(self) -> None:
         """Reset accumulated statistics."""
         if self.fid is not None:
@@ -215,10 +215,10 @@ class VAEMetrics(nn.Module):
     """
 
     def __init__(
-        self,
-        data_range: float = 2.0,  # [-1, 1] range
-        use_lpips: bool = True,
-        lpips_net: str = "vgg",
+            self,
+            data_range: float = 2.0,  # [-1, 1] range
+            use_lpips: bool = True,
+            lpips_net: str = "vgg",
     ):
         super().__init__()
         self.data_range = data_range
@@ -238,9 +238,9 @@ class VAEMetrics(nn.Module):
                 param.requires_grad = False
 
     def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
+            self,
+            pred: torch.Tensor,
+            target: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute all metrics.
@@ -275,9 +275,9 @@ class VAEMetrics(nn.Module):
         return metrics
 
     def compute_reconstruction_metrics(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
+            self,
+            pred: torch.Tensor,
+            target: torch.Tensor,
     ) -> Tuple[float, float, Optional[float]]:
         """
         Compute reconstruction metrics and return as Python floats.

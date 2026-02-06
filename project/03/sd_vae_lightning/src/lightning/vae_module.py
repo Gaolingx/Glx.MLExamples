@@ -19,7 +19,6 @@ import torchvision
 import math
 
 from ..models.autoencoder_kl import AutoencoderKL
-from ..models.vae import DiagonalGaussianDistribution
 from ..utils.metrics import PSNR, SSIM, rFID
 
 
@@ -335,7 +334,7 @@ class VAELightningModule(pl.LightningModule):
             self,
             x: torch.Tensor,
             sample_posterior: bool = True,
-    ) -> Tuple[torch.Tensor, DiagonalGaussianDistribution]:
+    ) -> Tuple[torch.Tensor, Any]:
         """
         Forward pass: encode and decode.
 
@@ -358,7 +357,7 @@ class VAELightningModule(pl.LightningModule):
             self,
             x: torch.Tensor,
             sample_posterior: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, DiagonalGaussianDistribution]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Any]:
         """
         Forward pass: encode and decode, also return latent.
 
@@ -508,7 +507,7 @@ class VAELightningModule(pl.LightningModule):
             self,
             targets: torch.Tensor,
             reconstructions: torch.Tensor,
-            posterior: DiagonalGaussianDistribution,
+            posterior: Any,
             optimizer_idx: int,
             global_step: int,
             training: bool = True,

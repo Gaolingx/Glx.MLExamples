@@ -26,10 +26,10 @@ class ImageLoggerCallback(Callback):
     """
 
     def __init__(
-        self,
-        log_every_n_steps: int = 500,
-        num_images: int = 4,
-        log_to_tensorboard: bool = True,
+            self,
+            log_every_n_steps: int = 500,
+            num_images: int = 4,
+            log_to_tensorboard: bool = True,
     ):
         super().__init__()
         self.log_every_n_steps = log_every_n_steps
@@ -37,9 +37,9 @@ class ImageLoggerCallback(Callback):
         self.log_to_tensorboard = log_to_tensorboard
 
     def _visualize_latent(
-        self,
-        latent: torch.Tensor,
-        target_size: Tuple[int, int],
+            self,
+            latent: torch.Tensor,
+            target_size: Tuple[int, int],
     ) -> torch.Tensor:
         """
         Visualize latent space as an image.
@@ -57,11 +57,11 @@ class ImageLoggerCallback(Callback):
         latent_flat = latent.view(b, -1)
         min_vals = latent_flat.min(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
         max_vals = latent_flat.max(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
-        
+
         # Avoid division by zero
         range_vals = max_vals - min_vals
         range_vals = torch.where(range_vals < 1e-5, torch.ones_like(range_vals), range_vals)
-        
+
         latent_normalized = (latent - min_vals) / range_vals
 
         # Use first 3 channels as RGB if available, otherwise use grayscale
@@ -82,12 +82,12 @@ class ImageLoggerCallback(Callback):
         return latent_vis
 
     def on_train_batch_end(
-        self,
-        trainer: pl.Trainer,
-        pl_module: pl.LightningModule,
-        outputs: Any,
-        batch: Dict[str, torch.Tensor],
-        batch_idx: int,
+            self,
+            trainer: pl.Trainer,
+            pl_module: pl.LightningModule,
+            outputs: Any,
+            batch: Dict[str, torch.Tensor],
+            batch_idx: int,
     ) -> None:
         """Log images at specified intervals during training."""
         if trainer.global_step % self.log_every_n_steps != 0:
@@ -99,7 +99,7 @@ class ImageLoggerCallback(Callback):
         # Get images and latent
         with torch.no_grad():
             targets = batch["pixel_values"][: self.num_images]
-            
+
             # Use forward_with_latent if available, otherwise use standard forward and encode
             if hasattr(pl_module, "forward_with_latent"):
                 reconstructions, latent, _ = pl_module.forward_with_latent(targets, sample_posterior=False)
@@ -127,7 +127,7 @@ class ImageLoggerCallback(Callback):
         # Log to tensorboard
         if hasattr(trainer.logger, "experiment"):
             trainer.logger.experiment.add_image(
-                "train/comparison", grid, trainer.global_step
+                "batch/comparison", grid, trainer.global_step
             )
 
 
@@ -148,15 +148,15 @@ class VAECheckpointCallback(ModelCheckpoint):
     """
 
     def __init__(
-        self,
-        dirpath: Optional[str] = None,
-        filename: str = "vae-{epoch:02d}-{step:06d}",
-        save_top_k: int = 3,
-        monitor: str = "val/rec_loss",
-        mode: str = "min",
-        save_last: bool = True,
-        every_n_train_steps: Optional[int] = None,
-        save_hf_format: bool = True,
+            self,
+            dirpath: Optional[str] = None,
+            filename: str = "vae-{epoch:02d}-{step:06d}",
+            save_top_k: int = 3,
+            monitor: str = "val/rec_loss",
+            mode: str = "min",
+            save_last: bool = True,
+            every_n_train_steps: Optional[int] = None,
+            save_hf_format: bool = True,
     ):
         super().__init__(
             dirpath=dirpath,
@@ -205,11 +205,11 @@ class LearningRateMonitor(Callback):
     """
 
     def on_train_batch_start(
-        self,
-        trainer: pl.Trainer,
-        pl_module: pl.LightningModule,
-        batch: Any,
-        batch_idx: int,
+            self,
+            trainer: pl.Trainer,
+            pl_module: pl.LightningModule,
+            batch: Any,
+            batch_idx: int,
     ) -> None:
         """Log current learning rates."""
         if trainer.logger is None:
@@ -237,10 +237,10 @@ class GradientNormLogger(Callback):
         self.log_every_n_steps = log_every_n_steps
 
     def on_before_optimizer_step(
-        self,
-        trainer: pl.Trainer,
-        pl_module: pl.LightningModule,
-        optimizer: torch.optim.Optimizer,
+            self,
+            trainer: pl.Trainer,
+            pl_module: pl.LightningModule,
+            optimizer: torch.optim.Optimizer,
     ) -> None:
         """Log gradient norms before optimizer step."""
         if trainer.global_step % self.log_every_n_steps != 0:
@@ -251,7 +251,7 @@ class GradientNormLogger(Callback):
             if p.grad is not None:
                 param_norm = p.grad.data.norm(2)
                 total_norm += param_norm.item() ** 2
-        total_norm = total_norm**0.5
+        total_norm = total_norm ** 0.5
 
         pl_module.log(
             "train/grad_norm",

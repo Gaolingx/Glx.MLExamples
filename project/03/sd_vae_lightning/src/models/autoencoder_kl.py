@@ -27,7 +27,7 @@ class AutoencoderKLOutput:
 class AutoencoderKL(nn.Module):
     """
     Variational Autoencoder (VAE) with KL divergence loss.
-    
+
     This is a wrapper around diffusers AutoencoderKL for compatibility
     with Stable Diffusion 1.5 weights while providing a clean interface.
 
@@ -49,21 +49,21 @@ class AutoencoderKL(nn.Module):
     """
 
     def __init__(
-        self,
-        in_channels: int = 3,
-        out_channels: int = 3,
-        down_block_types: Tuple[str, ...] = ("DownEncoderBlock2D",),
-        up_block_types: Tuple[str, ...] = ("UpDecoderBlock2D",),
-        block_out_channels: Tuple[int, ...] = (64,),
-        layers_per_block: int = 1,
-        act_fn: str = "silu",
-        latent_channels: int = 4,
-        norm_num_groups: int = 32,
-        sample_size: int = 512,
-        scaling_factor: float = 0.18215,
-        use_quant_conv: bool = True,
-        use_post_quant_conv: bool = True,
-        mid_block_add_attention: bool = True,
+            self,
+            in_channels: int = 3,
+            out_channels: int = 3,
+            down_block_types: Tuple[str, ...] = ("DownEncoderBlock2D",),
+            up_block_types: Tuple[str, ...] = ("UpDecoderBlock2D",),
+            block_out_channels: Tuple[int, ...] = (64,),
+            layers_per_block: int = 1,
+            act_fn: str = "silu",
+            latent_channels: int = 4,
+            norm_num_groups: int = 32,
+            sample_size: int = 512,
+            scaling_factor: float = 0.18215,
+            use_quant_conv: bool = True,
+            use_post_quant_conv: bool = True,
+            mid_block_add_attention: bool = True,
     ):
         super().__init__()
 
@@ -126,9 +126,9 @@ class AutoencoderKL(nn.Module):
         return self._vae.post_quant_conv
 
     def encode(
-        self,
-        x: torch.Tensor,
-        return_dict: bool = True,
+            self,
+            x: torch.Tensor,
+            return_dict: bool = True,
     ) -> Union[AutoencoderKLOutput, Tuple]:
         """
         Encode images into latent distributions.
@@ -146,9 +146,9 @@ class AutoencoderKL(nn.Module):
         return AutoencoderKLOutput(latent_dist=result.latent_dist)
 
     def decode(
-        self,
-        z: torch.Tensor,
-        return_dict: bool = True,
+            self,
+            z: torch.Tensor,
+            return_dict: bool = True,
     ) -> Union[DecoderOutput, Tuple[torch.Tensor]]:
         """
         Decode latent representations into images.
@@ -166,11 +166,11 @@ class AutoencoderKL(nn.Module):
         return DecoderOutput(sample=result.sample)
 
     def forward(
-        self,
-        sample: torch.Tensor,
-        sample_posterior: bool = False,
-        return_dict: bool = True,
-        generator: Optional[torch.Generator] = None,
+            self,
+            sample: torch.Tensor,
+            sample_posterior: bool = False,
+            return_dict: bool = True,
+            generator: Optional[torch.Generator] = None,
     ) -> Union[DecoderOutput, torch.Tensor]:
         """
         Full forward pass: encode then decode.
@@ -199,10 +199,10 @@ class AutoencoderKL(nn.Module):
         return DecoderOutput(sample=dec)
 
     def encode_to_latent(
-        self,
-        x: torch.Tensor,
-        sample_posterior: bool = True,
-        generator: Optional[torch.Generator] = None,
+            self,
+            x: torch.Tensor,
+            sample_posterior: bool = True,
+            generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         """
         Encode image to scaled latent representation.
@@ -276,11 +276,11 @@ class AutoencoderKL(nn.Module):
 
     @classmethod
     def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str,
-        subfolder: Optional[str] = None,
-        torch_dtype: Optional[torch.dtype] = None,
-        **kwargs,
+            cls,
+            pretrained_model_name_or_path: str,
+            subfolder: Optional[str] = None,
+            torch_dtype: Optional[torch.dtype] = None,
+            **kwargs,
     ) -> "AutoencoderKL":
         """
         Load pretrained model from path or HuggingFace Hub.
