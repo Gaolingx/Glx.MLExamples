@@ -10,8 +10,8 @@
         "accumulate_grad_batches": 1,
         "precision": "16-mixed",
         "num_workers": 4,
-        "adam_beta1": 0.5,
-        "adam_beta2": 0.9,
+        "adam_beta1": 0.9,
+        "adam_beta2": 0.999,
         "use_ema": true,
         "ema_decay": 0.9999,
         "ema_update_interval": 1,
@@ -38,7 +38,9 @@
         "disc_start_step": 50001,
         "disc_loss_type": "hinge",
         "use_adaptive_disc_weight": true,
-        "adaptive_weight_max": 1.0
+        "adaptive_weight_max": 1.0,
+        "override_lr_on_resume": true,
+        "reset_scheduler_on_resume": false
     },
     "data": {
         "dataset_name": "huggan/flowers-102-categories",

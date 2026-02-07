@@ -7,6 +7,7 @@ Features:
 - Alternating training between VAE and Discriminator (official diffusers style)
 - Manual gradient accumulation for proper alternating training
 - Supports mixed precision training
+- LR and scheduler override on resume
 
 Usage:
     python scripts/train.py --config configs/train_config.json
@@ -38,6 +39,7 @@ from src.utils.callbacks import (
     ImageLoggerCallback,
     VAECheckpointCallback,
     GradientNormLogger,
+    LRandSchedulerOverrideCallback,
 )
 
 
@@ -179,6 +181,14 @@ def main():
         ),
         # Gradient norm logger
         GradientNormLogger(log_every_n_steps=100),
+        # LR and Scheduler Override callback for resume
+        LRandSchedulerOverrideCallback(
+            override_lr_on_resume=train_config_section.get("override_lr_on_resume", True),
+            reset_scheduler_on_resume=train_config_section.get("reset_scheduler_on_resume", False),
+            vae_lr=train_config_section.get("learning_rate"),
+            disc_lr=train_config_section.get("disc_learning_rate"),
+            verbose=True,
+        ),
         # Progress bar
         RichProgressBar(),
     ]
@@ -240,6 +250,8 @@ def main():
     print("Starting VAE Training")
     print(f"  - Alternating training: VAE (even steps) / Disc (odd steps)")
     print(f"  - Gradient accumulation: {train_config_section.get('accumulate_grad_batches', 1)} steps")
+    print(f"  - Override LR on resume: {train_config_section.get('override_lr_on_resume', True)}")
+    print(f"  - Reset scheduler on resume: {train_config_section.get('reset_scheduler_on_resume', False)}")
     print(f"Output directory: {output_dir}")
     print(f"Log directory: {log_dir}")
     print(f"Checkpoint directory: {checkpoint_dir}")
