@@ -292,7 +292,6 @@ class LRandSchedulerOverrideCallback(Callback):
         self.vae_lr = vae_lr
         self.disc_lr = disc_lr
         self.verbose = verbose
-        self._has_resumed = False
 
     def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         """
@@ -303,11 +302,6 @@ class LRandSchedulerOverrideCallback(Callback):
             if self.verbose:
                 print("[LRandSchedulerOverrideCallback] Starting fresh training, no overrides applied.")
             return
-
-        if self._has_resumed:
-            return
-
-        self._has_resumed = True
 
         if self.verbose:
             print(f"[LRandSchedulerOverrideCallback] Resuming from checkpoint: {trainer.ckpt_path}")
@@ -423,11 +417,3 @@ class LRandSchedulerOverrideCallback(Callback):
                     f"[LRandSchedulerOverrideCallback] Scheduler {idx} ({scheduler_name}): "
                     f"last_epoch {old_last_epoch} -> -1 (reset)"
                 )
-
-    def state_dict(self) -> Dict[str, Any]:
-        """Return callback state for checkpointing."""
-        return {"has_resumed": self._has_resumed}
-
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        """Load callback state from checkpoint."""
-        self._has_resumed = state_dict.get("has_resumed", False)

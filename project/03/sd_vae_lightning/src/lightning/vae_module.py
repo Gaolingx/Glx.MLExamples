@@ -700,6 +700,7 @@ class VAELightningModule(pl.LightningModule):
 
         if train_generator:
             # ========== Train VAE (Generator) ==========
+            self.toggle_optimizer(opt_vae)
             vae_loss, vae_loss_dict = self.compute_loss(
                 targets, reconstructions, posterior,
                 optimizer_idx=0, global_step=self.global_step, training=True
@@ -708,6 +709,7 @@ class VAELightningModule(pl.LightningModule):
             # Scale loss for manual gradient accumulation
             scaled_loss = vae_loss / self.accumulate_grad_batches
             self.manual_backward(scaled_loss)
+            self.untoggle_optimizer(opt_vae)
 
             # Step optimizer only at accumulation boundary
             if is_last_accumulation_step:
@@ -752,6 +754,7 @@ class VAELightningModule(pl.LightningModule):
         else:
             # ========== Train Discriminator ==========
             if self.discriminator is not None and opt_disc is not None:
+                self.toggle_optimizer(opt_disc)
                 disc_loss, disc_loss_dict = self.compute_loss(
                     targets, reconstructions, posterior,
                     optimizer_idx=1, global_step=self.global_step,
@@ -760,6 +763,7 @@ class VAELightningModule(pl.LightningModule):
                 # Scale loss for manual gradient accumulation
                 scaled_loss = disc_loss / self.accumulate_grad_batches
                 self.manual_backward(scaled_loss)
+                self.untoggle_optimizer(opt_disc)
 
                 # Step optimizer only at accumulation boundary
                 if is_last_accumulation_step:
