@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
+from torch.optim.lr_scheduler import LambdaLR
 import torchvision
 
 
@@ -266,6 +267,8 @@ class LRandSchedulerOverrideCallback(Callback):
     """
     Callback to override learning rate and/or reset scheduler state when resuming from checkpoint.
 
+    Designed to work with diffusers.optimization.get_scheduler (returns LambdaLR).
+
     This is useful when you want to:
     - Resume training with a different learning rate than what was saved in the checkpoint
     - Reset the scheduler to start fresh (e.g., restart warmup) while keeping model weights
@@ -306,7 +309,7 @@ class LRandSchedulerOverrideCallback(Callback):
         if self.verbose:
             print(f"[LRandSchedulerOverrideCallback] Resuming from checkpoint: {trainer.ckpt_path}")
 
-        # Get optimizers and schedulers
+        # Get optimizers
         optimizers = trainer.optimizers
         if not isinstance(optimizers, list):
             optimizers = [optimizers]
@@ -318,7 +321,7 @@ class LRandSchedulerOverrideCallback(Callback):
 
         # Reset scheduler state FIRST if enabled (before LR override)
         if self.reset_scheduler_on_resume:
-            self._reset_schedulers(lr_scheduler_configs)
+            self._reset_schedulers(lr_scheduler_configs, optimizers)
 
         # Override learning rates if enabled
         if self.override_lr_on_resume:
@@ -351,69 +354,97 @@ class LRandSchedulerOverrideCallback(Callback):
             # Update optimizer param groups
             for param_group in optimizer.param_groups:
                 param_group["lr"] = new_lr
-                # Update initial_lr (used by some schedulers as reference)
-                if "initial_lr" in param_group:
-                    param_group["initial_lr"] = new_lr
+                # Update initial_lr (used by schedulers as reference)
+                param_group["initial_lr"] = new_lr
 
             # Update scheduler's base_lrs
-            # This is what scheduler.step() uses to compute actual LR
             if idx < len(lr_scheduler_configs):
                 scheduler = lr_scheduler_configs[idx].scheduler
-
-                # Update base_lrs - the reference LR that lambda functions multiply
-                if hasattr(scheduler, "base_lrs"):
-                    old_base_lrs = scheduler.base_lrs.copy()
-                    scheduler.base_lrs = [new_lr for _ in scheduler.base_lrs]
-                    if self.verbose:
-                        print(
-                            f"[LRandSchedulerOverrideCallback] {names[idx]} scheduler base_lrs: {old_base_lrs} -> {scheduler.base_lrs}")
-
-                # Update _last_lr to reflect the change immediately
-                if hasattr(scheduler, "_last_lr"):
-                    # Recalculate _last_lr based on current lambda value and new base_lr
-                    if hasattr(scheduler, "lr_lambdas") and hasattr(scheduler, "last_epoch"):
-                        current_step = max(0, scheduler.last_epoch)
-                        scheduler._last_lr = [
-                            lmbda(current_step) * new_lr
-                            for lmbda in scheduler.lr_lambdas
-                        ]
-                    else:
-                        scheduler._last_lr = [new_lr for _ in scheduler._last_lr]
+                self._update_scheduler_base_lr(scheduler, new_lr, names[idx])
 
             if self.verbose:
                 print(f"[LRandSchedulerOverrideCallback] {names[idx]} optimizer LR: {old_lr:.2e} -> {new_lr:.2e}")
 
+    def _update_scheduler_base_lr(
+            self,
+            scheduler: Any,
+            new_lr: float,
+            name: str,
+    ) -> None:
+        """
+        Update scheduler's base learning rate.
+
+        Works with LambdaLR from diffusers.optimization.get_scheduler.
+        """
+        # Update base_lrs - the reference LR that lambda functions multiply
+        if hasattr(scheduler, "base_lrs"):
+            old_base_lrs = list(scheduler.base_lrs)
+            scheduler.base_lrs = [new_lr for _ in scheduler.base_lrs]
+            if self.verbose:
+                print(
+                    f"[LRandSchedulerOverrideCallback] {name} scheduler base_lrs: "
+                    f"{old_base_lrs} -> {scheduler.base_lrs}"
+                )
+
+        # Update _last_lr to reflect the change immediately
+        if hasattr(scheduler, "_last_lr") and hasattr(scheduler, "base_lrs"):
+            current_step = max(0, getattr(scheduler, "last_epoch", 0))
+
+            # For LambdaLR (diffusers get_scheduler returns this type)
+            if isinstance(scheduler, LambdaLR) and hasattr(scheduler, "lr_lambdas"):
+                scheduler._last_lr = [
+                    lmbda(current_step) * base_lr
+                    for lmbda, base_lr in zip(scheduler.lr_lambdas, scheduler.base_lrs)
+                ]
+            else:
+                # Fallback for other scheduler types
+                scheduler._last_lr = list(scheduler.base_lrs)
+
     def _reset_schedulers(
             self,
             lr_scheduler_configs: List[Any],
+            optimizers: List[torch.optim.Optimizer],
     ) -> None:
-        """Reset scheduler state to initial values."""
+        """
+        Reset scheduler state to initial values.
+
+        Works with LambdaLR from diffusers.optimization.get_scheduler.
+        """
         for idx, scheduler_config in enumerate(lr_scheduler_configs):
             scheduler = scheduler_config.scheduler
-
+            scheduler_name = type(scheduler).__name__
             old_last_epoch = getattr(scheduler, "last_epoch", -1)
 
             # Reset last_epoch to -1 (will become 0 on first step())
             if hasattr(scheduler, "last_epoch"):
                 scheduler.last_epoch = -1
 
-            # Reset _step_count if it exists
+            # Reset _step_count if it exists (used internally by some schedulers)
             if hasattr(scheduler, "_step_count"):
                 scheduler._step_count = 0
 
-            # Recalculate _last_lr for step 0
+            # Recalculate _last_lr for step 0 (initial state after first step)
             if hasattr(scheduler, "_last_lr") and hasattr(scheduler, "base_lrs"):
-                if hasattr(scheduler, "lr_lambdas"):
+                if isinstance(scheduler, LambdaLR) and hasattr(scheduler, "lr_lambdas"):
+                    # LambdaLR: _last_lr = lambda(step) * base_lr
+                    # At step 0 (after reset, first step will compute lambda(0))
                     scheduler._last_lr = [
                         lmbda(0) * base_lr
                         for lmbda, base_lr in zip(scheduler.lr_lambdas, scheduler.base_lrs)
                     ]
                 else:
-                    scheduler._last_lr = scheduler.base_lrs.copy()
+                    scheduler._last_lr = list(scheduler.base_lrs)
+
+            # Also reset initial_lr in optimizer param_groups to match base_lrs
+            if idx < len(optimizers) and hasattr(scheduler, "base_lrs"):
+                optimizer = optimizers[idx]
+                for pg_idx, param_group in enumerate(optimizer.param_groups):
+                    if pg_idx < len(scheduler.base_lrs):
+                        param_group["initial_lr"] = scheduler.base_lrs[pg_idx]
 
             if self.verbose:
-                scheduler_name = type(scheduler).__name__
+                current_lr = scheduler._last_lr[0] if hasattr(scheduler, "_last_lr") else "N/A"
                 print(
                     f"[LRandSchedulerOverrideCallback] Scheduler {idx} ({scheduler_name}): "
-                    f"last_epoch {old_last_epoch} -> -1 (reset)"
+                    f"last_epoch {old_last_epoch} -> -1 (reset), initial LR -> {current_lr}"
                 )

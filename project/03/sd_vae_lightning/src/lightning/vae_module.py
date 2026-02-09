@@ -11,9 +11,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from torch.optim.lr_scheduler import LambdaLR
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 from diffusers.training_utils import EMAModel
+from diffusers.optimization import get_scheduler
 import lpips
 import torchvision
 import math
@@ -988,10 +988,17 @@ class VAELightningModule(pl.LightningModule):
             )
 
     def configure_optimizers(self):
-        """Configure optimizers and schedulers."""
+        """
+        Configure optimizers and learning rate schedulers.
+        Uses trainer.estimated_stepping_batches for accurate step count estimation.
+        Handles alternating G/D training by computing separate step counts for each optimizer.
+        Important considerations:
+        - VAE scheduler steps on even accumulated steps + all steps before disc_start
+        - Discriminator scheduler steps on odd accumulated steps after disc_start
+        - Warmup steps are clamped to each scheduler's total training steps
+        """
         train_config = self.config.get("training", {})
 
-        # VAE optimizer
         vae_params = list(self.vae.parameters())
         opt_vae = torch.optim.AdamW(
             vae_params,
@@ -1000,25 +1007,47 @@ class VAELightningModule(pl.LightningModule):
             weight_decay=train_config.get("weight_decay", 0.01),
         )
 
-        # Get scheduler config
+        total_steps = None
+
+        if hasattr(self, "trainer") and self.trainer is not None:
+            try:
+                estimated = self.trainer.estimated_stepping_batches
+                if estimated != float("inf") and estimated > 0:
+                    total_steps = int(estimated)
+            except Exception:
+                pass
+
+        if total_steps is None:
+            total_steps = train_config.get("max_train_steps", 100000)
+
+        total_steps = max(1, int(total_steps))
+
         lr_scheduler_type = train_config.get("lr_scheduler", "constant_with_warmup")
         lr_warmup_steps = train_config.get("lr_warmup_steps", 500)
         lr_num_cycles = train_config.get("lr_num_cycles", 1)
         lr_power = train_config.get("lr_power", 1.0)
-        # Estimate max training steps for scheduler
-        # This can be overridden by trainer's max_steps
-        max_train_steps = train_config.get("max_train_steps", 100000)
-        # Create VAE lr scheduler
+
+        disc_start_step = self.disc_start_step if self.use_discriminator else float("inf")
+
+        if disc_start_step < total_steps:
+            steps_before_disc = min(int(disc_start_step), total_steps)
+            steps_after_disc = total_steps - steps_before_disc
+            vae_scheduler_steps = steps_before_disc + (steps_after_disc + 1) // 2
+        else:
+            vae_scheduler_steps = total_steps
+
+        vae_scheduler_steps = max(1, vae_scheduler_steps)
+
         vae_scheduler = self._get_scheduler(
             optimizer=opt_vae,
             scheduler_type=lr_scheduler_type,
             num_warmup_steps=lr_warmup_steps,
-            num_training_steps=max_train_steps,
+            num_training_steps=vae_scheduler_steps,
             num_cycles=lr_num_cycles,
             power=lr_power,
         )
+
         if self.discriminator is not None:
-            # Discriminator optimizer
             disc_params = list(self.discriminator.parameters())
             opt_disc = torch.optim.AdamW(
                 disc_params,
@@ -1026,17 +1055,27 @@ class VAELightningModule(pl.LightningModule):
                 betas=(train_config.get("adam_beta1", 0.9), train_config.get("adam_beta2", 0.999)),
                 weight_decay=train_config.get("weight_decay", 0.01),
             )
-            # Get discriminator scheduler config (can be different from VAE)
+
             disc_lr_scheduler_type = train_config.get("disc_lr_scheduler", lr_scheduler_type)
-            # Create discriminator lr scheduler
+            disc_lr_warmup_steps = train_config.get("disc_lr_warmup_steps", lr_warmup_steps)
+
+            if disc_start_step < total_steps:
+                steps_after_disc = total_steps - int(disc_start_step)
+                disc_scheduler_steps = steps_after_disc // 2
+            else:
+                disc_scheduler_steps = 0
+
+            disc_scheduler_steps = max(1, disc_scheduler_steps)
+
             disc_scheduler = self._get_scheduler(
                 optimizer=opt_disc,
                 scheduler_type=disc_lr_scheduler_type,
-                num_warmup_steps=lr_warmup_steps,
-                num_training_steps=max_train_steps,
+                num_warmup_steps=disc_lr_warmup_steps,
+                num_training_steps=disc_scheduler_steps,
                 num_cycles=lr_num_cycles,
                 power=lr_power,
             )
+
             return (
                 [opt_vae, opt_disc],
                 [
@@ -1044,6 +1083,7 @@ class VAELightningModule(pl.LightningModule):
                     {"scheduler": disc_scheduler, "interval": "step", "frequency": 1},
                 ],
             )
+
         return {
             "optimizer": opt_vae,
             "lr_scheduler": {
@@ -1061,77 +1101,59 @@ class VAELightningModule(pl.LightningModule):
             num_training_steps: int,
             num_cycles: int = 1,
             power: float = 1.0,
+            lr_end: float = 0.0,
     ):
         """
-        Create a learning rate scheduler.
-        Mirrors the behavior of diffusers.optimization.get_scheduler.
+        Create a learning rate scheduler using diffusers.optimization.get_scheduler.
+
         Args:
             optimizer: The optimizer to schedule.
-            scheduler_type: Type of scheduler ('constant', 'constant_with_warmup', 
-                          'linear', 'cosine', 'cosine_with_restarts', 'polynomial').
+            scheduler_type: Type of scheduler. Supported:
+                'constant', 'constant_with_warmup', 'linear',
+                'cosine', 'cosine_with_restarts', 'polynomial'.
             num_warmup_steps: Number of warmup steps.
-            num_training_steps: Total number of training steps.
-            num_cycles: Number of cycles for cosine_with_restarts.
-            power: Power for polynomial scheduler.
+            num_training_steps: Total training steps for this scheduler.
+            num_cycles: Cycles for cosine_with_restarts.
+            power: Power for polynomial decay.
+            lr_end: Final LR ratio for polynomial (default 0.0).
+
         Returns:
-            Learning rate scheduler.
+            LambdaLR scheduler from diffusers.
         """
-        if scheduler_type == "constant":
-            return LambdaLR(optimizer, lambda _: 1.0)
-        elif scheduler_type == "constant_with_warmup":
-            def lr_lambda(current_step: int):
-                if current_step < num_warmup_steps:
-                    return float(current_step) / float(max(1, num_warmup_steps))
-                return 1.0
-
-            return LambdaLR(optimizer, lr_lambda)
-        elif scheduler_type == "linear":
-            def lr_lambda(current_step: int):
-                if current_step < num_warmup_steps:
-                    return float(current_step) / float(max(1, num_warmup_steps))
-                return max(
-                    0.0,
-                    float(num_training_steps - current_step) /
-                    float(max(1, num_training_steps - num_warmup_steps))
-                )
-
-            return LambdaLR(optimizer, lr_lambda)
-        elif scheduler_type == "cosine":
-            def lr_lambda(current_step: int):
-                if current_step < num_warmup_steps:
-                    return float(current_step) / float(max(1, num_warmup_steps))
-                progress = float(current_step - num_warmup_steps) / float(
-                    max(1, num_training_steps - num_warmup_steps)
-                )
-                return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-            return LambdaLR(optimizer, lr_lambda)
-        elif scheduler_type == "cosine_with_restarts":
-            def lr_lambda(current_step: int):
-                if current_step < num_warmup_steps:
-                    return float(current_step) / float(max(1, num_warmup_steps))
-                progress = float(current_step - num_warmup_steps) / float(
-                    max(1, num_training_steps - num_warmup_steps)
-                )
-                return max(0.0, 0.5 * (1.0 + math.cos(math.pi * ((progress * num_cycles) % 1.0))))
-
-            return LambdaLR(optimizer, lr_lambda)
-        elif scheduler_type == "polynomial":
-            def lr_lambda(current_step: int):
-                if current_step < num_warmup_steps:
-                    return float(current_step) / float(max(1, num_warmup_steps))
-                lr_range = 1.0 - 0.0  # end_lr = 0.0
-                decay_steps = num_training_steps - num_warmup_steps
-                pct_remaining = 1 - (current_step - num_warmup_steps) / decay_steps
-                return lr_range * pct_remaining ** power
-
-            return LambdaLR(optimizer, lr_lambda)
-        else:
+        valid_types = {
+            "constant",
+            "constant_with_warmup",
+            "linear",
+            "cosine",
+            "cosine_with_restarts",
+            "polynomial",
+        }
+        if scheduler_type not in valid_types:
             raise ValueError(
                 f"Unknown scheduler type: {scheduler_type}. "
-                f"Choose from: constant, constant_with_warmup, linear, cosine, "
-                f"cosine_with_restarts, polynomial"
+                f"Choose from: {', '.join(sorted(valid_types))}"
             )
+
+        num_training_steps = max(1, num_training_steps)
+
+        num_warmup_steps = min(num_warmup_steps, num_training_steps)
+
+        scheduler_kwargs = {
+            "name": scheduler_type,
+            "optimizer": optimizer,
+            "num_warmup_steps": num_warmup_steps,
+        }
+
+        if scheduler_type not in ("constant", "constant_with_warmup"):
+            scheduler_kwargs["num_training_steps"] = num_training_steps
+
+        if scheduler_type == "cosine_with_restarts":
+            scheduler_kwargs["num_cycles"] = num_cycles
+        elif scheduler_type == "polynomial":
+            scheduler_kwargs["power"] = power
+            scheduler_kwargs["lr_end"] = lr_end
+
+        return get_scheduler(**scheduler_kwargs)
 
     def save_pretrained(self, save_directory: str) -> None:
         """
