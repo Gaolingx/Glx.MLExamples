@@ -1008,17 +1008,24 @@ class VAELightningModule(pl.LightningModule):
         )
 
         total_steps = None
-
-        if hasattr(self, "trainer") and self.trainer is not None:
-            try:
-                estimated = self.trainer.estimated_stepping_batches
-                if estimated != float("inf") and estimated > 0:
-                    total_steps = int(estimated)
-            except Exception:
-                pass
+        trainer = getattr(self, "_trainer", None)
+        if trainer is not None:
+            # manual optimization + manual scheduler stepping: prefer explicit max_steps
+            if isinstance(trainer.max_steps, int) and trainer.max_steps > 0:
+                total_steps = trainer.max_steps
+            elif (
+                    trainer.max_epochs is not None
+                    and trainer.max_epochs > 0
+                    and trainer.num_training_batches not in (None, float("inf"))
+            ):
+                # fallback: derive update steps and account for manual grad accumulation
+                total_steps = math.ceil(
+                    (int(trainer.num_training_batches) * int(trainer.max_epochs))
+                    / int(self.accumulate_grad_batches)
+                )
 
         if total_steps is None:
-            total_steps = train_config.get("max_train_steps", 100000)
+            total_steps = int(train_config.get("max_train_steps", 100000))
 
         total_steps = max(1, int(total_steps))
 
