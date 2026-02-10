@@ -183,8 +183,10 @@ class VAELightningModule(pl.LightningModule):
         elif inline_vae_config is not None:
             self.vae = AutoencoderKL.from_config(inline_vae_config)
         else:
-            vae_config = AutoencoderKL.load_config("stabilityai/sd-vae-ft-mse")
-            self.vae = AutoencoderKL.from_config(vae_config)
+            raise ValueError(
+                "Must specify one of `pretrained_model_name_or_path`, "
+                "`model_config_name_or_path`, or `vae_config` in the config."
+            )
 
         # Build discriminator
         loss_config = config.get("loss", {})
@@ -700,6 +702,11 @@ class VAELightningModule(pl.LightningModule):
                 opt_vae.step()
                 opt_vae.zero_grad()
 
+                # Update EMA
+                if self.use_ema and self.ema is not None:
+                    if self.global_step % self.ema_update_interval == 0:
+                        self.ema.step(self.vae.parameters())
+
                 # Step the VAE learning rate scheduler
                 schedulers = self.lr_schedulers()
                 if isinstance(schedulers, list):
@@ -781,12 +788,6 @@ class VAELightningModule(pl.LightningModule):
                 result = disc_loss
             else:
                 result = None
-
-        if is_last_accumulation_step:
-            # Update EMA
-            if self.use_ema and self.ema is not None:
-                if self.global_step % self.ema_update_interval == 0:
-                    self.ema.step(self.vae.parameters())
 
         if is_last_accumulation_step and self.global_step % self.log_images_every_n_steps == 0:
             self._log_images(targets, reconstructions, latent, "train")

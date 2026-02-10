@@ -56,22 +56,32 @@ class VAEDataset(Dataset):
         """
         item = self.data[idx]
 
-        # Handle different data formats
         if isinstance(item, dict):
+            if self.image_column not in item:
+                raise KeyError(
+                    f"Missing image column '{self.image_column}' in sample keys: {list(item.keys())}"
+                )
             image = item[self.image_column]
-        elif isinstance(item, (str, Path)):
-            image = Image.open(item).convert("RGB")
         else:
             image = item
 
-        # Ensure PIL Image
-        if not isinstance(image, Image.Image):
-            if hasattr(image, "convert"):
-                image = image.convert("RGB")
-            else:
-                image = Image.fromarray(image).convert("RGB")
+        if isinstance(image, (str, Path)):
+            image_path = Path(image)
+            if not image_path.exists():
+                raise FileNotFoundError(f"Image path does not exist: {image_path}")
+            with Image.open(image_path) as img:
+                image = img.convert("RGB")
 
-        # Apply transforms
+        elif isinstance(image, Image.Image):
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+
+        else:
+            raise TypeError(
+                f"Unsupported image type: {type(image)}. "
+                f"Only str/Path (local file), PIL.Image.Image are supported."
+            )
+
         if self.transform is not None:
             image = self.transform(image)
 
@@ -231,7 +241,7 @@ class VAEDataModule(pl.LightningDataModule):
 
         # To tensor and normalize to [-1, 1]
         transform_list.append(transforms.ToTensor())
-        transform_list.append(transforms.Normalize([0.5], [0.5]))
+        transform_list.append(transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]))
 
         return transforms.Compose(transform_list)
 

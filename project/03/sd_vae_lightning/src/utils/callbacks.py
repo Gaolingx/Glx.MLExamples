@@ -262,20 +262,16 @@ class GradientNormLogger(Callback):
 
 class LRandSchedulerOverrideCallback(Callback):
     """
-    Callback to override learning rate and/or reset scheduler state when resuming from checkpoint.
+    Override LR and/or reset scheduler state when resuming from checkpoint.
 
-    Designed to work with diffusers.optimization.get_scheduler (returns LambdaLR).
+    Supports:
+    1) Override LR only, keep scheduler progress
+    2) Override LR + reset scheduler (restart warmup/progress)
+    3) Reset scheduler only
 
-    This is useful when you want to:
-    - Resume training with a different learning rate than what was saved in the checkpoint
-    - Reset the scheduler to start fresh (e.g., restart warmup) while keeping model weights
-
-    Args:
-        override_lr_on_resume: If True, override optimizer LR with config values after loading checkpoint.
-        reset_scheduler_on_resume: If True, reset scheduler state (step counter) to initial state.
-        vae_lr: Learning rate for VAE optimizer (used when override_lr_on_resume=True).
-        disc_lr: Learning rate for discriminator optimizer (used when override_lr_on_resume=True).
-        verbose: Whether to print info messages about overrides.
+    Notes:
+    - Designed for diffusers.optimization.get_scheduler (typically LambdaLR),
+      but includes fallbacks for non-Lambda schedulers.
     """
 
     def __init__(
@@ -293,155 +289,237 @@ class LRandSchedulerOverrideCallback(Callback):
         self.disc_lr = disc_lr
         self.verbose = verbose
 
+    # ----------------------------
+    # Public hook
+    # ----------------------------
     def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        """
-        Called when training starts. If resuming from checkpoint, apply LR/scheduler overrides.
-        """
-        # Check if we're resuming from a checkpoint
-        if trainer.ckpt_path is None:
-            if self.verbose:
-                print("[LRandSchedulerOverrideCallback] Starting fresh training, no overrides applied.")
+        if not self._is_resuming(trainer):
+            self._log("Starting fresh training, no LR/scheduler override applied.")
             return
 
-        if self.verbose:
-            print(f"[LRandSchedulerOverrideCallback] Resuming from checkpoint: {trainer.ckpt_path}")
+        if not self.override_lr_on_resume and not self.reset_scheduler_on_resume:
+            self._log("Resuming from checkpoint, but both override/reset are disabled.")
+            return
 
-        # Get optimizers
-        optimizers = trainer.optimizers
-        if not isinstance(optimizers, list):
-            optimizers = [optimizers]
+        self._log(f"Resuming from checkpoint: {trainer.ckpt_path}")
 
-        # Get scheduler configs
-        lr_scheduler_configs = trainer.lr_scheduler_configs
-        if lr_scheduler_configs is None:
-            lr_scheduler_configs = []
+        optimizers = self._as_list(getattr(trainer, "optimizers", []))
+        scheduler_configs = self._as_list(getattr(trainer, "lr_scheduler_configs", []))
+        schedulers = [
+            cfg.scheduler for cfg in scheduler_configs
+            if hasattr(cfg, "scheduler")
+        ]
 
-        # Reset scheduler state FIRST if enabled (before LR override)
-        if self.reset_scheduler_on_resume:
-            self._reset_schedulers(lr_scheduler_configs, optimizers)
-
-        # Override learning rates if enabled
-        if self.override_lr_on_resume:
-            self._override_learning_rates(optimizers, lr_scheduler_configs, pl_module)
-
-    def _override_learning_rates(
-            self,
-            optimizers: List[torch.optim.Optimizer],
-            lr_scheduler_configs: List[Any],
-            pl_module: pl.LightningModule,
-    ) -> None:
-        """Override optimizer learning rates AND scheduler base_lrs with config values."""
-        # Get LR values from config or use provided values
-        config = getattr(pl_module, "config", {})
-        train_config = config.get("training", {})
-
-        vae_lr = self.vae_lr or train_config.get("learning_rate")
-        disc_lr = self.disc_lr or train_config.get("disc_learning_rate")
-
-        target_lrs = [vae_lr, disc_lr]
+        target_lrs = self._resolve_target_lrs(pl_module)
         names = ["VAE", "Discriminator"]
 
-        for idx, optimizer in enumerate(optimizers):
-            if idx >= len(target_lrs) or target_lrs[idx] is None:
-                continue
+        num_slots = max(len(optimizers), len(schedulers), len(target_lrs))
+        for idx in range(num_slots):
+            name = names[idx] if idx < len(names) else f"Optimizer_{idx}"
+            optimizer = optimizers[idx] if idx < len(optimizers) else None
+            scheduler = schedulers[idx] if idx < len(schedulers) else None
+            target_lr = target_lrs[idx] if idx < len(target_lrs) else None
 
-            new_lr = target_lrs[idx]
-            old_lr = optimizer.param_groups[0]["lr"]
+            self._process_one(name, optimizer, scheduler, target_lr)
 
-            # Update optimizer param groups
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = new_lr
-                # Update initial_lr (used by schedulers as reference)
-                param_group["initial_lr"] = new_lr
+    # ----------------------------
+    # Core per-optimizer logic
+    # ----------------------------
+    def _process_one(
+            self,
+            name: str,
+            optimizer: Optional[torch.optim.Optimizer],
+            scheduler: Optional[Any],
+            target_lr: Optional[float],
+    ) -> None:
+        if optimizer is None:
+            self._log(f"{name}: optimizer not found, skip.")
+            return
 
-            # Update scheduler's base_lrs
-            if idx < len(lr_scheduler_configs):
-                scheduler = lr_scheduler_configs[idx].scheduler
-                self._update_scheduler_base_lr(scheduler, new_lr, names[idx])
+        # 1) Reset scheduler if requested
+        if self.reset_scheduler_on_resume and scheduler is not None:
+            self._reset_scheduler_state(name, scheduler)
 
-            if self.verbose:
-                print(f"[LRandSchedulerOverrideCallback] {names[idx]} optimizer LR: {old_lr:.2e} -> {new_lr:.2e}")
+        # 2) Override LR if requested
+        if self.override_lr_on_resume and target_lr is not None:
+            self._override_optimizer_and_scheduler_lr(
+                name=name,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                new_lr=float(target_lr),
+                reset_mode=self.reset_scheduler_on_resume,
+            )
+            return
 
-    def _update_scheduler_base_lr(
+        # 3) If no LR override but reset happened, still need to sync optimizer lr
+        if self.reset_scheduler_on_resume and scheduler is not None:
+            reset_lrs = self._compute_reset_current_lrs(scheduler, optimizer)
+            self._apply_optimizer_lrs(optimizer, reset_lrs)
+            self._set_scheduler_last_lrs(scheduler, reset_lrs)
+            self._log(f"{name}: scheduler reset only, synced optimizer lr -> {reset_lrs}")
+
+    def _override_optimizer_and_scheduler_lr(
+            self,
+            name: str,
+            optimizer: torch.optim.Optimizer,
+            scheduler: Optional[Any],
+            new_lr: float,
+            reset_mode: bool,
+    ) -> None:
+        n_groups = len(optimizer.param_groups)
+        new_base_lrs = [new_lr] * n_groups
+
+        old_current_lrs = [float(pg.get("lr", 0.0)) for pg in optimizer.param_groups]
+
+        if scheduler is not None:
+            old_base_lrs = self._get_base_lrs(scheduler, optimizer)
+
+            # Keep progress OR restart progress
+            if reset_mode:
+                multipliers = self._get_reset_multipliers(scheduler, n_groups)
+            else:
+                multipliers = self._compute_progress_multipliers(
+                    old_current_lrs=old_current_lrs,
+                    old_base_lrs=old_base_lrs,
+                    n_groups=n_groups,
+                )
+
+            # Update scheduler base_lrs
+            self._set_scheduler_base_lrs(scheduler, new_base_lrs)
+        else:
+            # No scheduler => direct set
+            multipliers = [1.0] * n_groups
+
+        new_current_lrs = [b * m for b, m in zip(new_base_lrs, multipliers)]
+
+        # Apply to optimizer
+        for pg, base_lr, cur_lr in zip(optimizer.param_groups, new_base_lrs, new_current_lrs):
+            pg["initial_lr"] = float(base_lr)
+            pg["lr"] = float(cur_lr)
+
+        # Keep scheduler internal "last lr" consistent
+        if scheduler is not None:
+            self._set_scheduler_last_lrs(scheduler, new_current_lrs)
+
+        self._log(
+            f"{name}: override lr -> base={new_lr:.3e}, "
+            f"current={new_current_lrs}, reset_mode={reset_mode}"
+        )
+
+    # ----------------------------
+    # Scheduler state helpers
+    # ----------------------------
+    def _reset_scheduler_state(self, name: str, scheduler: Any) -> None:
+        old_last_epoch = getattr(scheduler, "last_epoch", None)
+
+        if hasattr(scheduler, "last_epoch"):
+            scheduler.last_epoch = -1
+        if hasattr(scheduler, "_step_count"):
+            scheduler._step_count = 0
+        if hasattr(scheduler, "_get_lr_called_within_step"):
+            scheduler._get_lr_called_within_step = False
+
+        self._log(
+            f"{name}: reset scheduler {type(scheduler).__name__} "
+            f"(last_epoch: {old_last_epoch} -> -1)"
+        )
+
+    def _compute_reset_current_lrs(
             self,
             scheduler: Any,
-            new_lr: float,
-            name: str,
-    ) -> None:
-        """
-        Update scheduler's base learning rate.
+            optimizer: torch.optim.Optimizer,
+    ) -> List[float]:
+        base_lrs = self._get_base_lrs(scheduler, optimizer)
+        multipliers = self._get_reset_multipliers(scheduler, len(base_lrs))
+        return [b * m for b, m in zip(base_lrs, multipliers)]
 
-        Works with LambdaLR from diffusers.optimization.get_scheduler.
-        """
-        # Update base_lrs - the reference LR that lambda functions multiply
-        if hasattr(scheduler, "base_lrs"):
-            old_base_lrs = list(scheduler.base_lrs)
-            scheduler.base_lrs = [new_lr for _ in scheduler.base_lrs]
-            if self.verbose:
-                print(
-                    f"[LRandSchedulerOverrideCallback] {name} scheduler base_lrs: "
-                    f"{old_base_lrs} -> {scheduler.base_lrs}"
-                )
+    def _get_reset_multipliers(self, scheduler: Any, n_groups: int) -> List[float]:
+        # For LambdaLR (diffusers scheduler), use lambda(0)
+        if isinstance(scheduler, LambdaLR) and hasattr(scheduler, "lr_lambdas"):
+            vals = []
+            for fn in scheduler.lr_lambdas:
+                try:
+                    vals.append(float(fn(0)))
+                except Exception:
+                    vals.append(1.0)
+            return self._match_len(vals, n_groups, fill=1.0)
 
-        # Update _last_lr to reflect the change immediately
-        if hasattr(scheduler, "_last_lr") and hasattr(scheduler, "base_lrs"):
-            current_step = max(0, getattr(scheduler, "last_epoch", 0))
+        # Fallback for non-Lambda schedulers
+        return [1.0] * n_groups
 
-            # For LambdaLR (diffusers get_scheduler returns this type)
-            if isinstance(scheduler, LambdaLR) and hasattr(scheduler, "lr_lambdas"):
-                scheduler._last_lr = [
-                    lmbda(current_step) * base_lr
-                    for lmbda, base_lr in zip(scheduler.lr_lambdas, scheduler.base_lrs)
-                ]
-            else:
-                # Fallback for other scheduler types
-                scheduler._last_lr = list(scheduler.base_lrs)
-
-    def _reset_schedulers(
+    def _compute_progress_multipliers(
             self,
-            lr_scheduler_configs: List[Any],
-            optimizers: List[torch.optim.Optimizer],
-    ) -> None:
-        """
-        Reset scheduler state to initial values.
+            old_current_lrs: List[float],
+            old_base_lrs: List[float],
+            n_groups: int,
+    ) -> List[float]:
+        cur = self._match_len(old_current_lrs, n_groups, fill=0.0)
+        base = self._match_len(old_base_lrs, n_groups, fill=0.0)
 
-        Works with LambdaLR from diffusers.optimization.get_scheduler.
-        """
-        for idx, scheduler_config in enumerate(lr_scheduler_configs):
-            scheduler = scheduler_config.scheduler
-            scheduler_name = type(scheduler).__name__
-            old_last_epoch = getattr(scheduler, "last_epoch", -1)
+        multipliers = []
+        eps = 1e-12
+        for c, b in zip(cur, base):
+            if abs(b) < eps:
+                multipliers.append(1.0)
+            else:
+                multipliers.append(float(c / b))
+        return multipliers
 
-            # Reset last_epoch to -1 (will become 0 on first step())
-            if hasattr(scheduler, "last_epoch"):
-                scheduler.last_epoch = -1
+    def _get_base_lrs(
+            self,
+            scheduler: Optional[Any],
+            optimizer: torch.optim.Optimizer,
+    ) -> List[float]:
+        if scheduler is not None and hasattr(scheduler, "base_lrs"):
+            base = list(scheduler.base_lrs)
+            return self._match_len(base, len(optimizer.param_groups), fill=base[-1] if len(base) > 0 else 0.0)
 
-            # Reset _step_count if it exists (used internally by some schedulers)
-            if hasattr(scheduler, "_step_count"):
-                scheduler._step_count = 0
+        # Fallback from optimizer
+        vals = []
+        for pg in optimizer.param_groups:
+            vals.append(float(pg.get("initial_lr", pg.get("lr", 0.0))))
+        return vals
 
-            # Recalculate _last_lr for step 0 (initial state after first step)
-            if hasattr(scheduler, "_last_lr") and hasattr(scheduler, "base_lrs"):
-                if isinstance(scheduler, LambdaLR) and hasattr(scheduler, "lr_lambdas"):
-                    # LambdaLR: _last_lr = lambda(step) * base_lr
-                    # At step 0 (after reset, first step will compute lambda(0))
-                    scheduler._last_lr = [
-                        lmbda(0) * base_lr
-                        for lmbda, base_lr in zip(scheduler.lr_lambdas, scheduler.base_lrs)
-                    ]
-                else:
-                    scheduler._last_lr = list(scheduler.base_lrs)
+    def _set_scheduler_base_lrs(self, scheduler: Any, base_lrs: List[float]) -> None:
+        if hasattr(scheduler, "base_lrs"):
+            scheduler.base_lrs = list(base_lrs)
 
-            # Also reset initial_lr in optimizer param_groups to match base_lrs
-            if idx < len(optimizers) and hasattr(scheduler, "base_lrs"):
-                optimizer = optimizers[idx]
-                for pg_idx, param_group in enumerate(optimizer.param_groups):
-                    if pg_idx < len(scheduler.base_lrs):
-                        param_group["initial_lr"] = scheduler.base_lrs[pg_idx]
+    def _set_scheduler_last_lrs(self, scheduler: Any, lrs: List[float]) -> None:
+        if hasattr(scheduler, "_last_lr"):
+            scheduler._last_lr = list(lrs)
 
-            if self.verbose:
-                current_lr = scheduler._last_lr[0] if hasattr(scheduler, "_last_lr") else "N/A"
-                print(
-                    f"[LRandSchedulerOverrideCallback] Scheduler {idx} ({scheduler_name}): "
-                    f"last_epoch {old_last_epoch} -> -1 (reset), initial LR -> {current_lr}"
-                )
+    # ----------------------------
+    # Utility helpers
+    # ----------------------------
+    def _resolve_target_lrs(self, pl_module: pl.LightningModule) -> List[Optional[float]]:
+        config = getattr(pl_module, "config", {}) or {}
+        train_cfg = config.get("training", {}) if isinstance(config, dict) else {}
+
+        vae_lr = self.vae_lr if self.vae_lr is not None else train_cfg.get("learning_rate")
+        disc_lr = self.disc_lr if self.disc_lr is not None else train_cfg.get("disc_learning_rate")
+
+        return [vae_lr, disc_lr]
+
+    @staticmethod
+    def _as_list(x: Any) -> List[Any]:
+        if x is None:
+            return []
+        if isinstance(x, list):
+            return x
+        return [x]
+
+    @staticmethod
+    def _match_len(values: List[float], n: int, fill: float = 0.0) -> List[float]:
+        if len(values) >= n:
+            return values[:n]
+        if len(values) == 0:
+            return [fill] * n
+        return values + [values[-1]] * (n - len(values))
+
+    @staticmethod
+    def _is_resuming(trainer: pl.Trainer) -> bool:
+        return getattr(trainer, "ckpt_path", None) is not None
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"[LRandSchedulerOverrideCallback] {msg}")

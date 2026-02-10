@@ -18,6 +18,10 @@ Usage:
 
     # Custom resolution (non-square)
     python scripts/inference.py --input image.jpg --output out.jpg --width 768 --height 512
+
+    # Use EMA weights from a Lightning checkpoint for inference
+    python scripts/inference.py --checkpoint_path path/to/model.ckpt --use_ema \
+        --input image.jpg --output out.jpg
 """
 
 import argparse
@@ -34,8 +38,8 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms
 from tqdm import tqdm
+from diffusers import AutoencoderKL
 
-from src.models.autoencoder_kl import AutoencoderKL
 from src.lightning.vae_module import VAELightningModule
 
 # Supported file extensions
@@ -57,6 +61,11 @@ def parse_args():
         type=str,
         default=None,
         help="Path to Lightning checkpoint (optional)",
+    )
+    parser.add_argument(
+        "--use_ema",
+        action="store_true",
+        help="Use EMA weights for inference when loading from --checkpoint_path",
     )
     parser.add_argument(
         "--input",
@@ -160,14 +169,55 @@ def get_resolution(args) -> Tuple[int, int]:
     return width, height
 
 
+def encode_to_latent(
+        model: AutoencoderKL,
+        x: torch.Tensor,
+        sample_posterior: bool = True,
+) -> torch.Tensor:
+    """
+    Encode image tensor to scaled latents.
+    """
+    posterior = model.encode(x).latent_dist
+    z = posterior.sample() if sample_posterior else posterior.mode()
+    scaling_factor = getattr(model.config, "scaling_factor", 0.18215)
+    return z * scaling_factor
+
+
+def decode_from_latent(
+        model: AutoencoderKL,
+        z: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Decode scaled latents to image tensor.
+    """
+    scaling_factor = getattr(model.config, "scaling_factor", 0.18215)
+    z = z / scaling_factor
+    return model.decode(z).sample
+
+
 def load_model(args) -> AutoencoderKL:
     """Load VAE model."""
     if args.checkpoint_path:
         # Load from Lightning checkpoint
-        module = VAELightningModule.load_from_checkpoint(args.checkpoint_path)
+        module = VAELightningModule.load_from_checkpoint(
+            args.checkpoint_path,
+            map_location="cpu",
+        )
+        if args.use_ema:
+            if getattr(module, "ema", None) is None:
+                raise ValueError(
+                    "`--use_ema` is set, but EMA weights were not found in checkpoint. "
+                    "Please ensure this checkpoint was trained/saved with EMA enabled."
+                )
+            module.ema.copy_to(module.vae.parameters())
+            print("Using EMA weights from checkpoint for inference.")
         model = module.vae
     else:
         # Load from pretrained
+        if args.use_ema:
+            print(
+                "Warning: `--use_ema` is ignored because `--checkpoint_path` is not provided."
+            )
         model = AutoencoderKL.from_pretrained(args.model_path)
 
     # Set dtype
@@ -301,7 +351,7 @@ def encode_images(
         batch_tensor = torch.cat(images, dim=0).to(device, dtype=model_dtype)
 
         with torch.no_grad():
-            latents = model.encode_to_latent(batch_tensor, sample_posterior=True)
+            latents = encode_to_latent(model, batch_tensor, sample_posterior=True)
 
         # Save each latent
         for i, path in enumerate(batch_paths):
@@ -339,7 +389,7 @@ def decode_latents(
         batch_latent = torch.cat(latents, dim=0).to(dtype=model_dtype)
 
         with torch.no_grad():
-            images = model.decode_from_latent(batch_latent)
+            images = decode_from_latent(model, batch_latent)
 
         # Save each image
         for i, path in enumerate(batch_paths):
@@ -388,10 +438,10 @@ def reconstruct_images(
 
         with torch.no_grad():
             # Encode
-            latents = model.encode_to_latent(batch_tensor, sample_posterior=True)
+            latents = encode_to_latent(model, batch_tensor, sample_posterior=True)
 
             # Decode
-            reconstructions = model.decode_from_latent(latents)
+            reconstructions = decode_from_latent(model, latents)
 
         # Log latent shape once
         if not latent_shape_logged:
