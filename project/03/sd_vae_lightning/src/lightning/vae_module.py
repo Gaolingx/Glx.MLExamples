@@ -4,7 +4,7 @@ Supports TensorBoard logging, checkpoint management, and various loss functions.
 """
 
 from typing import Optional, Dict, Any, Tuple, List
-from copy import deepcopy
+import json
 from pathlib import Path
 
 import torch
@@ -12,13 +12,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.utilities.types import STEP_OUTPUT
+from diffusers import AutoencoderKL
 from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_scheduler
 import lpips
 import torchvision
 import math
 
-from ..models.autoencoder_kl import AutoencoderKL
 from ..utils.metrics import PSNR, SSIM, rFID
 
 
@@ -157,8 +157,8 @@ class VAELightningModule(pl.LightningModule):
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
-        self.save_hyperparameters(config)
         self.config = config
+        self.save_hyperparameters({"config": config})
 
         # Disable automatic optimization for GAN training with manual gradient accumulation
         self.automatic_optimization = False
@@ -166,50 +166,25 @@ class VAELightningModule(pl.LightningModule):
         # Build VAE model
         model_config = config.get("model", {})
         pretrained_path = model_config.get("pretrained_model_name_or_path")
+        model_config_name_or_path = model_config.get("model_config_name_or_path")
+        inline_vae_config = model_config.get("vae_config")
+
+        if pretrained_path and (model_config_name_or_path is not None or inline_vae_config is not None):
+            raise ValueError(
+                "Cannot set both `pretrained_model_name_or_path` and "
+                "`model_config_name_or_path`/`vae_config`."
+            )
 
         if pretrained_path:
             self.vae = AutoencoderKL.from_pretrained(pretrained_path)
+        elif model_config_name_or_path is not None:
+            vae_config = AutoencoderKL.load_config(model_config_name_or_path)
+            self.vae = AutoencoderKL.from_config(vae_config)
+        elif inline_vae_config is not None:
+            self.vae = AutoencoderKL.from_config(inline_vae_config)
         else:
-            self.vae = AutoencoderKL(
-                in_channels=model_config.get("in_channels", 3),
-                out_channels=model_config.get("out_channels", 3),
-                down_block_types=tuple(
-                    model_config.get(
-                        "down_block_types",
-                        [
-                            "DownEncoderBlock2D",
-                            "DownEncoderBlock2D",
-                            "DownEncoderBlock2D",
-                            "DownEncoderBlock2D",
-                        ],
-                    )
-                ),
-                up_block_types=tuple(
-                    model_config.get(
-                        "up_block_types",
-                        [
-                            "UpDecoderBlock2D",
-                            "UpDecoderBlock2D",
-                            "UpDecoderBlock2D",
-                            "UpDecoderBlock2D",
-                        ],
-                    )
-                ),
-                block_out_channels=tuple(
-                    model_config.get("block_out_channels", [128, 256, 512, 512])
-                ),
-                layers_per_block=model_config.get("layers_per_block", 2),
-                act_fn=model_config.get("act_fn", "silu"),
-                latent_channels=model_config.get("latent_channels", 4),
-                norm_num_groups=model_config.get("norm_num_groups", 32),
-                sample_size=model_config.get("sample_size", 512),
-                scaling_factor=model_config.get("scaling_factor", 0.18215),
-                use_quant_conv=model_config.get("use_quant_conv", True),
-                use_post_quant_conv=model_config.get("use_post_quant_conv", True),
-                mid_block_add_attention=model_config.get(
-                    "mid_block_add_attention", True
-                ),
-            )
+            vae_config = AutoencoderKL.load_config("stabilityai/sd-vae-ft-mse")
+            self.vae = AutoencoderKL.from_config(vae_config)
 
         # Build discriminator
         loss_config = config.get("loss", {})
@@ -358,7 +333,7 @@ class VAELightningModule(pl.LightningModule):
         dec = self.vae.decode(z).sample
         return dec, z, posterior
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
+    def encode(self, x: torch.Tensor, sample_posterior: bool = True) -> torch.Tensor:
         """
         Encode image to latent.
 
@@ -368,7 +343,9 @@ class VAELightningModule(pl.LightningModule):
         Returns:
             Scaled latent tensor.
         """
-        return self.vae.encode_to_latent(x, sample_posterior=True)
+        posterior = self.vae.encode(x).latent_dist
+        z = posterior.sample() if sample_posterior else posterior.mode()
+        return z * self.vae.config.scaling_factor
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """
@@ -380,7 +357,8 @@ class VAELightningModule(pl.LightningModule):
         Returns:
             Decoded image tensor (range [-1, 1]).
         """
-        return self.vae.decode_from_latent(z)
+        z = z / self.vae.config.scaling_factor
+        return self.vae.decode(z).sample
 
     def _compute_discriminator_win_rate(
             self,
@@ -1179,37 +1157,9 @@ class VAELightningModule(pl.LightningModule):
         if self.use_ema and self.ema is not None:
             ema_dir = save_path / "vae_ema"
 
-            self.ema.store(self.vae.parameters())
-            self.ema.copy_to(self.vae.parameters())
-            self.vae.save_pretrained(ema_dir)
-            self.ema.restore(self.vae.parameters())
+            self.ema.save_pretrained(str(ema_dir))
 
         # Save discriminator if exists
         if self.discriminator is not None:
             disc_path = save_path / "discriminator.pt"
             torch.save(self.discriminator.state_dict(), disc_path)
-
-    @classmethod
-    def load_from_checkpoint(
-            cls, checkpoint_path: str, config: Optional[Dict[str, Any]] = None, **kwargs
-    ) -> "VAELightningModule":
-        """
-        Load model from Lightning checkpoint.
-
-        Args:
-            checkpoint_path: Path to checkpoint file.
-            config: Optional config override.
-            **kwargs: Additional arguments.
-
-        Returns:
-            Loaded VAELightningModule.
-        """
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
-
-        if config is None:
-            config = checkpoint.get("hyper_parameters", {})
-
-        model = cls(config)
-        model.load_state_dict(checkpoint["state_dict"])
-
-        return model

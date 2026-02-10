@@ -261,9 +261,10 @@ def main():
     trainer.fit(model, datamodule=data_module, ckpt_path=ckpt_path)
 
     # Save final model
-    final_model_path = os.path.join(output_dir, "final_model")
-    model.save_pretrained(final_model_path)
-    print(f"Final model saved to: {final_model_path}")
+    if trainer.is_global_zero:
+        final_model_path = os.path.join(output_dir, "final_model")
+        trainer.lightning_module.save_pretrained(final_model_path)
+        print(f"Final model saved to: {final_model_path}")
 
 
 if __name__ == "__main__":

@@ -189,10 +189,7 @@ class VAECheckpointCallback(ModelCheckpoint):
                 ema_save_dir = hf_dir / "vae_ema"
                 print(f"Saving EMA weights to {ema_save_dir}...")
 
-                pl_module.ema.store(pl_module.vae.parameters())
-                pl_module.ema.copy_to(pl_module.vae.parameters())
-                pl_module.vae.save_pretrained(str(ema_save_dir))
-                pl_module.ema.restore(pl_module.vae.parameters())
+                pl_module.ema.save_pretrained(str(ema_save_dir))
 
             # Save training config
             config_path = hf_dir / "training_config.json"
