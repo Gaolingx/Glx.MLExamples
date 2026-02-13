@@ -1,6 +1,7 @@
 {
   "model": {
     "pretrained_model_name_or_path": null,
+    "gradient_checkpointing": true,
     "vae_config": {
       "in_channels": 3,
       "out_channels": 3,

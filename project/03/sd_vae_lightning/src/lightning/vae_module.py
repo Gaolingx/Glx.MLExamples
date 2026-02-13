@@ -187,6 +187,10 @@ class VAELightningModule(pl.LightningModule):
                 "Must specify one of `pretrained_model_name_or_path`, "
                 "`model_config_name_or_path`, or `vae_config` in the config."
             )
+        
+        # Enable gradient checkpointing for memory savings
+        if model_config.get("gradient_checkpointing", False):
+            self.vae.enable_gradient_checkpointing()
 
         # Build discriminator
         loss_config = config.get("loss", {})
