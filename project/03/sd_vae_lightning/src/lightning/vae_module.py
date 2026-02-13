@@ -187,7 +187,7 @@ class VAELightningModule(pl.LightningModule):
                 "Must specify one of `pretrained_model_name_or_path`, "
                 "`model_config_name_or_path`, or `vae_config` in the config."
             )
-        
+
         # Enable gradient checkpointing for memory savings
         if model_config.get("gradient_checkpointing", False):
             self.vae.enable_gradient_checkpointing()
@@ -202,7 +202,7 @@ class VAELightningModule(pl.LightningModule):
                 input_nc=disc_config.get("input_nc", 3),
                 ndf=disc_config.get("ndf", 64),
                 n_layers=disc_config.get("n_layers", 3),
-                norm_type=disc_config.get("norm_type", "spectral_group"),  # Default: stable for low bs
+                norm_type=disc_config.get("norm_type", "spectral_group"),
                 num_groups=disc_config.get("num_groups", 32),
             )
             self.disc_start_step = loss_config.get("disc_start_step", 50001)
@@ -229,10 +229,40 @@ class VAELightningModule(pl.LightningModule):
         self.use_adaptive_disc_weight = loss_config.get("use_adaptive_disc_weight", True)
         self.adaptive_weight_max = loss_config.get("adaptive_weight_max", 10.0)
 
-        # Training config
         train_config = config.get("training", {})
-        self.learning_rate = train_config.get("learning_rate", 4.5e-6)
-        self.disc_learning_rate = train_config.get("disc_learning_rate", 4.5e-6)
+
+        # Generator optimizer config
+        gen_opt_cfg = train_config.get("generator_optimizer", {})
+        self.gen_opt_config = {
+            "type": gen_opt_cfg.get("type", "AdamW"),
+            "learning_rate": gen_opt_cfg.get("learning_rate", 4.5e-6),
+            "adam_beta1": gen_opt_cfg.get("adam_beta1", 0.9),
+            "adam_beta2": gen_opt_cfg.get("adam_beta2", 0.999),
+            "weight_decay": gen_opt_cfg.get("weight_decay", 0.01),
+            "lr_scheduler": gen_opt_cfg.get("lr_scheduler", "constant_with_warmup"),
+            "lr_warmup_steps": gen_opt_cfg.get("lr_warmup_steps", 500),
+            "lr_num_cycles": gen_opt_cfg.get("lr_num_cycles", 1),
+            "lr_power": gen_opt_cfg.get("lr_power", 1.0),
+        }
+
+        # Discriminator optimizer config
+        disc_opt_cfg = train_config.get("discriminator_optimizer", {})
+        self.disc_opt_config = {
+            "type": disc_opt_cfg.get("type", "AdamW"),
+            "learning_rate": disc_opt_cfg.get("learning_rate", 4.5e-6),
+            "adam_beta1": disc_opt_cfg.get("adam_beta1", 0.9),
+            "adam_beta2": disc_opt_cfg.get("adam_beta2", 0.999),
+            "weight_decay": disc_opt_cfg.get("weight_decay", 0.01),
+            "lr_scheduler": disc_opt_cfg.get("lr_scheduler", "constant_with_warmup"),
+            "lr_warmup_steps": disc_opt_cfg.get("lr_warmup_steps", 500),
+            "lr_num_cycles": disc_opt_cfg.get("lr_num_cycles", 1),
+            "lr_power": disc_opt_cfg.get("lr_power", 1.0),
+        }
+
+        # Keep top-level attributes for backward compatibility with training_step logging
+        self.learning_rate = self.gen_opt_config["learning_rate"]
+        self.disc_learning_rate = self.disc_opt_config["learning_rate"]
+
         self.accumulate_grad_batches = train_config.get("accumulate_grad_batches", 1)
         self.gradient_clip_val = train_config.get("gradient_clip_val", 1.0)
 
@@ -248,7 +278,7 @@ class VAELightningModule(pl.LightningModule):
         self.num_val_images = log_config.get("num_val_images", 4)
 
         # Validation metrics
-        self.psnr_metric = PSNR(data_range=2.0)  # [-1, 1] range
+        self.psnr_metric = PSNR(data_range=2.0)
         self.ssim_metric = SSIM(data_range=2.0, channel=3)
 
         # rFID metric for reconstruction quality evaluation
@@ -970,30 +1000,139 @@ class VAELightningModule(pl.LightningModule):
                 self.global_step,
             )
 
+    def _build_optimizer(
+            self,
+            params,
+            opt_config: Dict[str, Any],
+    ) -> torch.optim.Optimizer:
+        """
+        Build an optimizer from a per-role config dict.
+
+        Args:
+            params: Iterable of parameters to optimise.
+            opt_config: Dictionary with keys:
+                - type: Optimizer class name ('AdamW', 'Adam', 'SGD', 'RMSprop').
+                - learning_rate: Base learning rate.
+                - adam_beta1: Beta1 for Adam-family optimizers.
+                - adam_beta2: Beta2 for Adam-family optimizers.
+                - weight_decay: Weight decay coefficient.
+                - momentum: Momentum for SGD (default 0.9).
+
+        Returns:
+            Configured optimizer instance.
+
+        Raises:
+            ValueError: If optimizer type is not supported.
+        """
+        opt_type = opt_config.get("type", "AdamW").lower()
+        lr = opt_config["learning_rate"]
+        betas = (opt_config.get("adam_beta1", 0.9), opt_config.get("adam_beta2", 0.999))
+        weight_decay = opt_config.get("weight_decay", 0.01)
+
+        if opt_type == "adamw":
+            return torch.optim.AdamW(params, lr=lr, betas=betas, weight_decay=weight_decay)
+        elif opt_type == "adam":
+            return torch.optim.Adam(params, lr=lr, betas=betas, weight_decay=weight_decay)
+        elif opt_type == "sgd":
+            momentum = opt_config.get("momentum", 0.9)
+            return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
+        elif opt_type == "rmsprop":
+            return torch.optim.RMSprop(params, lr=lr, weight_decay=weight_decay)
+        else:
+            raise ValueError(
+                f"Unknown optimizer type: {opt_type}. "
+                f"Supported: 'AdamW', 'Adam', 'SGD', 'RMSprop'."
+            )
+
+    def _build_scheduler(
+            self,
+            optimizer: torch.optim.Optimizer,
+            opt_config: Dict[str, Any],
+            num_training_steps: int,
+    ):
+        """
+        Build a learning rate scheduler from a per-role config dict.
+
+        Reads all scheduler-related fields from the same ``opt_config`` dict
+        used by ``_build_optimizer``, keeping a unified config-per-role pattern.
+
+        Args:
+            optimizer: The optimizer to schedule.
+            opt_config: Dictionary with keys:
+                - lr_scheduler: Scheduler type. Supported:
+                    'constant', 'constant_with_warmup', 'linear',
+                    'cosine', 'cosine_with_restarts', 'polynomial'.
+                - lr_warmup_steps: Number of warmup steps (clamped to
+                    ``num_training_steps``).
+                - lr_num_cycles: Cycles for 'cosine_with_restarts' (default 1).
+                - lr_power: Exponent for 'polynomial' decay (default 1.0).
+                - lr_end: Final LR for 'polynomial' (default 0.0).
+            num_training_steps: Total training steps for this scheduler
+                (already accounts for alternating G/D splits).
+
+        Returns:
+            LambdaLR scheduler from ``diffusers.optimization.get_scheduler``.
+
+        Raises:
+            ValueError: If scheduler type is not supported.
+        """
+        scheduler_type = opt_config.get("lr_scheduler", "constant_with_warmup")
+        num_warmup_steps = opt_config.get("lr_warmup_steps", 500)
+        num_cycles = opt_config.get("lr_num_cycles", 1)
+        power = opt_config.get("lr_power", 1.0)
+        lr_end = opt_config.get("lr_end", 0.0)
+
+        valid_types = {
+            "constant",
+            "constant_with_warmup",
+            "linear",
+            "cosine",
+            "cosine_with_restarts",
+            "polynomial",
+        }
+        if scheduler_type not in valid_types:
+            raise ValueError(
+                f"Unknown scheduler type: {scheduler_type}. "
+                f"Choose from: {', '.join(sorted(valid_types))}"
+            )
+
+        num_training_steps = max(1, num_training_steps)
+        num_warmup_steps = min(num_warmup_steps, num_training_steps)
+
+        scheduler_kwargs: Dict[str, Any] = {
+            "name": scheduler_type,
+            "optimizer": optimizer,
+            "num_warmup_steps": num_warmup_steps,
+        }
+
+        if scheduler_type not in ("constant", "constant_with_warmup"):
+            scheduler_kwargs["num_training_steps"] = num_training_steps
+
+        if scheduler_type == "cosine_with_restarts":
+            scheduler_kwargs["num_cycles"] = num_cycles
+        elif scheduler_type == "polynomial":
+            scheduler_kwargs["power"] = power
+            scheduler_kwargs["lr_end"] = lr_end
+
+        return get_scheduler(**scheduler_kwargs)
+
     def configure_optimizers(self):
         """
         Configure optimizers and learning rate schedulers.
+
         Uses trainer.estimated_stepping_batches for accurate step count estimation.
-        Handles alternating G/D training by computing separate step counts for each optimizer.
+        Handles alternating G/D training by computing separate step counts for
+        each optimizer.
+
         Important considerations:
-        - VAE scheduler steps on even accumulated steps + all steps before disc_start
-        - Discriminator scheduler steps on odd accumulated steps after disc_start
-        - Warmup steps are clamped to each scheduler's total training steps
+            - VAE scheduler steps on even accumulated steps + all steps before disc_start.
+            - Discriminator scheduler steps on odd accumulated steps after disc_start.
+            - Warmup steps are clamped to each scheduler's total training steps.
         """
-        train_config = self.config.get("training", {})
-
-        vae_params = list(self.vae.parameters())
-        opt_vae = torch.optim.AdamW(
-            vae_params,
-            lr=self.learning_rate,
-            betas=(train_config.get("adam_beta1", 0.9), train_config.get("adam_beta2", 0.999)),
-            weight_decay=train_config.get("weight_decay", 0.01),
-        )
-
+        # ---- total training steps estimation ----
         total_steps = None
         trainer = getattr(self, "_trainer", None)
         if trainer is not None:
-            # manual optimization + manual scheduler stepping: prefer explicit max_steps
             if isinstance(trainer.max_steps, int) and trainer.max_steps > 0:
                 total_steps = trainer.max_steps
             elif (
@@ -1001,21 +1140,21 @@ class VAELightningModule(pl.LightningModule):
                     and trainer.max_epochs > 0
                     and trainer.num_training_batches not in (None, float("inf"))
             ):
-                # fallback: derive update steps and account for manual grad accumulation
                 total_steps = math.ceil(
                     (int(trainer.num_training_batches) * int(trainer.max_epochs))
                     / int(self.accumulate_grad_batches)
                 )
 
+        train_config = self.config.get("training", {})
         if total_steps is None:
             total_steps = int(train_config.get("max_train_steps", 100000))
-
         total_steps = max(1, int(total_steps))
 
-        lr_scheduler_type = train_config.get("lr_scheduler", "constant_with_warmup")
-        lr_warmup_steps = train_config.get("lr_warmup_steps", 500)
-        lr_num_cycles = train_config.get("lr_num_cycles", 1)
-        lr_power = train_config.get("lr_power", 1.0)
+        # ---- Generator (VAE) ----
+        opt_vae = self._build_optimizer(
+            list(self.vae.parameters()),
+            self.gen_opt_config,
+        )
 
         disc_start_step = self.disc_start_step if self.use_discriminator else float("inf")
 
@@ -1026,44 +1165,28 @@ class VAELightningModule(pl.LightningModule):
         else:
             vae_scheduler_steps = total_steps
 
-        vae_scheduler_steps = max(1, vae_scheduler_steps)
-
-        vae_scheduler = self._get_scheduler(
-            optimizer=opt_vae,
-            scheduler_type=lr_scheduler_type,
-            num_warmup_steps=lr_warmup_steps,
-            num_training_steps=vae_scheduler_steps,
-            num_cycles=lr_num_cycles,
-            power=lr_power,
+        vae_scheduler = self._build_scheduler(
+            opt_vae,
+            self.gen_opt_config,
+            num_training_steps=max(1, vae_scheduler_steps),
         )
 
+        # ---- Discriminator (if needed) ----
         if self.discriminator is not None:
-            disc_params = list(self.discriminator.parameters())
-            opt_disc = torch.optim.AdamW(
-                disc_params,
-                lr=self.disc_learning_rate,
-                betas=(train_config.get("adam_beta1", 0.9), train_config.get("adam_beta2", 0.999)),
-                weight_decay=train_config.get("weight_decay", 0.01),
+            opt_disc = self._build_optimizer(
+                list(self.discriminator.parameters()),
+                self.disc_opt_config,
             )
 
-            disc_lr_scheduler_type = train_config.get("disc_lr_scheduler", lr_scheduler_type)
-            disc_lr_warmup_steps = train_config.get("disc_lr_warmup_steps", lr_warmup_steps)
-
             if disc_start_step < total_steps:
-                steps_after_disc = total_steps - int(disc_start_step)
-                disc_scheduler_steps = steps_after_disc // 2
+                disc_scheduler_steps = (total_steps - int(disc_start_step)) // 2
             else:
                 disc_scheduler_steps = 0
 
-            disc_scheduler_steps = max(1, disc_scheduler_steps)
-
-            disc_scheduler = self._get_scheduler(
-                optimizer=opt_disc,
-                scheduler_type=disc_lr_scheduler_type,
-                num_warmup_steps=disc_lr_warmup_steps,
-                num_training_steps=disc_scheduler_steps,
-                num_cycles=lr_num_cycles,
-                power=lr_power,
+            disc_scheduler = self._build_scheduler(
+                opt_disc,
+                self.disc_opt_config,
+                num_training_steps=max(1, disc_scheduler_steps),
             )
 
             return (
@@ -1082,68 +1205,6 @@ class VAELightningModule(pl.LightningModule):
                 "frequency": 1,
             },
         }
-
-    def _get_scheduler(
-            self,
-            optimizer: torch.optim.Optimizer,
-            scheduler_type: str,
-            num_warmup_steps: int,
-            num_training_steps: int,
-            num_cycles: int = 1,
-            power: float = 1.0,
-            lr_end: float = 0.0,
-    ):
-        """
-        Create a learning rate scheduler using diffusers.optimization.get_scheduler.
-
-        Args:
-            optimizer: The optimizer to schedule.
-            scheduler_type: Type of scheduler. Supported:
-                'constant', 'constant_with_warmup', 'linear',
-                'cosine', 'cosine_with_restarts', 'polynomial'.
-            num_warmup_steps: Number of warmup steps.
-            num_training_steps: Total training steps for this scheduler.
-            num_cycles: Cycles for cosine_with_restarts.
-            power: Power for polynomial decay.
-            lr_end: Final LR ratio for polynomial (default 0.0).
-
-        Returns:
-            LambdaLR scheduler from diffusers.
-        """
-        valid_types = {
-            "constant",
-            "constant_with_warmup",
-            "linear",
-            "cosine",
-            "cosine_with_restarts",
-            "polynomial",
-        }
-        if scheduler_type not in valid_types:
-            raise ValueError(
-                f"Unknown scheduler type: {scheduler_type}. "
-                f"Choose from: {', '.join(sorted(valid_types))}"
-            )
-
-        num_training_steps = max(1, num_training_steps)
-
-        num_warmup_steps = min(num_warmup_steps, num_training_steps)
-
-        scheduler_kwargs = {
-            "name": scheduler_type,
-            "optimizer": optimizer,
-            "num_warmup_steps": num_warmup_steps,
-        }
-
-        if scheduler_type not in ("constant", "constant_with_warmup"):
-            scheduler_kwargs["num_training_steps"] = num_training_steps
-
-        if scheduler_type == "cosine_with_restarts":
-            scheduler_kwargs["num_cycles"] = num_cycles
-        elif scheduler_type == "polynomial":
-            scheduler_kwargs["power"] = power
-            scheduler_kwargs["lr_end"] = lr_end
-
-        return get_scheduler(**scheduler_kwargs)
 
     def save_pretrained(self, save_directory: str) -> None:
         """
