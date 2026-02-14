@@ -12,8 +12,184 @@ import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
+from pytorch_lightning.utilities.types import STEP_OUTPUT
 from torch.optim.lr_scheduler import LambdaLR
 import torchvision
+
+
+class VAELoggingCallback(Callback):
+    """
+    Unified callback for VAE metric/image logging.
+
+    - Logs step-level train metrics emitted by `training_step`
+    - Aggregates and logs epoch-level train metrics
+    - Logs validation metrics emitted by `validation_step`
+    - Computes/logs validation rFID at epoch end
+    - Logs validation comparison images to TensorBoard
+    """
+
+    def __init__(
+            self,
+            num_val_images: int = 4,
+            log_to_tensorboard: bool = True,
+            log_every_n_steps: int = 500,
+    ):
+        super().__init__()
+        self.num_val_images = num_val_images
+        self.log_to_tensorboard = log_to_tensorboard
+        self.log_every_n_steps = log_every_n_steps
+        self._train_epoch_metrics: Dict[str, List[torch.Tensor]] = {}
+        self._val_outputs: List[Dict[str, torch.Tensor]] = []
+
+    def _visualize_latent(
+            self,
+            latent: torch.Tensor,
+            target_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        b, c, h, w = latent.shape
+
+        latent_flat = latent.view(b, -1)
+        min_vals = latent_flat.min(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
+        max_vals = latent_flat.max(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
+
+        range_vals = max_vals - min_vals
+        range_vals = torch.where(range_vals < 1e-5, torch.ones_like(range_vals), range_vals)
+        latent_normalized = (latent - min_vals) / range_vals
+
+        if c >= 3:
+            latent_vis = latent_normalized[:, :3]
+        else:
+            latent_vis = latent_normalized[:, :1].repeat(1, 3, 1, 1)
+
+        latent_vis = F.interpolate(
+            latent_vis,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        return latent_vis
+
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self._train_epoch_metrics = {}
+
+    def on_train_batch_end(
+            self,
+            trainer: pl.Trainer,
+            pl_module: pl.LightningModule,
+            outputs: Any,
+            batch: Any,
+            batch_idx: int,
+    ) -> None:
+        if not isinstance(outputs, dict):
+            return
+
+        metrics = outputs.get("train_metrics", {})
+        if not isinstance(metrics, dict):
+            return
+
+        for key, value in metrics.items():
+            if isinstance(value, torch.Tensor):
+                metric_value = value.detach()
+            else:
+                metric_value = torch.tensor(float(value), device=pl_module.device)
+
+            pl_module.log(key, metric_value, on_step=True, on_epoch=False, prog_bar=key.startswith("train/"))
+
+            if key not in self._train_epoch_metrics:
+                self._train_epoch_metrics[key] = []
+            self._train_epoch_metrics[key].append(metric_value)
+
+        if (
+                self.log_to_tensorboard
+                and trainer.logger is not None
+                and trainer.global_step % self.log_every_n_steps == 0
+                and isinstance(batch, dict)
+                and "pixel_values" in batch
+        ):
+            with torch.no_grad():
+                targets = batch["pixel_values"][: self.num_val_images]
+                if hasattr(pl_module, "forward_with_latent"):
+                    reconstructions, latent, _ = pl_module.forward_with_latent(
+                        targets, sample_posterior=False
+                    )
+                else:
+                    reconstructions, _ = pl_module(targets, sample_posterior=False)
+                    latent = pl_module.vae.encode(targets).latent_dist.mode()
+
+            targets = torch.clamp((targets + 1) / 2, 0, 1)
+            reconstructions = torch.clamp((reconstructions + 1) / 2, 0, 1)
+            target_size = (targets.shape[2], targets.shape[3])
+            latent_vis = self._visualize_latent(latent, target_size)
+
+            comparison = torch.cat([targets, latent_vis, reconstructions], dim=0)
+            grid = torchvision.utils.make_grid(comparison, nrow=self.num_val_images, padding=2)
+
+            if hasattr(trainer.logger, "experiment"):
+                trainer.logger.experiment.add_image("train/reconstruction", grid, trainer.global_step)
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        for key, values in self._train_epoch_metrics.items():
+            if len(values) == 0:
+                continue
+            mean_value = torch.stack(values).mean()
+            pl_module.log(f"epoch/{key}", mean_value, on_step=False, on_epoch=True, prog_bar=False)
+        self._train_epoch_metrics = {}
+
+    def on_validation_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self._val_outputs = []
+
+    def on_validation_batch_end(
+            self,
+            trainer: pl.Trainer,
+            pl_module: pl.LightningModule,
+            outputs: Optional[STEP_OUTPUT],
+            batch: Any,
+            batch_idx: int,
+            dataloader_idx: int = 0,
+    ) -> None:
+        if not isinstance(outputs, dict):
+            return
+
+        metrics = outputs.get("val_metrics", {})
+        if isinstance(metrics, dict):
+            for key, value in metrics.items():
+                if isinstance(value, torch.Tensor):
+                    metric_value = value.detach()
+                else:
+                    metric_value = torch.tensor(float(value), device=pl_module.device)
+                pl_module.log(key, metric_value, on_step=False, on_epoch=True, prog_bar=True)
+
+        visuals = outputs.get("val_visuals")
+        if isinstance(visuals, dict) and len(self._val_outputs) < self.num_val_images:
+            self._val_outputs.append(visuals)
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if hasattr(pl_module, "rfid_metric"):
+            rfid_score = pl_module.rfid_metric.compute()
+            pl_module.log("val/rfid", rfid_score, on_epoch=True, prog_bar=True)
+            pl_module.rfid_metric.reset()
+
+        if not self.log_to_tensorboard or trainer.logger is None or len(self._val_outputs) == 0:
+            return
+
+        targets = torch.cat([out["targets"] for out in self._val_outputs], dim=0)
+        reconstructions = torch.cat([out["reconstructions"] for out in self._val_outputs], dim=0)
+        latent = torch.cat([out["latent"] for out in self._val_outputs], dim=0)
+
+        targets = (targets + 1) / 2
+        reconstructions = (reconstructions + 1) / 2
+        targets = torch.clamp(targets, 0, 1)
+        reconstructions = torch.clamp(reconstructions, 0, 1)
+
+        target_size = (targets.shape[2], targets.shape[3])
+        latent_vis = self._visualize_latent(latent, target_size)
+
+        n = min(self.num_val_images, targets.shape[0])
+        comparison = torch.cat([targets[:n], latent_vis[:n], reconstructions[:n]], dim=0)
+        grid = torchvision.utils.make_grid(comparison, nrow=n, padding=2)
+
+        if hasattr(trainer.logger, "experiment"):
+            trainer.logger.experiment.add_image("val/reconstruction", grid, trainer.global_step)
 
 
 class ImageLoggerCallback(Callback):
@@ -195,33 +371,6 @@ class VAECheckpointCallback(ModelCheckpoint):
             config_path = hf_dir / "training_config.json"
             with open(config_path, "w") as f:
                 json.dump(trainer.lightning_module.config, f, indent=2)
-
-
-class LearningRateMonitor(Callback):
-    """
-    Callback for monitoring and logging learning rates.
-    """
-
-    def on_train_batch_start(
-            self,
-            trainer: pl.Trainer,
-            pl_module: pl.LightningModule,
-            batch: Any,
-            batch_idx: int,
-    ) -> None:
-        """Log current learning rates."""
-        if trainer.logger is None:
-            return
-
-        optimizers = trainer.optimizers
-        if not isinstance(optimizers, list):
-            optimizers = [optimizers]
-
-        for idx, optimizer in enumerate(optimizers):
-            for param_group_idx, param_group in enumerate(optimizer.param_groups):
-                lr = param_group["lr"]
-                name = f"lr/optimizer_{idx}_group_{param_group_idx}"
-                pl_module.log(name, lr, on_step=True, on_epoch=False)
 
 
 class GradientNormLogger(Callback):

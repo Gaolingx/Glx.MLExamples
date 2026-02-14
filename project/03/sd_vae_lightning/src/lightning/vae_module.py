@@ -16,7 +16,6 @@ from diffusers import AutoencoderKL
 from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_scheduler
 import lpips
-import torchvision
 import math
 
 from ..utils.metrics import PSNR, SSIM, rFID
@@ -164,7 +163,6 @@ class VAELightningModule(pl.LightningModule):
         loss_config = config.get("loss", {})
         disc_config = config.get("discriminator", {})
         train_config = config.get("training", {})
-        log_config = config.get("logging", {})
 
         # Disable automatic optimization for GAN training with manual gradient accumulation
         self.automatic_optimization = False
@@ -267,15 +265,13 @@ class VAELightningModule(pl.LightningModule):
         self.accumulate_grad_batches = train_config.get("accumulate_grad_batches", 1)
         self.gradient_clip_val = train_config.get("gradient_clip_val", 1.0)
 
+        self.max_train_steps = train_config.get("max_train_steps", 100000)
+
         # EMA configuration
         self.use_ema = train_config.get("use_ema", True)
         self.ema_decay = train_config.get("ema_decay", 0.9999)
         self.ema_update_interval = train_config.get("ema_update_interval", 1)
         self.ema: Optional[EMAModel] = None
-
-        # Logging config
-        self.log_images_every_n_steps = log_config.get("log_images_every_n_steps", 500)
-        self.num_val_images = log_config.get("num_val_images", 4)
 
         # Validation metrics
         self.psnr_metric = PSNR(data_range=2.0)
@@ -284,15 +280,8 @@ class VAELightningModule(pl.LightningModule):
         # rFID metric for reconstruction quality evaluation
         self.rfid_metric = rFID(feature_dim=2048, reset_real_features=True)
 
-        # Validation images storage
-        self.validation_step_outputs: List[Dict[str, torch.Tensor]] = []
-
         # Cache for G/D loss ratio computation across alternating steps
         self._cached_g_loss: Optional[torch.Tensor] = None
-        self._cached_vae_loss_dict: Optional[Dict[str, torch.Tensor]] = None
-
-        # Training epoch metrics accumulator
-        self._train_epoch_metrics: Dict[str, List[torch.Tensor]] = {}
 
     def on_fit_start(self) -> None:
         """Initialize EMA model at the start of training."""
@@ -625,33 +614,6 @@ class VAELightningModule(pl.LightningModule):
 
             return d_loss, loss_dict
 
-    def _accumulate_epoch_metrics(self, loss_dict: Dict[str, torch.Tensor], prefix: str) -> None:
-        """
-        Accumulate metrics for epoch-level logging.
-
-        Args:
-            loss_dict: Dictionary of loss values.
-            prefix: Prefix for metric keys.
-        """
-        for key, value in loss_dict.items():
-            metric_key = f"{prefix}/{key}"
-            if metric_key not in self._train_epoch_metrics:
-                self._train_epoch_metrics[metric_key] = []
-            self._train_epoch_metrics[metric_key].append(value.detach())
-
-    def on_train_epoch_start(self) -> None:
-        """Reset epoch metrics accumulator at the start of each epoch."""
-        self._train_epoch_metrics = {}
-
-    def on_train_epoch_end(self) -> None:
-        """Log epoch-level training metrics."""
-        for key, values in self._train_epoch_metrics.items():
-            if len(values) > 0:
-                stacked = torch.stack(values)
-                mean_value = stacked.mean()
-                self.log(f"epoch/{key}", mean_value, on_step=False, on_epoch=True, prog_bar=False)
-        self._train_epoch_metrics = {}
-
     def _compute_grad_norm(self, parameters) -> torch.Tensor:
         """
         Compute total gradient norm for given parameters.
@@ -689,6 +651,7 @@ class VAELightningModule(pl.LightningModule):
             Loss tensor.
         """
         targets = batch["pixel_values"]
+        train_metrics: Dict[str, torch.Tensor] = {}
         optimizers = self.optimizers()
 
         # Handle single or multiple optimizers
@@ -749,24 +712,20 @@ class VAELightningModule(pl.LightningModule):
                     vae_scheduler = schedulers
                 vae_scheduler.step()
 
-                self.log("train/grad_norm_vae", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
+                train_metrics["train/grad_norm_vae"] = grad_norm
 
             for key, value in vae_loss_dict.items():
-                self.log(f"train/{key}", value, on_step=True, on_epoch=False, prog_bar=True)
-            # Log learning rate
+                train_metrics[f"train/{key}"] = value
+            # Learning rate metric
             schedulers = self.lr_schedulers()
             if isinstance(schedulers, list):
                 vae_lr = schedulers[0].get_last_lr()[0]
             else:
                 vae_lr = schedulers.get_last_lr()[0]
-            self.log("train/lr", vae_lr, on_step=True, on_epoch=False, prog_bar=False)
+            train_metrics["train/lr"] = torch.tensor(vae_lr, device=targets.device)
 
-            # Accumulate for epoch-level logging
-            self._accumulate_epoch_metrics(vae_loss_dict, "train")
-
-            # Cache g_loss and loss dict for G/D ratio computation in discriminator step
+            # Cache g_loss for G/D ratio computation in discriminator step
             self._cached_g_loss = vae_loss_dict.get("g_loss", torch.tensor(0.0, device=targets.device))
-            self._cached_vae_loss_dict = vae_loss_dict
 
             result = vae_loss
 
@@ -800,7 +759,7 @@ class VAELightningModule(pl.LightningModule):
                     if isinstance(schedulers, list) and len(schedulers) > 1:
                         disc_scheduler = schedulers[1]
                         disc_scheduler.step()
-                    self.log("train/grad_norm_disc", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
+                    train_metrics["train/grad_norm_disc"] = grad_norm
 
                 if self._cached_g_loss is not None:
                     g_loss = self._cached_g_loss
@@ -808,25 +767,20 @@ class VAELightningModule(pl.LightningModule):
                     gd_ratio = self._compute_loss_ratio(g_loss, d_loss)
                     disc_loss_dict["gd_loss_ratio"] = gd_ratio
 
-                # Log discriminator losses (step-level only)
                 for key, value in disc_loss_dict.items():
-                    self.log(f"train/{key}", value, on_step=True, on_epoch=False, prog_bar=True)
-                # Log discriminator learning rate
+                    train_metrics[f"train/{key}"] = value
                 schedulers = self.lr_schedulers()
                 if isinstance(schedulers, list) and len(schedulers) > 1:
                     disc_lr = schedulers[1].get_last_lr()[0]
-                    self.log("train/disc_lr", disc_lr, on_step=True, on_epoch=False, prog_bar=False)
-
-                # Accumulate for epoch-level logging
-                self._accumulate_epoch_metrics(disc_loss_dict, "train")
+                    train_metrics["train/disc_lr"] = torch.tensor(disc_lr, device=targets.device)
                 result = disc_loss
             else:
                 result = None
 
-        if is_last_accumulation_step and self.global_step % self.log_images_every_n_steps == 0:
-            self._log_images(targets, reconstructions, latent, "train")
-
-        return result
+        return {
+            "loss": result,
+            "train_metrics": train_metrics,
+        }
 
     def validation_step(
             self, batch: Dict[str, torch.Tensor], batch_idx: int
@@ -866,139 +820,21 @@ class VAELightningModule(pl.LightningModule):
             loss_dict["psnr"] = psnr
             loss_dict["ssim"] = ssim
 
-            # Log losses to epoch section
-            for key, value in loss_dict.items():
-                self.log(f"val/{key}", value, on_step=False, on_epoch=True, prog_bar=True)
-
-            # Store for epoch end logging
-            if batch_idx < self.num_val_images:
-                self.validation_step_outputs.append(
-                    {
-                        "targets": targets.detach().cpu(),
-                        "reconstructions": reconstructions.detach().cpu(),
-                        "latent": latent.detach().cpu(),
-                    }
-                )
+            val_metrics = {f"val/{key}": value for key, value in loss_dict.items()}
+            val_visuals = {
+                "targets": targets.detach().cpu(),
+                "reconstructions": reconstructions.detach().cpu(),
+                "latent": latent.detach().cpu(),
+            }
         finally:
             # Restore original weights
             if self.use_ema and self.ema is not None:
                 self.ema.restore(self.vae.parameters())
 
-        return loss_dict
-
-    def on_validation_epoch_end(self) -> None:
-        """Log validation images and compute epoch-level metrics at epoch end."""
-        # Compute and log rFID score
-        rfid_score = self.rfid_metric.compute()
-        self.log("val/rfid", rfid_score, on_epoch=True, prog_bar=True)
-        self.rfid_metric.reset()
-
-        if len(self.validation_step_outputs) > 0:
-            targets = torch.cat(
-                [out["targets"] for out in self.validation_step_outputs], dim=0
-            )
-            reconstructions = torch.cat(
-                [out["reconstructions"] for out in self.validation_step_outputs], dim=0
-            )
-            latent = torch.cat(
-                [out["latent"] for out in self.validation_step_outputs], dim=0
-            )
-            self._log_images(
-                targets[: self.num_val_images],
-                reconstructions[: self.num_val_images],
-                latent[: self.num_val_images],
-                "val",
-            )
-            self.validation_step_outputs.clear()
-
-    def _visualize_latent(
-            self,
-            latent: torch.Tensor,
-            target_size: Tuple[int, int],
-    ) -> torch.Tensor:
-        """
-        Visualize latent space as an image.
-
-        Args:
-            latent: Latent tensor of shape (B, C, H, W).
-            target_size: Target size (H, W) to upsample to.
-
-        Returns:
-            Visualization tensor of shape (B, 3, H', W') normalized to [0, 1].
-        """
-        b, c, h, w = latent.shape
-
-        # Min-max normalize per image (across all channels)
-        latent_flat = latent.view(b, -1)
-        min_vals = latent_flat.min(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
-        max_vals = latent_flat.max(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
-
-        # Avoid division by zero
-        range_vals = max_vals - min_vals
-        range_vals = torch.where(range_vals < 1e-5, torch.ones_like(range_vals), range_vals)
-
-        latent_normalized = (latent - min_vals) / range_vals
-
-        # Use first 3 channels as RGB if available, otherwise use grayscale
-        if c >= 3:
-            latent_vis = latent_normalized[:, :3]
-        else:
-            # Repeat single channel to RGB
-            latent_vis = latent_normalized[:, :1].repeat(1, 3, 1, 1)
-
-        # Upsample to target size for consistent grid visualization
-        latent_vis = F.interpolate(
-            latent_vis,
-            size=target_size,
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        return latent_vis
-
-    def _log_images(
-            self,
-            targets: torch.Tensor,
-            reconstructions: torch.Tensor,
-            latent: torch.Tensor,
-            prefix: str,
-    ) -> None:
-        """
-        Log images to TensorBoard.
-
-        Args:
-            targets: Original images.
-            reconstructions: Reconstructed images.
-            latent: Latent space tensor.
-            prefix: Logging prefix ('train' or 'val').
-        """
-        if not self.logger:
-            return
-
-        # Denormalize images from [-1, 1] to [0, 1]
-        targets = (targets + 1) / 2
-        reconstructions = (reconstructions + 1) / 2
-
-        # Clamp values
-        targets = torch.clamp(targets, 0, 1)
-        reconstructions = torch.clamp(reconstructions, 0, 1)
-
-        # Visualize latent space (upsample to match target size)
-        target_size = (targets.shape[2], targets.shape[3])
-        latent_vis = self._visualize_latent(latent, target_size)
-
-        # Create grid with 3 rows: targets, latent, reconstructions
-        n = min(4, targets.shape[0])
-        comparison = torch.cat([targets[:n], latent_vis[:n], reconstructions[:n]], dim=0)
-        grid = torchvision.utils.make_grid(comparison, nrow=n, padding=2)
-
-        # Log to tensorboard
-        if hasattr(self.logger, "experiment"):
-            self.logger.experiment.add_image(
-                f"{prefix}/reconstruction",
-                grid,
-                self.global_step,
-            )
+        return {
+            "val_metrics": val_metrics,
+            "val_visuals": val_visuals,
+        }
 
     def _build_optimizer(
             self,
@@ -1146,7 +982,7 @@ class VAELightningModule(pl.LightningModule):
                 )
 
         if total_steps is None:
-            total_steps = int(self.train_config.get("max_train_steps", 100000))
+            total_steps = int(self.max_train_steps)
         total_steps = max(1, int(total_steps))
 
         # ---- Generator (VAE) ----

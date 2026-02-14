@@ -36,7 +36,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from src.lightning.vae_module import VAELightningModule
 from src.data.dataset import VAEDataModule
 from src.utils.callbacks import (
-    ImageLoggerCallback,
+    VAELoggingCallback,
     VAECheckpointCallback,
     GradientNormLogger,
     LRandSchedulerOverrideCallback,
@@ -179,11 +179,11 @@ def main():
         ),
         # Learning rate monitor
         LearningRateMonitor(logging_interval="step"),
-        # Image logger
-        ImageLoggerCallback(
-            log_every_n_steps=logging_config.get("log_images_every_n_steps", 500),
-            num_images=logging_config.get("num_val_images", 4),
+        # Unified VAE metrics/images logging
+        VAELoggingCallback(
+            num_val_images=logging_config.get("num_val_images", 4),
             log_to_tensorboard=True,
+            log_every_n_steps=logging_config.get("log_images_every_n_steps", 500),
         ),
         # Gradient norm logger
         GradientNormLogger(log_every_n_steps=100),
