@@ -265,8 +265,6 @@ class VAELightningModule(pl.LightningModule):
         self.accumulate_grad_batches = train_config.get("accumulate_grad_batches", 1)
         self.gradient_clip_val = train_config.get("gradient_clip_val", 1.0)
 
-        self.max_train_steps = train_config.get("max_train_steps", 100000)
-
         # EMA configuration
         self.use_ema = train_config.get("use_ema", True)
         self.ema_decay = train_config.get("ema_decay", 0.9999)
@@ -966,25 +964,14 @@ class VAELightningModule(pl.LightningModule):
             - Warmup steps are clamped to each scheduler's total training steps.
         """
         # ---- total training steps estimation ----
-        total_steps = None
-        trainer = getattr(self, "_trainer", None)
-        if trainer is not None:
-            if isinstance(trainer.max_steps, int) and trainer.max_steps > 0:
-                total_steps = trainer.max_steps
-            elif (
-                    trainer.max_epochs is not None
-                    and trainer.max_epochs > 0
-                    and trainer.num_training_batches not in (None, float("inf"))
-            ):
-                total_steps = math.ceil(
-                    (int(trainer.num_training_batches) * int(trainer.max_epochs))
-                    / int(self.accumulate_grad_batches)
-                )
-
-        if total_steps is None:
-            total_steps = int(self.max_train_steps)
-        total_steps = max(1, int(total_steps))
-
+        estimated = self.trainer.estimated_stepping_batches
+        if estimated is None or not math.isfinite(estimated):
+            raise ValueError(
+                "Cannot infer total training steps from Trainer. "
+                "Please set `max_steps` in `pl.Trainer(...)`, or use finite "
+                "`max_epochs` with a finite-length dataloader."
+            )
+        total_steps = max(1, math.ceil(float(estimated) / float(self.accumulate_grad_batches)))
         # ---- Generator (VAE) ----
         opt_vae = self._build_optimizer(
             list(self.vae.parameters()),

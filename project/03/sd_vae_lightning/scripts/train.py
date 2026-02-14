@@ -228,6 +228,7 @@ def main():
         accelerator=accelerator,
         devices=devices,
         max_epochs=train_config_section.get("num_epochs", 100),
+        max_steps=train_config_section.get("max_train_steps", -1),
         precision=train_config_section.get("precision", "16-mixed"),
         accumulate_grad_batches=1,  # Manual accumulation in training_step
         # gradient_clip_val handled manually in training_step
