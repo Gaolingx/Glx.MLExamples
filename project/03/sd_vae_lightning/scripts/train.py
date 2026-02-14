@@ -40,6 +40,7 @@ from src.utils.callbacks import (
     VAECheckpointCallback,
     GradientNormLogger,
     LRandSchedulerOverrideCallback,
+    NaNLossCallback,
 )
 
 
@@ -159,7 +160,12 @@ def main():
     checkpoint_config = config.get("checkpoint", {})
     logging_config = config.get("logging", {})
 
+    gen_opt_cfg = train_config_section.get("generator_optimizer", {})
+    disc_opt_cfg = train_config_section.get("discriminator_optimizer", {})
+
     callbacks = [
+        # NaN/Inf loss guard
+        NaNLossCallback(),
         # Checkpoint callback
         VAECheckpointCallback(
             dirpath=checkpoint_dir,
@@ -185,8 +191,8 @@ def main():
         LRandSchedulerOverrideCallback(
             override_lr_on_resume=train_config_section.get("override_lr_on_resume", True),
             reset_scheduler_on_resume=train_config_section.get("reset_scheduler_on_resume", False),
-            vae_lr=train_config_section.get("learning_rate"),
-            disc_lr=train_config_section.get("disc_learning_rate"),
+            gen_opt_config=gen_opt_cfg,
+            disc_opt_config=disc_opt_cfg,
             verbose=True,
         ),
         # Progress bar

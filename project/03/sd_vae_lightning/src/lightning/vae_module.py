@@ -160,11 +160,16 @@ class VAELightningModule(pl.LightningModule):
         self.config = config
         self.save_hyperparameters({"config": config})
 
+        model_config = config.get("model", {})
+        loss_config = config.get("loss", {})
+        disc_config = config.get("discriminator", {})
+        train_config = config.get("training", {})
+        log_config = config.get("logging", {})
+
         # Disable automatic optimization for GAN training with manual gradient accumulation
         self.automatic_optimization = False
 
         # Build VAE model
-        model_config = config.get("model", {})
         pretrained_path = model_config.get("pretrained_model_name_or_path")
         model_config_name_or_path = model_config.get("model_config_name_or_path")
         inline_vae_config = model_config.get("vae_config")
@@ -193,11 +198,9 @@ class VAELightningModule(pl.LightningModule):
             self.vae.enable_gradient_checkpointing()
 
         # Build discriminator
-        loss_config = config.get("loss", {})
         self.use_discriminator = loss_config.get("disc_weight", 0) > 0
 
         if self.use_discriminator:
-            disc_config = config.get("discriminator", {})
             self.discriminator = NLayerDiscriminator(
                 input_nc=disc_config.get("input_nc", 3),
                 ndf=disc_config.get("ndf", 64),
@@ -228,8 +231,6 @@ class VAELightningModule(pl.LightningModule):
         self.disc_factor = loss_config.get("disc_factor", 1.0)
         self.use_adaptive_disc_weight = loss_config.get("use_adaptive_disc_weight", True)
         self.adaptive_weight_max = loss_config.get("adaptive_weight_max", 10.0)
-
-        train_config = config.get("training", {})
 
         # Generator optimizer config
         gen_opt_cfg = train_config.get("generator_optimizer", {})
@@ -273,7 +274,6 @@ class VAELightningModule(pl.LightningModule):
         self.ema: Optional[EMAModel] = None
 
         # Logging config
-        log_config = config.get("logging", {})
         self.log_images_every_n_steps = log_config.get("log_images_every_n_steps", 500)
         self.num_val_images = log_config.get("num_val_images", 4)
 
@@ -1145,9 +1145,8 @@ class VAELightningModule(pl.LightningModule):
                     / int(self.accumulate_grad_batches)
                 )
 
-        train_config = self.config.get("training", {})
         if total_steps is None:
-            total_steps = int(train_config.get("max_train_steps", 100000))
+            total_steps = int(self.train_config.get("max_train_steps", 100000))
         total_steps = max(1, int(total_steps))
 
         # ---- Generator (VAE) ----
@@ -1222,7 +1221,6 @@ class VAELightningModule(pl.LightningModule):
         # Save VAE (optionally use EMA weights)
         if self.use_ema and self.ema is not None:
             ema_dir = save_path / "vae_ema"
-
             self.ema.save_pretrained(str(ema_dir))
 
         # Save discriminator if exists
