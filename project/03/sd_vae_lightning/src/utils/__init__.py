@@ -1,13 +1,13 @@
 """Training utilities: callbacks, metrics, and helpers."""
 
 from .callbacks import (
-    ImageLoggerCallback,
+    VAELoggingCallback,
     VAECheckpointCallback,
 )
 from .metrics import VAEMetrics
 
 __all__ = [
-    "ImageLoggerCallback",
+    "VAELoggingCallback",
     "VAECheckpointCallback",
     "VAEMetrics",
 ]
