@@ -194,29 +194,6 @@ class VAELightningModule(pl.LightningModule):
 
             self.ema.load_state_dict(checkpoint["ema_state"])
 
-    def forward(
-            self,
-            x: torch.Tensor,
-            sample_posterior: bool = True,
-    ) -> Tuple[torch.Tensor, Any]:
-        """
-        Forward pass: encode and decode.
-
-        Args:
-            x: Input image tensor.
-            sample_posterior: Whether to sample from posterior.
-
-        Returns:
-            Tuple of (reconstructed image, posterior distribution).
-        """
-        posterior = self.vae.encode(x).latent_dist
-        if sample_posterior:
-            z = posterior.sample()
-        else:
-            z = posterior.mode()
-        dec = self.vae.decode(z).sample
-        return dec, posterior
-
     def forward_with_latent(
             self,
             x: torch.Tensor,
@@ -239,33 +216,6 @@ class VAELightningModule(pl.LightningModule):
             z = posterior.mode()
         dec = self.vae.decode(z).sample
         return dec, z, posterior
-
-    def encode(self, x: torch.Tensor, sample_posterior: bool = True) -> torch.Tensor:
-        """
-        Encode image to latent.
-
-        Args:
-            x: Input image tensor (range [-1, 1]).
-
-        Returns:
-            Scaled latent tensor.
-        """
-        posterior = self.vae.encode(x).latent_dist
-        z = posterior.sample() if sample_posterior else posterior.mode()
-        return z * self.vae.config.scaling_factor
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Decode latent to image.
-
-        Args:
-            z: Scaled latent tensor.
-
-        Returns:
-            Decoded image tensor (range [-1, 1]).
-        """
-        z = z / self.vae.config.scaling_factor
-        return self.vae.decode(z).sample
 
     def _compute_discriminator_win_rate(
             self,

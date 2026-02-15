@@ -108,13 +108,9 @@ class VAELoggingCallback(Callback):
         ):
             with torch.no_grad():
                 targets = batch["pixel_values"][: self.num_val_images]
-                if hasattr(pl_module, "forward_with_latent"):
-                    reconstructions, latent, _ = pl_module.forward_with_latent(
-                        targets, sample_posterior=False
-                    )
-                else:
-                    reconstructions, _ = pl_module(targets, sample_posterior=False)
-                    latent = pl_module.vae.encode(targets).latent_dist.mode()
+                posterior = pl_module.vae.encode(targets).latent_dist
+                latent = posterior.mode()
+                reconstructions = pl_module.vae.decode(latent).sample
 
             targets = torch.clamp((targets + 1) / 2, 0, 1)
             reconstructions = torch.clamp((reconstructions + 1) / 2, 0, 1)
