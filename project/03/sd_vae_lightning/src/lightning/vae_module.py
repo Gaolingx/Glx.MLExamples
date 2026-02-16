@@ -717,72 +717,67 @@ class VAELightningModule(pl.LightningModule):
             optimizer: torch.optim.Optimizer,
             opt_config: Dict[str, Any],
             num_training_steps: int,
+            last_epoch: int = -1,
     ):
         """
         Build a learning rate scheduler from a per-role config dict.
 
-        Reads all scheduler-related fields from the same ``opt_config`` dict
-        used by ``_build_optimizer``, keeping a unified config-per-role pattern.
+        Delegates entirely to ``diffusers.optimization.get_scheduler``, which
+        internally validates required arguments per scheduler type.
 
         Args:
             optimizer: The optimizer to schedule.
             opt_config: Dictionary with keys:
                 - lr_scheduler: Scheduler type. Supported:
                     'constant', 'constant_with_warmup', 'linear',
-                    'cosine', 'cosine_with_restarts', 'polynomial'.
-                - lr_warmup_steps: Number of warmup steps (clamped to
-                    ``num_training_steps``).
-                - lr_num_cycles: Cycles for 'cosine_with_restarts' (default 1).
+                    'cosine', 'cosine_with_restarts', 'polynomial',
+                    'piecewise_constant'.
+                - lr_warmup_steps: Number of warmup steps (default 500,
+                    clamped to ``num_training_steps``).
+                - lr_num_cycles: Cycles for cosine-family schedulers.
+                    For 'cosine' this controls the fraction of a cosine
+                    period (default 0.5 = half-cosine decay).
+                    For 'cosine_with_restarts' this is the number of
+                    hard restarts (default 1).
                 - lr_power: Exponent for 'polynomial' decay (default 1.0).
-                - lr_end: Final LR for 'polynomial' (default 0.0).
+                - lr_end: Final learning rate for 'polynomial' (default 1e-7).
+                - lr_step_rules: Step rules string for 'piecewise_constant'
+                    (e.g. "1:10,0.1:20,0.01:30,0.005").
             num_training_steps: Total training steps for this scheduler
                 (already accounts for alternating G/D splits).
+            last_epoch: Index of the last epoch for resuming training
+                (default -1, meaning fresh start).
 
         Returns:
-            LambdaLR scheduler from ``diffusers.optimization.get_scheduler``.
+            ``LambdaLR`` scheduler from ``diffusers.optimization.get_scheduler``.
 
         Raises:
-            ValueError: If scheduler type is not supported.
+            ValueError: If scheduler type is not recognised by diffusers.
         """
         scheduler_type = opt_config.get("lr_scheduler", "constant_with_warmup")
-        num_warmup_steps = opt_config.get("lr_warmup_steps", 500)
-        num_cycles = opt_config.get("lr_num_cycles", 1)
-        power = opt_config.get("lr_power", 1.0)
-        lr_end = opt_config.get("lr_end", 0.0)
-
-        valid_types = {
-            "constant",
-            "constant_with_warmup",
-            "linear",
-            "cosine",
-            "cosine_with_restarts",
-            "polynomial",
-        }
-        if scheduler_type not in valid_types:
-            raise ValueError(
-                f"Unknown scheduler type: {scheduler_type}. "
-                f"Choose from: {', '.join(sorted(valid_types))}"
-            )
 
         num_training_steps = max(1, num_training_steps)
+        num_warmup_steps = opt_config.get("lr_warmup_steps", 500)
         num_warmup_steps = min(num_warmup_steps, num_training_steps)
 
-        scheduler_kwargs: Dict[str, Any] = {
-            "name": scheduler_type,
-            "optimizer": optimizer,
-            "num_warmup_steps": num_warmup_steps,
-        }
+        if scheduler_type == "cosine":
+            num_cycles = opt_config.get("lr_num_cycles", 0.5)
+        else:
+            num_cycles = opt_config.get("lr_num_cycles", 1)
 
-        if scheduler_type not in ("constant", "constant_with_warmup"):
-            scheduler_kwargs["num_training_steps"] = num_training_steps
+        power = opt_config.get("lr_power", 1.0)
+        step_rules = opt_config.get("lr_step_rules", None)
 
-        if scheduler_type == "cosine_with_restarts":
-            scheduler_kwargs["num_cycles"] = num_cycles
-        elif scheduler_type == "polynomial":
-            scheduler_kwargs["power"] = power
-            scheduler_kwargs["lr_end"] = lr_end
-
-        return get_scheduler(**scheduler_kwargs)
+        return get_scheduler(
+            name=scheduler_type,
+            optimizer=optimizer,
+            step_rules=step_rules,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+            num_cycles=num_cycles,
+            power=power,
+            last_epoch=last_epoch,
+        )
 
     def configure_optimizers(self):
         """
