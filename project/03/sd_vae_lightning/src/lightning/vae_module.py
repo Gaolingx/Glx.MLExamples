@@ -755,16 +755,12 @@ class VAELightningModule(pl.LightningModule):
             ValueError: If scheduler type is not recognised by diffusers.
         """
         scheduler_type = opt_config.get("lr_scheduler", "constant_with_warmup")
-
         num_training_steps = max(1, num_training_steps)
+
         num_warmup_steps = opt_config.get("lr_warmup_steps", 500)
         num_warmup_steps = min(num_warmup_steps, num_training_steps)
 
-        if scheduler_type == "cosine":
-            num_cycles = opt_config.get("lr_num_cycles", 0.5)
-        else:
-            num_cycles = opt_config.get("lr_num_cycles", 1)
-
+        num_cycles = opt_config.get("lr_num_cycles", 1)
         power = opt_config.get("lr_power", 1.0)
         step_rules = opt_config.get("lr_step_rules", None)
 

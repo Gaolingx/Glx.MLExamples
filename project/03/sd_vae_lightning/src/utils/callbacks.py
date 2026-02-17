@@ -32,12 +32,12 @@ class VAELoggingCallback(Callback):
             self,
             num_val_images: int = 4,
             log_to_tensorboard: bool = True,
-            log_every_n_steps: int = 500,
+            log_images_every_n_steps: int = 500,
     ):
         super().__init__()
         self.num_val_images = num_val_images
         self.log_to_tensorboard = log_to_tensorboard
-        self.log_every_n_steps = log_every_n_steps
+        self.log_images_every_n_steps = log_images_every_n_steps
         self._train_epoch_metrics: Dict[str, List[torch.Tensor]] = {}
         self._val_outputs: List[Dict[str, torch.Tensor]] = []
 
@@ -102,7 +102,7 @@ class VAELoggingCallback(Callback):
         if (
                 self.log_to_tensorboard
                 and trainer.logger is not None
-                and trainer.global_step % self.log_every_n_steps == 0
+                and trainer.global_step % self.log_images_every_n_steps == 0
                 and isinstance(batch, dict)
                 and "pixel_values" in batch
         ):
@@ -259,7 +259,7 @@ class GradientNormLogger(Callback):
     Useful for debugging training instabilities.
     """
 
-    def __init__(self, log_every_n_steps: int = 100):
+    def __init__(self, log_every_n_steps: int = 50):
         super().__init__()
         self.log_every_n_steps = log_every_n_steps
 
