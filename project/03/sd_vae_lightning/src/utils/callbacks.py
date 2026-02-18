@@ -69,6 +69,29 @@ class VAELoggingCallback(Callback):
         )
         return latent_vis
 
+    def _log_images(
+            self,
+            targets: torch.Tensor,
+            reconstructions: torch.Tensor,
+            latent: torch.Tensor,
+            prefix: str,
+            step: int,
+    ) -> None:
+        if not self.logger:
+            return
+
+        targets = torch.clamp((targets + 1) / 2, 0, 1)
+        reconstructions = torch.clamp((reconstructions + 1) / 2, 0, 1)
+        target_size = (targets.shape[2], targets.shape[3])
+        latent_vis = self._visualize_latent(latent, target_size)
+
+        n = targets.shape[0]
+        comparison = torch.cat([targets[:n], latent_vis[:n], reconstructions[:n]], dim=0)
+        grid = torchvision.utils.make_grid(comparison, nrow=n, padding=2)
+
+        if hasattr(self.logger, "experiment"):
+            self.logger.experiment.add_image(f"{prefix}/reconstruction", grid, step)
+
     def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         self._train_epoch_metrics = {}
 
@@ -112,16 +135,7 @@ class VAELoggingCallback(Callback):
                 latent = posterior.mode()
                 reconstructions = pl_module.vae.decode(latent).sample
 
-            targets = torch.clamp((targets + 1) / 2, 0, 1)
-            reconstructions = torch.clamp((reconstructions + 1) / 2, 0, 1)
-            target_size = (targets.shape[2], targets.shape[3])
-            latent_vis = self._visualize_latent(latent, target_size)
-
-            comparison = torch.cat([targets, latent_vis, reconstructions], dim=0)
-            grid = torchvision.utils.make_grid(comparison, nrow=self.num_val_images, padding=2)
-
-            if hasattr(trainer.logger, "experiment"):
-                trainer.logger.experiment.add_image("train/reconstruction", grid, trainer.global_step)
+            self._log_images(targets, reconstructions, latent, "train", trainer.global_step)
 
     def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         for key, values in self._train_epoch_metrics.items():
@@ -172,20 +186,11 @@ class VAELoggingCallback(Callback):
         reconstructions = torch.cat([out["reconstructions"] for out in self._val_outputs], dim=0)
         latent = torch.cat([out["latent"] for out in self._val_outputs], dim=0)
 
-        targets = (targets + 1) / 2
-        reconstructions = (reconstructions + 1) / 2
-        targets = torch.clamp(targets, 0, 1)
-        reconstructions = torch.clamp(reconstructions, 0, 1)
-
-        target_size = (targets.shape[2], targets.shape[3])
-        latent_vis = self._visualize_latent(latent, target_size)
-
         n = min(self.num_val_images, targets.shape[0])
-        comparison = torch.cat([targets[:n], latent_vis[:n], reconstructions[:n]], dim=0)
-        grid = torchvision.utils.make_grid(comparison, nrow=n, padding=2)
-
-        if hasattr(trainer.logger, "experiment"):
-            trainer.logger.experiment.add_image("val/reconstruction", grid, trainer.global_step)
+        targets = targets[:n]
+        reconstructions = reconstructions[:n]
+        latent = latent[:n]
+        self._log_images(targets, reconstructions, latent, "val", trainer.global_step)
 
 
 class VAECheckpointCallback(ModelCheckpoint):
