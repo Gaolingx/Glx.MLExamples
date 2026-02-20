@@ -3,11 +3,8 @@ Metrics for evaluating VAE reconstruction quality.
 Includes PSNR, SSIM, LPIPS, and rFID computation.
 """
 
-from typing import Optional, Dict, Tuple
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 try:
     import lpips
@@ -22,6 +19,13 @@ try:
     HAS_FID = True
 except ImportError:
     HAS_FID = False
+
+try:
+    from torchmetrics.image import PeakSignalNoiseRatio
+
+    HAS_TORCHMETRICS_PSNR = True
+except ImportError:
+    HAS_TORCHMETRICS_PSNR = False
 
 try:
     from torchmetrics.image import StructuralSimilarityIndexMeasure
@@ -40,11 +44,15 @@ class PSNR:
     """
 
     def __init__(self, data_range: float = 1.0):
+        if not HAS_TORCHMETRICS_PSNR:
+            raise ImportError(
+                "torchmetrics is required for PSNR computation. "
+                "Install with: pip install torchmetrics"
+            )
         self.data_range = data_range
+        self._metric = PeakSignalNoiseRatio(data_range=data_range)
 
-    def __call__(
-            self, pred: torch.Tensor, target: torch.Tensor
-    ) -> torch.Tensor:
+    def __call__(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
         Compute PSNR between prediction and target.
 
@@ -55,11 +63,8 @@ class PSNR:
         Returns:
             PSNR value in dB.
         """
-        mse = F.mse_loss(pred, target, reduction="mean")
-        if mse == 0:
-            return torch.tensor(float("inf"), device=pred.device)
-        psnr = 20 * torch.log10(self.data_range / torch.sqrt(mse))
-        return psnr
+        self._metric = self._metric.to(pred.device)
+        return self._metric(pred, target)
 
 
 class SSIM:
@@ -69,15 +74,9 @@ class SSIM:
     Args:
         data_range: Range of input data.
         window_size: Size of the sliding window (kernel_size).
-        channel: Number of channels (kept for backward compatibility).
     """
 
-    def __init__(
-            self,
-            data_range: float = 1.0,
-            window_size: int = 11,
-            channel: int = 3,
-    ):
+    def __init__(self, data_range: float = 1.0, window_size: int = 11):
         if not HAS_TORCHMETRICS_SSIM:
             raise ImportError(
                 "torchmetrics is required for SSIM computation. "
@@ -85,31 +84,12 @@ class SSIM:
             )
         self.data_range = data_range
         self.window_size = window_size
-        self.channel = channel  # Kept for backward compatibility
-        self._ssim_metric: Optional[StructuralSimilarityIndexMeasure] = None
-        self._device: Optional[torch.device] = None
-        self._dtype: Optional[torch.dtype] = None
+        self._metric = StructuralSimilarityIndexMeasure(
+            data_range=data_range,
+            kernel_size=window_size,
+        )
 
-    def _get_metric(
-            self, device: torch.device, dtype: torch.dtype
-    ) -> StructuralSimilarityIndexMeasure:
-        """Get cached metric or create new one if needed."""
-        if (
-                self._ssim_metric is None
-                or self._device != device
-                or self._dtype != dtype
-        ):
-            self._ssim_metric = StructuralSimilarityIndexMeasure(
-                data_range=self.data_range,
-                kernel_size=self.window_size,
-            ).to(device=device, dtype=dtype)
-            self._device = device
-            self._dtype = dtype
-        return self._ssim_metric
-
-    def __call__(
-            self, pred: torch.Tensor, target: torch.Tensor
-    ) -> torch.Tensor:
+    def __call__(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
         Compute SSIM between prediction and target.
 
@@ -120,8 +100,8 @@ class SSIM:
         Returns:
             SSIM value.
         """
-        metric = self._get_metric(pred.device, pred.dtype)
-        return metric(pred, target)
+        self._metric = self._metric.to(pred.device)
+        return self._metric(pred, target)
 
 
 class rFID:
@@ -136,35 +116,21 @@ class rFID:
         reset_real_features: Whether to reset real features after each compute.
     """
 
-    def __init__(
-            self,
-            feature_dim: int = 2048,
-            reset_real_features: bool = True,
-    ):
+    def __init__(self, feature_dim: int = 2048, reset_real_features: bool = True):
+        if not HAS_FID:
+            raise ImportError(
+                "torch-fidelity is required for rFID computation. "
+                "Install with: pip install torch-fidelity"
+            )
         self.feature_dim = feature_dim
         self.reset_real_features = reset_real_features
-        self.fid = None
+        self.fid = FrechetInceptionDistance(
+            feature=feature_dim,
+            reset_real_features=reset_real_features,
+            normalize=True,
+        )
 
-        if HAS_FID:
-            try:
-                self.fid = FrechetInceptionDistance(
-                    feature=feature_dim,
-                    reset_real_features=reset_real_features,
-                    normalize=True,
-                )
-            except ModuleNotFoundError:
-                # torch-fidelity not installed
-                print(
-                    "Warning: torch-fidelity not installed, rFID metric disabled. "
-                    "Install with: pip install torch-fidelity"
-                )
-                self.fid = None
-
-    def update(
-            self,
-            real: torch.Tensor,
-            fake: torch.Tensor,
-    ) -> None:
+    def update(self, real: torch.Tensor, fake: torch.Tensor) -> None:
         """
         Update FID statistics with a batch of real and reconstructed images.
 
@@ -172,18 +138,12 @@ class rFID:
             real: Original images in range [-1, 1].
             fake: Reconstructed images in range [-1, 1].
         """
-        if self.fid is None:
-            return
-
-        # Move FID to correct device if needed
         if next(self.fid.parameters()).device != real.device:
             self.fid = self.fid.to(real.device)
 
-        # Normalize from [-1, 1] to [0, 1] and clamp
         real = torch.clamp((real + 1) / 2, 0, 1)
         fake = torch.clamp((fake + 1) / 2, 0, 1)
 
-        # Update FID metric
         self.fid.update(real, real=True)
         self.fid.update(fake, real=False)
 
@@ -194,105 +154,46 @@ class rFID:
         Returns:
             rFID score (lower is better).
         """
-        if self.fid is None:
-            return torch.tensor(float("nan"))
         return self.fid.compute()
 
     def reset(self) -> None:
         """Reset accumulated statistics."""
-        if self.fid is not None:
-            self.fid.reset()
+        self.fid.reset()
 
 
-class VAEMetrics(nn.Module):
+class LPIPS(nn.Module):
     """
-    Collection of metrics for VAE evaluation.
+    LPIPS perceptual metric/loss wrapper.
 
-    Args:
-        data_range: Range of input data.
-        use_lpips: Whether to compute LPIPS.
-        lpips_net: Network for LPIPS ('alex', 'vgg', 'squeeze').
+    Notes:
+        - Keeps LPIPS network frozen.
+        - Computes in float32 for better numerical stability.
+        - By default expects inputs in [-1, 1] (normalize=False).
+          If your inputs are [0, 1], set normalize=True.
     """
 
-    def __init__(
-            self,
-            data_range: float = 2.0,  # [-1, 1] range
-            use_lpips: bool = True,
-            lpips_net: str = "vgg",
-    ):
+    def __init__(self, net: str = "vgg", normalize: bool = False):
         super().__init__()
-        self.data_range = data_range
+        if not HAS_LPIPS:
+            raise ImportError(
+                "lpips is required for perceptual loss/metric. "
+                "Install with: pip install lpips"
+            )
+        self.normalize = normalize
+        self._metric = lpips.LPIPS(net=net)
+        self._metric.eval()
+        for p in self._metric.parameters():
+            p.requires_grad = False
 
-        # PSNR
-        self.psnr = PSNR(data_range=data_range)
-
-        # SSIM
-        self.ssim = SSIM(data_range=data_range)
-
-        # LPIPS
-        self.use_lpips = use_lpips and HAS_LPIPS
-        if self.use_lpips:
-            self.lpips = lpips.LPIPS(net=lpips_net)
-            self.lpips.eval()
-            for param in self.lpips.parameters():
-                param.requires_grad = False
-
-    def forward(
-            self,
-            pred: torch.Tensor,
-            target: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
-        Compute all metrics.
+        Compute LPIPS between prediction and target.
 
         Args:
-            pred: Predicted image tensor.
-            target: Target image tensor.
+            pred: Predicted image tensor, shape (N, C, H, W).
+            target: Target image tensor, shape (N, C, H, W).
 
         Returns:
-            Dictionary of metric values.
+            LPIPS tensor of shape (N, 1, 1, 1), same as lpips package.
         """
-        metrics = {}
-
-        # PSNR
-        with torch.no_grad():
-            metrics["psnr"] = self.psnr(pred, target)
-
-            # SSIM
-            metrics["ssim"] = self.ssim(pred, target)
-
-            # LPIPS
-            if self.use_lpips:
-                # LPIPS expects values in [-1, 1]
-                if self.data_range != 2.0:
-                    pred_normalized = pred * 2 - 1
-                    target_normalized = target * 2 - 1
-                else:
-                    pred_normalized = pred
-                    target_normalized = target
-                metrics["lpips"] = self.lpips(pred_normalized, target_normalized).mean()
-
-        return metrics
-
-    def compute_reconstruction_metrics(
-            self,
-            pred: torch.Tensor,
-            target: torch.Tensor,
-    ) -> Tuple[float, float, Optional[float]]:
-        """
-        Compute reconstruction metrics and return as Python floats.
-
-        Args:
-            pred: Predicted image tensor.
-            target: Target image tensor.
-
-        Returns:
-            Tuple of (PSNR, SSIM, LPIPS).
-        """
-        metrics = self(pred, target)
-        psnr = metrics["psnr"].item()
-        ssim = metrics["ssim"].item()
-        lpips_val = metrics.get("lpips")
-        if lpips_val is not None:
-            lpips_val = lpips_val.item()
-        return psnr, ssim, lpips_val
+        return self._metric(pred, target, normalize=self.normalize)

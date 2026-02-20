@@ -71,14 +71,13 @@ class VAELoggingCallback(Callback):
 
     def _log_images(
             self,
+            logger: pl.Trainer.logger,
             targets: torch.Tensor,
             reconstructions: torch.Tensor,
             latent: torch.Tensor,
             prefix: str,
             step: int,
     ) -> None:
-        if not self.logger:
-            return
 
         targets = torch.clamp((targets + 1) / 2, 0, 1)
         reconstructions = torch.clamp((reconstructions + 1) / 2, 0, 1)
@@ -89,8 +88,8 @@ class VAELoggingCallback(Callback):
         comparison = torch.cat([targets[:n], latent_vis[:n], reconstructions[:n]], dim=0)
         grid = torchvision.utils.make_grid(comparison, nrow=n, padding=2)
 
-        if hasattr(self.logger, "experiment"):
-            self.logger.experiment.add_image(f"{prefix}/reconstruction", grid, step)
+        if hasattr(logger, "experiment"):
+            logger.experiment.add_image(f"{prefix}/reconstruction", grid, step)
 
     def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         self._train_epoch_metrics = {}
@@ -135,7 +134,7 @@ class VAELoggingCallback(Callback):
                 latent = posterior.mode()
                 reconstructions = pl_module.vae.decode(latent).sample
 
-            self._log_images(targets, reconstructions, latent, "train", trainer.global_step)
+            self._log_images(trainer.logger, targets, reconstructions, latent, "train", trainer.global_step)
 
     def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         for key, values in self._train_epoch_metrics.items():
@@ -190,7 +189,7 @@ class VAELoggingCallback(Callback):
         targets = targets[:n]
         reconstructions = reconstructions[:n]
         latent = latent[:n]
-        self._log_images(targets, reconstructions, latent, "val", trainer.global_step)
+        self._log_images(trainer.logger, targets, reconstructions, latent, "val", trainer.global_step)
 
 
 class VAECheckpointCallback(ModelCheckpoint):

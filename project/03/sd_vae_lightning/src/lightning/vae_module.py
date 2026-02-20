@@ -15,10 +15,9 @@ from pytorch_lightning.utilities.types import STEP_OUTPUT
 from diffusers import AutoencoderKL
 from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_scheduler
-import lpips
 import math
 
-from ..utils.metrics import PSNR, SSIM, rFID
+from ..utils.metrics import PSNR, SSIM, rFID, LPIPS
 from ..models.discriminator import NLayerDiscriminator
 
 
@@ -98,10 +97,7 @@ class VAELightningModule(pl.LightningModule):
         # Perceptual loss
         self.perceptual_weight = loss_config.get("perceptual_weight", 0.5)
         if self.perceptual_weight > 0:
-            self.perceptual_loss = lpips.LPIPS(net="vgg")
-            self.perceptual_loss.eval()
-            for param in self.perceptual_loss.parameters():
-                param.requires_grad = False
+            self.perceptual_loss = LPIPS(net="vgg", normalize=False)
         else:
             self.perceptual_loss = None
 
@@ -157,7 +153,7 @@ class VAELightningModule(pl.LightningModule):
 
         # Validation metrics
         self.psnr_metric = PSNR(data_range=2.0)
-        self.ssim_metric = SSIM(data_range=2.0, channel=3)
+        self.ssim_metric = SSIM(data_range=2.0)
 
         # rFID metric for reconstruction quality evaluation
         self.rfid_metric = rFID(feature_dim=2048, reset_real_features=True)
