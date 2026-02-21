@@ -414,12 +414,13 @@ def reconstruct_images(
     model_dtype = model.encoder.conv_in.weight.dtype
 
     # Lazy load metrics
-    metrics = None
-    all_psnr, all_ssim, all_lpips = [], [], []
-
+    psnr_metric = None
+    ssim_metric = None
+    all_psnr, all_ssim = [], []
     if compute_metrics:
-        from src.utils.metrics import VAEMetrics
-        metrics = VAEMetrics(data_range=2.0, use_lpips=True)
+        from src.utils.metrics import PSNR, SSIM
+        psnr_metric = PSNR(data_range=2.0)
+        ssim_metric = SSIM(data_range=2.0)
 
     num_batches = (len(input_paths) + batch_size - 1) // batch_size
     pbar = tqdm(
@@ -457,36 +458,36 @@ def reconstruct_images(
             output_path = get_output_path(path, output_arg, ".png")
             save_image(recon_cpu[i:i + 1], str(output_path))
 
-            if metrics is not None:
-                psnr, ssim, lpips_val = metrics.compute_reconstruction_metrics(
-                    recon_cpu[i:i + 1], batch_cpu[i:i + 1]
-                )
+            if psnr_metric is not None and ssim_metric is not None:
+                pred = recon_cpu[i:i + 1]
+                target = batch_cpu[i:i + 1]
+
+                psnr_metric._metric.reset()
+                ssim_metric._metric.reset()
+
+                psnr = float(psnr_metric(pred, target).item())
+                ssim = float(ssim_metric(pred, target).item())
+
                 all_psnr.append(psnr)
                 all_ssim.append(ssim)
                 batch_psnr.append(psnr)
-                if lpips_val is not None:
-                    all_lpips.append(lpips_val)
 
                 if not quiet:
-                    lpips_str = f", LPIPS: {lpips_val:.4f}" if lpips_val else ""
                     tqdm.write(
-                        f"  {path.name} -> {output_path.name} | PSNR: {psnr:.2f} dB, SSIM: {ssim:.4f}{lpips_str}")
-            elif not quiet:
-                tqdm.write(f"  {path.name} -> {output_path.name}")
+                        f"  {path.name} -> {output_path.name} | PSNR: {psnr:.2f} dB, SSIM: {ssim:.4f}"
+                    )
 
         # Update progress bar with batch metrics
         if batch_psnr:
             pbar.set_postfix({"avg_psnr": f"{np.mean(batch_psnr):.2f} dB"})
 
     # Print summary metrics
-    if metrics is not None and len(all_psnr) > 0:
+    if psnr_metric is not None and len(all_psnr) > 0:
         print(f"\n{'=' * 50}")
         print(f"Summary ({len(all_psnr)} images)")
         print(f"{'=' * 50}")
         print(f"  PSNR:  {np.mean(all_psnr):.2f} dB (±{np.std(all_psnr):.2f})")
         print(f"  SSIM:  {np.mean(all_ssim):.4f} (±{np.std(all_ssim):.4f})")
-        if all_lpips:
-            print(f"  LPIPS: {np.mean(all_lpips):.4f} (±{np.std(all_lpips):.4f})")
 
 
 def main():
