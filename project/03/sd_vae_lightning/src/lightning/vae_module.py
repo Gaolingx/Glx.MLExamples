@@ -799,7 +799,7 @@ class VAELightningModule(pl.LightningModule):
                 "Please set `max_steps` in `pl.Trainer(...)`, or use finite "
                 "`max_epochs` with a finite-length dataloader."
             )
-        total_steps = max(1, int(math.ceil(estimated)))
+        total_steps = max(1, int(math.ceil(estimated / self.accumulate_grad_batches)))
         # ---- Generator (VAE) ----
         opt_vae = self._build_optimizer(
             list(self.vae.parameters()),
