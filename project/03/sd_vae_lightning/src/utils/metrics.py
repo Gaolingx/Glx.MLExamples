@@ -1,10 +1,9 @@
 """
 Metrics for evaluating VAE reconstruction quality.
-Includes PSNR, SSIM, LPIPS, and rFID computation.
+Includes PSNR, SSIM, PSIM, and rFID computation.
 """
 
 import torch
-import torch.nn as nn
 
 try:
     import lpips
@@ -161,39 +160,40 @@ class rFID:
         self.fid.reset()
 
 
-class LPIPS(nn.Module):
+class PSIM:
     """
-    LPIPS perceptual metric/loss wrapper.
+    Perceptual Similarity Metric (PSIM).
+    Here we use LPIPS distance and convert to similarity: sim = 1 / (1 + d).
+    Higher is better, range (0, 1].
 
-    Notes:
-        - Keeps LPIPS network frozen.
-        - Computes in float32 for better numerical stability.
-        - By default expects inputs in [-1, 1] (normalize=False).
-          If your inputs are [0, 1], set normalize=True.
+    Args:
+        net: base/trunk networks
     """
 
-    def __init__(self, net: str = "vgg", normalize: bool = False):
-        super().__init__()
+    def __init__(self, net: str = "vgg"):
         if not HAS_LPIPS:
             raise ImportError(
-                "lpips is required for perceptual loss/metric. "
+                "lpips is required for PSIM computation. "
                 "Install with: pip install lpips"
             )
-        self.normalize = normalize
-        self._metric = lpips.LPIPS(net=net)
-        self._metric.eval()
-        for p in self._metric.parameters():
+        self.net = net
+        self.metric = lpips.LPIPS(net=net)
+        self.metric.eval()
+        for p in self.metric.parameters():
             p.requires_grad = False
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def __call__(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
-        Compute LPIPS between prediction and target.
-
         Args:
-            pred: Predicted image tensor, shape (N, C, H, W).
-            target: Target image tensor, shape (N, C, H, W).
+            pred: Reconstructed images in [-1, 1], shape [B, C, H, W]
+            target: Ground-truth images in [-1, 1], shape [B, C, H, W]
 
         Returns:
-            LPIPS tensor of shape (N, 1, 1, 1), same as lpips package.
+            PSIM similarity scalar (higher is better)
         """
-        return self._metric(pred, target, normalize=self.normalize)
+        if next(self.metric.parameters()).device != pred.device:
+            self.metric = self.metric.to(pred.device)
+
+        d = self.metric(pred, target).mean()
+        sim = 1.0 / (1.0 + d)
+        return sim

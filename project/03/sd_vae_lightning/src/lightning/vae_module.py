@@ -15,9 +15,10 @@ from pytorch_lightning.utilities.types import STEP_OUTPUT
 from diffusers import AutoencoderKL
 from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_scheduler
+import lpips
 import math
 
-from ..utils.metrics import PSNR, SSIM, rFID, LPIPS
+from ..utils.metrics import PSNR, SSIM, rFID, PSIM
 from ..models.discriminator import NLayerDiscriminator
 
 
@@ -97,7 +98,10 @@ class VAELightningModule(pl.LightningModule):
         # Perceptual loss
         self.perceptual_weight = loss_config.get("perceptual_weight", 0.5)
         if self.perceptual_weight > 0:
-            self.perceptual_loss = LPIPS(net="vgg", normalize=False)
+            self.perceptual_loss = lpips.LPIPS(net="vgg")
+            self.perceptual_loss.eval()
+            for param in self.perceptual_loss.parameters():
+                param.requires_grad = False
         else:
             self.perceptual_loss = None
 
@@ -154,6 +158,7 @@ class VAELightningModule(pl.LightningModule):
         # Validation metrics
         self.psnr_metric = PSNR(data_range=2.0)
         self.ssim_metric = SSIM(data_range=2.0)
+        self.psim_metric = PSIM(net="vgg")
 
         # rFID metric for reconstruction quality evaluation
         self.rfid_metric = rFID(feature_dim=2048, reset_real_features=True)
@@ -637,16 +642,18 @@ class VAELightningModule(pl.LightningModule):
                 targets, reconstructions, posterior, optimizer_idx=0, global_step=self.global_step, training=False
             )
 
-            # Compute PSNR and SSIM
+            # Compute PSNR, SSIM and PSIM
             with torch.no_grad():
                 psnr = self.psnr_metric(reconstructions, targets)
                 ssim = self.ssim_metric(reconstructions, targets)
+                psim = self.psim_metric(reconstructions, targets)
 
                 # Update rFID metric with current batch
                 self.rfid_metric.update(targets, reconstructions)
 
             loss_dict["psnr"] = psnr
             loss_dict["ssim"] = ssim
+            loss_dict["psim"] = psim
 
             val_metrics = {f"val/{key}": value for key, value in loss_dict.items()}
             val_visuals = {
