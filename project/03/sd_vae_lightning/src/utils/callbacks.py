@@ -11,7 +11,7 @@ import os
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback, ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint, EarlyStopping
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 from torch.optim.lr_scheduler import LambdaLR
 import torchvision
@@ -598,3 +598,41 @@ class NaNLossCallback(Callback):
                 f"Stopping training."
             )
             trainer.should_stop = True
+
+
+class OptionalEarlyStopping(EarlyStopping):
+    """
+    EarlyStopping callback that can be enabled or disabled via config
+    while still being instantiated in the callbacks list.
+    If 'early_stopping' is False in the config, this callback does nothing.
+    """
+
+    def __init__(
+            self,
+            enabled: bool = False,
+            monitor: str = "val/rec_loss",
+            patience: int = 10,
+            mode: str = "min",
+            **kwargs: Any,
+    ):
+        self.enabled = enabled
+        super().__init__(
+            monitor=monitor,
+            patience=patience,
+            mode=mode,
+            **kwargs,
+        )
+
+    @classmethod
+    def from_config(cls, checkpoint_config: Dict[str, Any]) -> "OptionalEarlyStopping":
+        return cls(
+            enabled=checkpoint_config.get("early_stopping", False),
+            monitor=checkpoint_config.get("monitor", "val/rec_loss"),
+            patience=checkpoint_config.get("patience", 10),
+            mode=checkpoint_config.get("mode", "min"),
+        )
+
+    def _run_early_stopping_check(self, trainer: pl.Trainer) -> None:
+        if not self.enabled:
+            return
+        super()._run_early_stopping_check(trainer)

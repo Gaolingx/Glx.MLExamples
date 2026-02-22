@@ -28,7 +28,6 @@ sys.path.insert(0, str(project_root))
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
     LearningRateMonitor,
-    EarlyStopping,
     RichProgressBar,
 )
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -41,6 +40,7 @@ from src.utils.callbacks import (
     GradientNormLogger,
     LRandSchedulerOverrideCallback,
     NaNLossCallback,
+    OptionalEarlyStopping,
 )
 
 
@@ -212,19 +212,16 @@ def main():
             disc_opt_config=disc_opt_cfg,
             verbose=True,
         ),
+        # Optional Early Stopping
+        OptionalEarlyStopping(
+            enabled=checkpoint_config.get("early_stopping", False),
+            monitor=checkpoint_config.get("monitor", "val/rec_loss"),
+            patience=checkpoint_config.get("patience", 10),
+            mode=checkpoint_config.get("mode", "min"),
+        ),
         # Progress bar
         RichProgressBar(),
     ]
-
-    # Optional early stopping
-    if checkpoint_config.get("early_stopping", False):
-        callbacks.append(
-            EarlyStopping(
-                monitor=checkpoint_config.get("monitor", "val/rec_loss"),
-                patience=checkpoint_config.get("patience", 10),
-                mode=checkpoint_config.get("mode", "min"),
-            )
-        )
 
     # Create trainer
     # NOTE: accumulate_grad_batches is set to 1 because we handle gradient accumulation
