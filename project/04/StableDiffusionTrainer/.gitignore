@@ -1,0 +1,8 @@
+.DS_Store
+.cache/
+.venv/
+.idea/
+__pycache__/
+checkpoints/
+outputs/
+logs/
