@@ -57,6 +57,7 @@
     "data": {
         "dataset_name": "huggan/flowers-102-categories",
         "image_column": "image",
+        "cache_dir": "./.cache/huggingface",
         "resolution": 512,
         "center_crop": true,
         "random_flip": true
@@ -68,6 +69,7 @@
         "mode": "min"
     },
     "logging": {
+        "name": "vae_training",
         "log_every_n_steps": 5,
         "val_check_interval": 500,
         "log_images_every_n_steps": 100,

@@ -108,6 +108,7 @@ class VAEDataModule(pl.LightningDataModule):
         self.train_config = config.get("training", {})
 
         self.dataset_name = self.data_config.get("dataset_name")
+        self.cache_dir = self.data_config.get("cache_dir")
         self.dataset_config = self.data_config.get("dataset_config")
         self.train_data_dir = self.data_config.get("train_data_dir")
         self.val_data_dir = self.data_config.get("val_data_dir")
@@ -130,6 +131,7 @@ class VAEDataModule(pl.LightningDataModule):
                 self.dataset_name,
                 self.dataset_config,
                 split="train",
+                cache_dir=self.cache_dir,
             )
 
     def setup(self, stage: Optional[str] = None) -> None:
@@ -150,6 +152,7 @@ class VAEDataModule(pl.LightningDataModule):
                     self.dataset_name,
                     self.dataset_config,
                     split="train",
+                    cache_dir=self.cache_dir,
                 )
                 # Check if validation split exists
                 try:
@@ -157,6 +160,7 @@ class VAEDataModule(pl.LightningDataModule):
                         self.dataset_name,
                         self.dataset_config,
                         split="validation",
+                        cache_dir=self.cache_dir,
                     )
                 except ValueError:
                     # Split training data for validation
@@ -180,32 +184,6 @@ class VAEDataModule(pl.LightningDataModule):
                 transform=val_transform,
                 image_column=self.image_column,
             )
-
-        if stage == "validate" or stage is None:
-            if self.val_dataset is None:
-                if self.dataset_name and HAS_DATASETS:
-                    try:
-                        val_data = load_dataset(
-                            self.dataset_name,
-                            self.dataset_config,
-                            split="validation",
-                        )
-                    except ValueError:
-                        val_data = load_dataset(
-                            self.dataset_name,
-                            self.dataset_config,
-                            split="train[:10%]",
-                        )
-                else:
-                    val_data = self._load_local_images(
-                        self.val_data_dir or self.train_data_dir
-                    )
-
-                self.val_dataset = VAEDataset(
-                    data=val_data,
-                    transform=val_transform,
-                    image_column=self.image_column,
-                )
 
     def _build_transform(self, augment: bool = False) -> transforms.Compose:
         """

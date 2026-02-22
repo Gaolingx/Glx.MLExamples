@@ -19,12 +19,12 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
     LearningRateMonitor,
@@ -107,6 +107,23 @@ def merge_configs(train_config: dict, model_config: dict) -> dict:
     return config
 
 
+def find_resume_checkpoint(checkpoint_cfg: Dict[str, Any]) -> Optional[str]:
+    ckpt_dir = Path(checkpoint_cfg.get("dirpath", "outputs/checkpoints"))
+    if not ckpt_dir.exists():
+        return None
+
+    last_ckpt = ckpt_dir / "last.ckpt"
+    if last_ckpt.exists():
+        print(f"Resuming from latest checkpoint: {last_ckpt}")
+        return str(last_ckpt)
+
+    candidates = sorted(ckpt_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if len(candidates) == 0:
+        return None
+
+    return str(candidates[0])
+
+
 def main():
     """Main training function."""
     args = parse_args()
@@ -148,13 +165,6 @@ def main():
     # Create model
     model = VAELightningModule(config)
 
-    # Setup logger
-    logger = TensorBoardLogger(
-        save_dir=log_dir,
-        name="vae_training",
-        default_hp_metric=False,
-    )
-
     # Setup callbacks
     train_config_section = config.get("training", {})
     checkpoint_config = config.get("checkpoint", {})
@@ -162,6 +172,13 @@ def main():
 
     gen_opt_cfg = train_config_section.get("generator_optimizer", {})
     disc_opt_cfg = train_config_section.get("discriminator_optimizer", {})
+
+    # Setup logger
+    logger = TensorBoardLogger(
+        save_dir=log_dir,
+        name=logging_config.get("name", "vae_training"),
+        default_hp_metric=False,
+    )
 
     callbacks = [
         # NaN/Inf loss guard
@@ -209,29 +226,19 @@ def main():
             )
         )
 
-    # Determine accelerator and devices
-    if torch.cuda.is_available():
-        accelerator = "gpu"
-        devices = args.gpus if args.gpus else "auto"
-    elif torch.backends.mps.is_available():
-        accelerator = "mps"
-        devices = 1
-    else:
-        accelerator = "cpu"
-        devices = "auto"
-
     # Create trainer
     # NOTE: accumulate_grad_batches is set to 1 because we handle gradient accumulation
     # manually in VAELightningModule.training_step() for proper alternating training
     # between VAE and Discriminator (following official diffusers implementation)
     trainer = pl.Trainer(
-        accelerator=accelerator,
-        devices=devices,
+        default_root_dir=str(output_dir),
+        accelerator="auto",
+        devices="auto",
+        strategy="auto",
         max_epochs=train_config_section.get("num_epochs", 100),
         max_steps=train_config_section.get("max_train_steps", -1),
         precision=train_config_section.get("precision", "16-mixed"),
         accumulate_grad_batches=1,  # Manual accumulation in training_step
-        # gradient_clip_val handled manually in training_step
         log_every_n_steps=logging_config.get("log_every_n_steps", 50),
         val_check_interval=logging_config.get("val_check_interval", 500),
         logger=logger,
@@ -240,17 +247,9 @@ def main():
         deterministic=True,
     )
 
-    # Handle checkpoint resuming
-    ckpt_path = args.resume_from_checkpoint
-    if ckpt_path == "latest":
-        # Find latest checkpoint
-        ckpt_files = list(Path(checkpoint_dir).glob("*.ckpt"))
-        if ckpt_files:
-            ckpt_path = str(max(ckpt_files, key=os.path.getctime))
-            print(f"Resuming from latest checkpoint: {ckpt_path}")
-        else:
-            ckpt_path = None
-            print("No checkpoints found, starting from scratch")
+    ckpt_path = None
+    if args.resume_from_checkpoint:
+        ckpt_path = find_resume_checkpoint(checkpoint_dir)
 
     # Train
     print("=" * 60)
