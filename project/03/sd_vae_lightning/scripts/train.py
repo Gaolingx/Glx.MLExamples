@@ -100,15 +100,11 @@ def merge_configs(train_config: dict, model_config: dict) -> dict:
     config = {}
     config.update(train_config)
     config["model"] = model_config.get("model", {})
-    if "pretrained_model_name_or_path" in model_config:
-        config["model"]["pretrained_model_name_or_path"] = model_config[
-            "pretrained_model_name_or_path"
-        ]
     return config
 
 
-def find_resume_checkpoint(checkpoint_cfg: Dict[str, Any]) -> Optional[str]:
-    ckpt_dir = Path(checkpoint_cfg.get("dirpath", "outputs/checkpoints"))
+def find_resume_checkpoint(checkpoint_path: str) -> Optional[str]:
+    ckpt_dir = Path(checkpoint_path)
     if not ckpt_dir.exists():
         return None
 
@@ -228,7 +224,7 @@ def main():
     # manually in VAELightningModule.training_step() for proper alternating training
     # between VAE and Discriminator (following official diffusers implementation)
     trainer = pl.Trainer(
-        default_root_dir=str(output_dir),
+        default_root_dir=output_dir,
         accelerator="auto",
         devices="auto",
         strategy="auto",
