@@ -1,5 +1,5 @@
 """Data loading and preprocessing utilities."""
 
-from .dataset import VAEDataModule, VAEDataset
+from .dataset import VAEDataset, VAEDataModule
 
-__all__ = ["VAEDataModule", "VAEDataset"]
+__all__ = ["VAEDataset", "VAEDataModule"]

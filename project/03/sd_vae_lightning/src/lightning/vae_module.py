@@ -56,12 +56,6 @@ class VAELightningModule(pl.LightningModule):
         model_config_name_or_path = model_config.get("model_config_name_or_path")
         inline_vae_config = model_config.get("vae_config")
 
-        if pretrained_path and (model_config_name_or_path is not None or inline_vae_config is not None):
-            raise ValueError(
-                "Cannot set both `pretrained_model_name_or_path` and "
-                "`model_config_name_or_path`/`vae_config`."
-            )
-
         if pretrained_path:
             self.vae = AutoencoderKL.from_pretrained(pretrained_path)
         elif model_config_name_or_path is not None:

@@ -1,4 +1,4 @@
-"""Model components for Discriminator."""
+"""Model components for VAE training."""
 
 from .discriminator import NLayerDiscriminator
 
