@@ -539,17 +539,17 @@ class VAELightningModule(pl.LightningModule):
                     vae_scheduler = schedulers
                 vae_scheduler.step()
 
-                train_metrics["train/grad_norm_vae"] = grad_norm
+                train_metrics["grad_norm_vae"] = grad_norm
 
             for key, value in vae_loss_dict.items():
-                train_metrics[f"train/{key}"] = value
+                train_metrics[key] = value
             # Learning rate metric
             schedulers = self.lr_schedulers()
             if isinstance(schedulers, list):
                 vae_lr = schedulers[0].get_last_lr()[0]
             else:
                 vae_lr = schedulers.get_last_lr()[0]
-            train_metrics["train/lr"] = torch.tensor(vae_lr, device=targets.device)
+            train_metrics["lr"] = torch.tensor(vae_lr, device=targets.device)
 
             # Cache g_loss for G/D ratio computation in discriminator step
             self._cached_g_loss = vae_loss_dict.get("g_loss", torch.tensor(0.0, device=targets.device))
@@ -586,7 +586,7 @@ class VAELightningModule(pl.LightningModule):
                     if isinstance(schedulers, list) and len(schedulers) > 1:
                         disc_scheduler = schedulers[1]
                         disc_scheduler.step()
-                    train_metrics["train/grad_norm_disc"] = grad_norm
+                    train_metrics["grad_norm_disc"] = grad_norm
 
                 if self._cached_g_loss is not None:
                     g_loss = self._cached_g_loss
@@ -595,11 +595,11 @@ class VAELightningModule(pl.LightningModule):
                     disc_loss_dict["gd_loss_ratio"] = gd_ratio
 
                 for key, value in disc_loss_dict.items():
-                    train_metrics[f"train/{key}"] = value
+                    train_metrics[key] = value
                 schedulers = self.lr_schedulers()
                 if isinstance(schedulers, list) and len(schedulers) > 1:
                     disc_lr = schedulers[1].get_last_lr()[0]
-                    train_metrics["train/disc_lr"] = torch.tensor(disc_lr, device=targets.device)
+                    train_metrics["disc_lr"] = torch.tensor(disc_lr, device=targets.device)
                 result = disc_loss
             else:
                 result = None
@@ -649,7 +649,7 @@ class VAELightningModule(pl.LightningModule):
             loss_dict["ssim"] = ssim
             loss_dict["psim"] = psim
 
-            val_metrics = {f"val/{key}": value for key, value in loss_dict.items()}
+            val_metrics = {key: value for key, value in loss_dict.items()}
             val_visuals = {
                 "targets": targets.detach().cpu(),
                 "reconstructions": reconstructions.detach().cpu(),

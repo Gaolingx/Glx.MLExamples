@@ -115,7 +115,7 @@ class VAELoggingCallback(Callback):
             else:
                 metric_value = torch.tensor(float(value), device=pl_module.device)
 
-            pl_module.log(key, metric_value, on_step=True, on_epoch=False, prog_bar=key.startswith("train/"))
+            pl_module.log(f"train/{key}", metric_value, on_step=True, on_epoch=False, prog_bar=True)
 
             if key not in self._train_epoch_metrics:
                 self._train_epoch_metrics[key] = []
@@ -166,7 +166,7 @@ class VAELoggingCallback(Callback):
                     metric_value = value.detach()
                 else:
                     metric_value = torch.tensor(float(value), device=pl_module.device)
-                pl_module.log(key, metric_value, on_step=False, on_epoch=True, prog_bar=True)
+                pl_module.log(f"val/{key}", metric_value, on_step=False, on_epoch=True, prog_bar=True)
 
         visuals = outputs.get("val_visuals")
         if isinstance(visuals, dict) and len(self._val_outputs) < self.num_val_images:
