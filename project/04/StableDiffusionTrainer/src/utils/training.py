@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -93,38 +94,11 @@ class LRandSchedulerOverrideCallback(Callback):
 
 
 class CheckpointCallback(ModelCheckpoint):
-    """ModelCheckpoint with Lightning ckpt + HuggingFace-style UNet export."""
+    """ModelCheckpoint with optional HF export delegated to LightningModule."""
 
     def __init__(self, *args: Any, save_hf_format: bool = True, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.save_hf_format = save_hf_format
-
-    @staticmethod
-    def _extract_training_config(pl_module: pl.LightningModule) -> Dict[str, Any]:
-        if hasattr(pl_module, "cfg") and isinstance(pl_module.cfg, dict):
-            return pl_module.cfg
-        if hasattr(pl_module, "config") and isinstance(pl_module.config, dict):
-            return pl_module.config
-        return {}
-
-    @staticmethod
-    def _save_ema_unet(pl_module: pl.LightningModule, hf_dir: Path) -> None:
-        use_ema = bool(getattr(pl_module, "use_ema", False))
-        if not use_ema:
-            return
-
-        ema_obj = getattr(pl_module, "ema", None)
-        ema_unet = getattr(pl_module, "ema_unet", None)
-        ema_save_dir = hf_dir / "unet_ema"
-
-        # Compatibility branch: either an EMA wrapper exposing save_pretrained,
-        # or a standalone ema_unet module.
-        if ema_obj is not None and hasattr(ema_obj, "save_pretrained"):
-            ema_obj.save_pretrained(str(ema_save_dir))
-            return
-
-        if ema_unet is not None and hasattr(ema_unet, "save_pretrained"):
-            ema_unet.save_pretrained(str(ema_save_dir))
 
     def _save_checkpoint(self, trainer: Trainer, filepath: str) -> None:
         super()._save_checkpoint(trainer, filepath)
@@ -133,20 +107,8 @@ class CheckpointCallback(ModelCheckpoint):
             return
 
         pl_module = trainer.lightning_module
-
-        # Keep HF export colocated with each ckpt stem:
-        # xxx-epoch=00-step=xxxxxx-val/hf_checkpoint
-        checkpoint_dir = Path(filepath).with_suffix("")
-        hf_dir = checkpoint_dir / "hf_checkpoint"
-        hf_dir.mkdir(parents=True, exist_ok=True)
-
-        unet_save_dir = hf_dir / "unet"
-        pl_module.unet.save_pretrained(str(unet_save_dir))
-        self._save_ema_unet(pl_module, hf_dir)
-
-        config_path = hf_dir / "training_config.json"
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(self._extract_training_config(pl_module), f, indent=2, ensure_ascii=False)
+        if hasattr(pl_module, "save_hf_checkpoint"):
+            pl_module.save_hf_checkpoint(filepath)
 
 
 class GradParamNormCallback(Callback):
@@ -188,9 +150,6 @@ class GradParamNormCallback(Callback):
         grad_norm = self._compute_global_norm(pl_module, use_grad=True)
         param_norm = self._compute_global_norm(pl_module, use_grad=False)
 
-        pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-        pl_module.log("train/param_norm", param_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-
         runtime_metrics = getattr(pl_module, "runtime_log_dict", None)
         if isinstance(runtime_metrics, dict):
             runtime_metrics["train/grad_norm"] = float(grad_norm.detach().cpu())
@@ -217,33 +176,132 @@ class LoggingCallback(Callback):
             return
 
         runtime_metrics = getattr(pl_module, "runtime_log_dict", {})
-        loss = runtime_metrics.get("train/loss")
-        lr = runtime_metrics.get("train/lr")
-        grad_norm = runtime_metrics.get("train/grad_norm")
-        param_norm = runtime_metrics.get("train/param_norm")
+        metrics_to_log: Dict[str, Any] = {}
 
-        # Backward-compatible fallback: keep prior behavior if runtime dict is unavailable.
-        if loss is None or lr is None:
-            metrics = trainer.callback_metrics
-            loss = metrics.get("train/loss_step") or metrics.get("train/loss")
-            lr = metrics.get("train/lr")
-            grad_norm = metrics.get("train/grad_norm")
-            param_norm = metrics.get("train/param_norm")
+        if isinstance(runtime_metrics, dict) and len(runtime_metrics) > 0:
+            metrics_to_log.update(runtime_metrics)
+        else:
+            callback_metrics = trainer.callback_metrics
+            for key, value in callback_metrics.items():
+                if key.startswith("train/"):
+                    metrics_to_log[key] = value
 
-        if trainer.is_global_zero:
-            loss_val = float(loss.detach().cpu()) if torch.is_tensor(loss) else float(loss) if loss is not None else float("nan")
-            lr_val = float(lr.detach().cpu()) if torch.is_tensor(lr) else float(lr) if lr is not None else float("nan")
-            grad_norm_val = (
-                float(grad_norm.detach().cpu()) if torch.is_tensor(grad_norm) else float(grad_norm) if grad_norm is not None else float("nan")
-            )
-            param_norm_val = (
-                float(param_norm.detach().cpu()) if torch.is_tensor(param_norm) else float(param_norm) if param_norm is not None else float("nan")
-            )
-            print(
-                "[LoggingCallback] "
-                f"step={step} train/loss={loss_val:.6f} train/lr={lr_val:.8f} "
-                f"train/grad_norm={grad_norm_val:.6f} train/param_norm={param_norm_val:.6f}"
-            )
+        for key, value in metrics_to_log.items():
+            if value is None:
+                continue
+            if torch.is_tensor(value):
+                metric_value = value.detach()
+            else:
+                metric_value = float(value)
+            pl_module.log(key, metric_value, on_step=True, on_epoch=False, prog_bar=True)
+
+
+class TrainHealthMetricsCallback(Callback):
+    """Log timing/throughput and latent/noise/timestep distribution sanity metrics."""
+
+    def __init__(self, log_every_n_steps: int = 10) -> None:
+        super().__init__()
+        self.log_every_n_steps = max(1, int(log_every_n_steps))
+        self._batch_start_time: Optional[float] = None
+
+    @staticmethod
+    def _infer_batch_size(batch: Any) -> int:
+        if torch.is_tensor(batch):
+            return int(batch.shape[0]) if batch.ndim > 0 else 1
+
+        if isinstance(batch, dict):
+            for value in batch.values():
+                if torch.is_tensor(value):
+                    return int(value.shape[0]) if value.ndim > 0 else 1
+
+        if isinstance(batch, (list, tuple)) and len(batch) > 0:
+            first = batch[0]
+            if torch.is_tensor(first):
+                return int(first.shape[0]) if first.ndim > 0 else 1
+
+        return 1
+
+    @staticmethod
+    def _to_device(value: torch.Tensor, device: torch.device) -> torch.Tensor:
+        if value.device == device:
+            return value
+        return value.to(device)
+
+    def on_train_batch_start(
+        self,
+        trainer: Trainer,
+        pl_module: pl.LightningModule,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        self._batch_start_time = time.perf_counter()
+
+    @torch.no_grad()
+    def on_train_batch_end(
+        self,
+        trainer: Trainer,
+        pl_module: pl.LightningModule,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        step = int(trainer.global_step)
+        if step == 0 or step % self.log_every_n_steps != 0:
+            return
+
+        runtime_metrics = getattr(pl_module, "runtime_log_dict", None)
+
+        # Throughput/system-level metrics.
+        if self._batch_start_time is not None:
+            step_time_ms = (time.perf_counter() - self._batch_start_time) * 1000.0
+            batch_size = max(1, self._infer_batch_size(batch))
+            samples_per_sec = (batch_size * 1000.0) / max(step_time_ms, 1e-6)
+
+            if isinstance(runtime_metrics, dict):
+                runtime_metrics["train/step_time_ms"] = float(step_time_ms)
+                runtime_metrics["train/samples_per_sec"] = float(samples_per_sec)
+
+        # Sanity metrics for diffusion training internals.
+        if not isinstance(batch, dict) or "pixel_values" not in batch:
+            return
+
+        if not hasattr(pl_module, "vae") or not hasattr(pl_module, "noise_scheduler"):
+            return
+
+        pixel_values = batch["pixel_values"]
+        if not torch.is_tensor(pixel_values):
+            return
+
+        if pixel_values.ndim == 3:
+            pixel_values = pixel_values.unsqueeze(0)
+        elif pixel_values.ndim != 4:
+            return
+
+        pixel_values = self._to_device(pixel_values, pl_module.device)
+
+        latents = pl_module.vae.encode(pixel_values).latent_dist.sample()
+        latents = latents * pl_module.vae.config.scaling_factor
+
+        noise = torch.randn_like(latents)
+        bsz = latents.shape[0]
+        timesteps = torch.randint(
+            0,
+            pl_module.noise_scheduler.config.num_train_timesteps,
+            (bsz,),
+            device=latents.device,
+            dtype=torch.long,
+        )
+
+        timestep_mean = timesteps.float().mean()
+        timestep_std = timesteps.float().std(unbiased=False)
+        latent_std = latents.float().std(unbiased=False)
+        noise_std = noise.float().std(unbiased=False)
+
+        if isinstance(runtime_metrics, dict):
+            runtime_metrics["train/timestep_mean"] = float(timestep_mean.detach().cpu())
+            runtime_metrics["train/timestep_std"] = float(timestep_std.detach().cpu())
+            runtime_metrics["train/latent_std"] = float(latent_std.detach().cpu())
+            runtime_metrics["train/noise_std"] = float(noise_std.detach().cpu())
 
 
 def build_tensorboard_logger(logging_cfg: Dict[str, Any]) -> TensorBoardLogger:
@@ -275,6 +333,7 @@ def build_callbacks(cfg: Dict[str, Any]) -> list:
         NaNLossCallback(),
         LRandSchedulerOverrideCallback(cfg),
         GradParamNormCallback(log_every_n_steps=int(logging_cfg.get("norm_log_every_n_steps", 1))),
+        TrainHealthMetricsCallback(log_every_n_steps=int(logging_cfg.get("health_log_every_n_steps", 10))),
         LoggingCallback(log_every_n_steps=int(logging_cfg.get("log_every_n_steps", 10))),
     ]
 

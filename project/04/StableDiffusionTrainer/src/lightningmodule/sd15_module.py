@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from typing import Any, Dict, List
 
 import pytorch_lightning as pl
@@ -131,13 +132,12 @@ class StableDiffusionLightningModule(pl.LightningModule):
             return float(value.float().mean().cpu())
         return float(value)
 
-    def _log_metric(self, name: str, value: Any, **kwargs: Any) -> None:
-        self.log(name, value, **kwargs)
+    def _log_metric(self, name: str, value: Any) -> None:
         self.runtime_log_dict[name] = self._to_float_for_runtime_log(value)
 
     def _log_train_metrics(self, loss: torch.Tensor, lr: float) -> None:
-        self._log_metric("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self._log_metric("train/lr", lr, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        self._log_metric("train/loss", loss)
+        self._log_metric("train/lr", lr)
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         if self.automatic_optimization:
@@ -214,6 +214,49 @@ class StableDiffusionLightningModule(pl.LightningModule):
                 writer.add_image(f"validation/sample_{idx}", image_tensor, global_step)
 
         del pipeline
+
+    def save_pretrained(self, save_directory: str) -> None:
+        """Export current training state to a Diffusers-compatible checkpoint folder."""
+        save_dir = Path(save_directory)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        pipeline = StableDiffusionPipeline(
+            vae=self.vae,
+            text_encoder=self.text_encoder,
+            tokenizer=self.tokenizer,
+            unet=self.unet,
+            scheduler=DPMSolverMultistepScheduler.from_config(self.noise_scheduler.config),
+            safety_checker=None,
+            feature_extractor=None,
+            requires_safety_checker=False,
+        )
+        pipeline.save_pretrained(str(save_dir), safe_serialization=True)
+
+        with open(save_dir / "training_config.json", "w", encoding="utf-8") as f:
+            json.dump(self.cfg, f, ensure_ascii=False, indent=2)
+
+    def save_hf_checkpoint(self, checkpoint_filepath: str) -> None:
+        """Export UNet-style HF checkpoint colocated with a Lightning .ckpt filepath."""
+        checkpoint_dir = Path(checkpoint_filepath).with_suffix("")
+        hf_dir = checkpoint_dir / "hf_checkpoint"
+        hf_dir.mkdir(parents=True, exist_ok=True)
+
+        unet_save_dir = hf_dir / "unet"
+        self.unet.save_pretrained(str(unet_save_dir))
+
+        use_ema = bool(getattr(self, "use_ema", False))
+        if use_ema:
+            ema_obj = getattr(self, "ema", None)
+            ema_unet = getattr(self, "ema_unet", None)
+            ema_save_dir = hf_dir / "unet_ema"
+
+            if ema_obj is not None and hasattr(ema_obj, "save_pretrained"):
+                ema_obj.save_pretrained(str(ema_save_dir))
+            elif ema_unet is not None and hasattr(ema_unet, "save_pretrained"):
+                ema_unet.save_pretrained(str(ema_save_dir))
+
+        with open(hf_dir / "training_config.json", "w", encoding="utf-8") as f:
+            json.dump(self.cfg, f, indent=2, ensure_ascii=False)
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
