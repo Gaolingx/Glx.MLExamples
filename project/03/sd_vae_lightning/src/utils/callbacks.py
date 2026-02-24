@@ -238,23 +238,8 @@ class VAECheckpointCallback(ModelCheckpoint):
 
         if self.save_hf_format and trainer.is_global_zero:
             # Save HuggingFace format
-            hf_dir = Path(filepath).parent / "hf_checkpoint"
-            hf_dir.mkdir(parents=True, exist_ok=True)
-
-            pl_module = trainer.lightning_module
-            vae_save_dir = hf_dir / "vae"
-            pl_module.vae.save_pretrained(str(vae_save_dir))
-
-            if getattr(pl_module, "use_ema", False) and getattr(pl_module, "ema", None) is not None:
-                ema_save_dir = hf_dir / "vae_ema"
-                print(f"Saving EMA weights to {ema_save_dir}...")
-
-                pl_module.ema.save_pretrained(str(ema_save_dir))
-
-            # Save training config
-            config_path = hf_dir / "training_config.json"
-            with open(config_path, "w") as f:
-                json.dump(trainer.lightning_module.config, f, indent=2)
+            hf_dir = os.path.join(filepath, "hf_checkpoint")
+            trainer.lightning_module.save_pretrained(hf_dir)
 
 
 class GradientNormLogger(Callback):

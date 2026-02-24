@@ -867,8 +867,14 @@ class VAELightningModule(pl.LightningModule):
         if self.use_ema and self.ema is not None:
             ema_dir = save_path / "vae_ema"
             self.ema.save_pretrained(str(ema_dir))
+            print(f"Saving EMA weights to {ema_dir}...")
 
         # Save discriminator if exists
         if self.discriminator is not None:
             disc_path = save_path / "discriminator.pt"
             torch.save(self.discriminator.state_dict(), disc_path)
+        
+        # Save training config
+        config_path = save_path / "training_config.json"
+        with open(config_path, "w") as f:
+            json.dump(self.config, f, indent=2)
