@@ -61,7 +61,9 @@ class StableDiffusionLightningModule(pl.LightningModule):
             try:
                 self.unet.enable_xformers_memory_efficient_attention()
             except Exception as exc:
-                raise RuntimeError("xFormers attention was enabled but not available.") from exc
+                print(
+                    f"[warning] xFormers attention requested but unavailable; falling back to standard attention. ({exc})"
+                )
 
     def on_fit_start(self) -> None:
         # Keep frozen modules in eval mode during training.
@@ -76,8 +78,17 @@ class StableDiffusionLightningModule(pl.LightningModule):
         pixel_values = batch["pixel_values"]
         input_ids = batch["input_ids"]
 
+        # VAE expects [B, C, H, W]. If an upstream batch of size 1 was flattened
+        # to [C, H, W], recover the missing batch dimension.
+        if pixel_values.ndim == 3:
+            pixel_values = pixel_values.unsqueeze(0)
+        elif pixel_values.ndim != 4:
+            raise ValueError(f"Expected pixel_values to be 4D [B, C, H, W], got shape {tuple(pixel_values.shape)}")
+
         if input_ids.ndim == 3:
             input_ids = input_ids.squeeze(1)
+        elif input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
 
         latents = self.vae.encode(pixel_values).latent_dist.sample()
         latents = latents * self.vae.config.scaling_factor

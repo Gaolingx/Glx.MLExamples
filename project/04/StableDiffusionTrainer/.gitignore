@@ -3,6 +3,4 @@
 .venv/
 .idea/
 __pycache__/
-checkpoints/
 outputs/
-logs/

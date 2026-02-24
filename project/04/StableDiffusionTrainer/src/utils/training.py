@@ -149,6 +149,54 @@ class CheckpointCallback(ModelCheckpoint):
             json.dump(self._extract_training_config(pl_module), f, indent=2, ensure_ascii=False)
 
 
+class GradParamNormCallback(Callback):
+    """Log global parameter/gradient L2 norms as training metrics."""
+
+    def __init__(self, log_every_n_steps: int = 1) -> None:
+        super().__init__()
+        self.log_every_n_steps = max(1, int(log_every_n_steps))
+
+    @staticmethod
+    def _compute_global_norm(pl_module: pl.LightningModule, *, use_grad: bool) -> torch.Tensor:
+        reference = None
+        total = None
+
+        for param in pl_module.parameters():
+            if not param.requires_grad:
+                continue
+
+            tensor = param.grad if use_grad else param.detach()
+            if tensor is None:
+                continue
+
+            reference = tensor
+            part = tensor.detach().float().pow(2).sum()
+            total = part if total is None else total + part
+
+        if total is None:
+            if reference is not None:
+                return torch.tensor(0.0, device=reference.device)
+            return torch.tensor(0.0, device=pl_module.device)
+
+        return total.sqrt()
+
+    def on_after_backward(self, trainer: Trainer, pl_module: pl.LightningModule) -> None:
+        step = int(trainer.global_step)
+        if step == 0 or step % self.log_every_n_steps != 0:
+            return
+
+        grad_norm = self._compute_global_norm(pl_module, use_grad=True)
+        param_norm = self._compute_global_norm(pl_module, use_grad=False)
+
+        pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        pl_module.log("train/param_norm", param_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+
+        runtime_metrics = getattr(pl_module, "runtime_log_dict", None)
+        if isinstance(runtime_metrics, dict):
+            runtime_metrics["train/grad_norm"] = float(grad_norm.detach().cpu())
+            runtime_metrics["train/param_norm"] = float(param_norm.detach().cpu())
+
+
 class LoggingCallback(Callback):
     """Lightweight stdout logging callback for training progress."""
 
@@ -171,17 +219,31 @@ class LoggingCallback(Callback):
         runtime_metrics = getattr(pl_module, "runtime_log_dict", {})
         loss = runtime_metrics.get("train/loss")
         lr = runtime_metrics.get("train/lr")
+        grad_norm = runtime_metrics.get("train/grad_norm")
+        param_norm = runtime_metrics.get("train/param_norm")
 
         # Backward-compatible fallback: keep prior behavior if runtime dict is unavailable.
         if loss is None or lr is None:
             metrics = trainer.callback_metrics
             loss = metrics.get("train/loss_step") or metrics.get("train/loss")
             lr = metrics.get("train/lr")
+            grad_norm = metrics.get("train/grad_norm")
+            param_norm = metrics.get("train/param_norm")
 
         if trainer.is_global_zero:
             loss_val = float(loss.detach().cpu()) if torch.is_tensor(loss) else float(loss) if loss is not None else float("nan")
             lr_val = float(lr.detach().cpu()) if torch.is_tensor(lr) else float(lr) if lr is not None else float("nan")
-            print(f"[LoggingCallback] step={step} train/loss={loss_val:.6f} train/lr={lr_val:.8f}")
+            grad_norm_val = (
+                float(grad_norm.detach().cpu()) if torch.is_tensor(grad_norm) else float(grad_norm) if grad_norm is not None else float("nan")
+            )
+            param_norm_val = (
+                float(param_norm.detach().cpu()) if torch.is_tensor(param_norm) else float(param_norm) if param_norm is not None else float("nan")
+            )
+            print(
+                "[LoggingCallback] "
+                f"step={step} train/loss={loss_val:.6f} train/lr={lr_val:.8f} "
+                f"train/grad_norm={grad_norm_val:.6f} train/param_norm={param_norm_val:.6f}"
+            )
 
 
 def build_tensorboard_logger(logging_cfg: Dict[str, Any]) -> TensorBoardLogger:
@@ -212,6 +274,7 @@ def build_callbacks(cfg: Dict[str, Any]) -> list:
         LearningRateMonitor(logging_interval="step"),
         NaNLossCallback(),
         LRandSchedulerOverrideCallback(cfg),
+        GradParamNormCallback(log_every_n_steps=int(logging_cfg.get("norm_log_every_n_steps", 1))),
         LoggingCallback(log_every_n_steps=int(logging_cfg.get("log_every_n_steps", 10))),
     ]
 

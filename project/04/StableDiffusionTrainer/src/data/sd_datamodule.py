@@ -97,7 +97,8 @@ class StableDiffusionDataModule(pl.LightningDataModule):
 
             max_train_samples = self.dataset_cfg.get("max_train_samples")
             if max_train_samples is not None:
-                dataset = dataset.shuffle(seed=self.seed).select(range(int(max_train_samples)))
+                max_train_samples = min(int(max_train_samples), len(dataset))
+                dataset = dataset.shuffle(seed=self.seed).select(range(max_train_samples))
 
             self.dataset = dataset.with_transform(self._transform_examples)
 
