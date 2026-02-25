@@ -248,7 +248,7 @@ class GradientNormLogger(Callback):
     Useful for debugging training instabilities.
     """
 
-    def __init__(self, log_every_n_steps: int = 1) -> None:
+    def __init__(self, log_every_n_steps: int = 50) -> None:
         super().__init__()
         self.log_every_n_steps = max(1, int(log_every_n_steps))
 
@@ -287,10 +287,11 @@ class GradientNormLogger(Callback):
         pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
         pl_module.log("train/param_norm", param_norm, on_step=True, on_epoch=False, prog_bar=False)
 
-    def on_before_optimizer_step(self,
-                                 trainer: pl.Trainer,
-                                 pl_module: pl.LightningModule,
-                                 optimizer: torch.optim.Optimizer) -> None:
+    def on_before_optimizer_step(
+            self,
+            trainer: pl.Trainer,
+            pl_module: pl.LightningModule,
+            optimizer: torch.optim.Optimizer) -> None:
         step = int(trainer.global_step)
         if step == 0 or step % self.log_every_n_steps != 0:
             return

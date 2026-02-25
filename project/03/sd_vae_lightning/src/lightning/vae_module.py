@@ -74,7 +74,7 @@ class VAELightningModule(pl.LightningModule):
             self.vae.enable_gradient_checkpointing()
 
         # Build discriminator
-        self.use_discriminator = loss_config.get("disc_weight", 0) > 0
+        self.use_discriminator = loss_config.get("disc_weight", 1.0) > 0
 
         if self.use_discriminator:
             self.discriminator = NLayerDiscriminator(
