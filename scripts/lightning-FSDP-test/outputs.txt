@@ -1,0 +1,61 @@
+Initializing distributed: GLOBAL_RANK: 0, MEMBER: 1/1
+----------------------------------------------------------------------------------------------------
+distributed_backend=nccl
+All distributed processes registered. Starting with 1 processes
+----------------------------------------------------------------------------------------------------
+
+You are using a CUDA device ('NVIDIA A100-SXM4-40GB') that has Tensor Cores. To properly utilize them, you should set `torch.set_float32_matmul_precision('medium' | 'high')` which will trade-off precision for performance. For more details, read https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html#torch.set_float32_matmul_precision
+[rank: 0] Seed set to 42
+expected bf16 memory usage from params: 2.03 GB
+current memory usage with model on device 2.17 GB
+torch.bfloat16
+torch.bfloat16
+torch.bfloat16
+10.475000381469727
+|===========================================================================|
+|                  PyTorch CUDA memory summary, device ID 0                 |
+|---------------------------------------------------------------------------|
+|            CUDA OOMs: 0            |        cudaMalloc retries: 0         |
+|===========================================================================|
+|        Metric         | Cur Usage  | Peak Usage | Tot Alloc  | Tot Freed  |
+|---------------------------------------------------------------------------|
+| Allocated memory      |   7738 MiB |   9662 MiB |  14679 MiB |   6941 MiB |
+|       from large pool |   7734 MiB |   9656 MiB |  13868 MiB |   6134 MiB |
+|       from small pool |      4 MiB |     99 MiB |    811 MiB |    807 MiB |
+|---------------------------------------------------------------------------|
+| Active memory         |   7738 MiB |   9662 MiB |  14679 MiB |   6941 MiB |
+|       from large pool |   7734 MiB |   9656 MiB |  13868 MiB |   6134 MiB |
+|       from small pool |      4 MiB |     99 MiB |    811 MiB |    807 MiB |
+|---------------------------------------------------------------------------|
+| Requested memory      |   7736 MiB |   9660 MiB |  14599 MiB |   6863 MiB |
+|       from large pool |   7732 MiB |   9654 MiB |  13788 MiB |   6055 MiB |
+|       from small pool |      4 MiB |     99 MiB |    811 MiB |    807 MiB |
+|---------------------------------------------------------------------------|
+| GPU reserved memory   |  10042 MiB |  10042 MiB |  10042 MiB |      0 B   |
+|       from large pool |   9942 MiB |   9942 MiB |   9942 MiB |      0 B   |
+|       from small pool |    100 MiB |    100 MiB |    100 MiB |      0 B   |
+|---------------------------------------------------------------------------|
+| Non-releasable memory | 284412 KiB | 346318 KiB |  13488 MiB |  13210 MiB |
+|       from large pool | 282512 KiB | 345992 KiB |  12583 MiB |  12308 MiB |
+|       from small pool |   1900 KiB |  11181 KiB |    904 MiB |    902 MiB |
+|---------------------------------------------------------------------------|
+| Allocations           |    2071    |    3038    |    9118    |    7047    |
+|       from large pool |     777    |    1099    |    1815    |    1038    |
+|       from small pool |    1294    |    1939    |    7303    |    6009    |
+|---------------------------------------------------------------------------|
+| Active allocs         |    2071    |    3038    |    9118    |    7047    |
+|       from large pool |     777    |    1099    |    1815    |    1038    |
+|       from small pool |    1294    |    1939    |    7303    |    6009    |
+|---------------------------------------------------------------------------|
+| GPU reserved segments |     455    |     455    |     455    |       0    |
+|       from large pool |     405    |     405    |     405    |       0    |
+|       from small pool |      50    |      50    |      50    |       0    |
+|---------------------------------------------------------------------------|
+| Non-releasable allocs |     139    |     151    |    2939    |    2800    |
+|       from large pool |     136    |     149    |     887    |     751    |
+|       from small pool |       3    |      20    |    2052    |    2049    |
+|---------------------------------------------------------------------------|
+| Oversize allocations  |       0    |       0    |       0    |       0    |
+|---------------------------------------------------------------------------|
+| Oversize GPU segments |       0    |       0    |       0    |       0    |
+|===========================================================================|
