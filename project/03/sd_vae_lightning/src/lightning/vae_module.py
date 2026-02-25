@@ -850,6 +850,30 @@ class VAELightningModule(pl.LightningModule):
             },
         }
 
+    def save_hf_checkpoint(self, checkpoint_filepath: str) -> None:
+        """
+        Save HuggingFace format model to directory.
+
+        Args:
+            checkpoint_filepath: Path to save directory.
+        """
+        save_path = Path(checkpoint_filepath)
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        vae_save_dir = save_path / "vae"
+        self.vae.save_pretrained(vae_save_dir)
+
+        # Save VAE (optionally use EMA weights)
+        if self.use_ema and self.ema is not None:
+            ema_dir = save_path / "vae_ema"
+            self.ema.save_pretrained(str(ema_dir))
+            print(f"Saving EMA weights to {ema_dir}...")
+
+        # Save training config
+        config_path = save_path / "training_config.json"
+        with open(config_path, "w") as f:
+            json.dump(self.config, f, indent=2)
+
     def save_pretrained(self, save_directory: str) -> None:
         """
         Save model to directory.
@@ -873,7 +897,7 @@ class VAELightningModule(pl.LightningModule):
         if self.discriminator is not None:
             disc_path = save_path / "discriminator.pt"
             torch.save(self.discriminator.state_dict(), disc_path)
-        
+
         # Save training config
         config_path = save_path / "training_config.json"
         with open(config_path, "w") as f:

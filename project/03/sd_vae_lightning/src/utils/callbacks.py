@@ -238,7 +238,7 @@ class VAECheckpointCallback(ModelCheckpoint):
 
         if self.save_hf_format and trainer.is_global_zero:
             # Save HuggingFace format
-            hf_dir = os.path.join(filepath, "hf_checkpoint")
+            hf_dir = Path(filepath).parent / "hf_checkpoint"
             trainer.lightning_module.save_pretrained(hf_dir)
 
 
@@ -284,8 +284,22 @@ class GradientNormLogger(Callback):
         grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
         param_norm = self._compute_global_norm(pl_module, use_grad=False).detach().cpu()
 
-        pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False,prog_bar=False)
-        pl_module.log("train/param_norm", param_norm, on_step=True, on_epoch=False,prog_bar=False)
+        pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
+        pl_module.log("train/param_norm", param_norm, on_step=True, on_epoch=False, prog_bar=False)
+
+    def on_before_optimizer_step(self,
+                                 trainer: pl.Trainer,
+                                 pl_module: pl.LightningModule,
+                                 optimizer: torch.optim.Optimizer) -> None:
+        step = int(trainer.global_step)
+        if step == 0 or step % self.log_every_n_steps != 0:
+            return
+
+        grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
+        param_norm = self._compute_global_norm(pl_module, use_grad=False).detach().cpu()
+
+        pl_module.log("train/grad_norm_clip", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
+        pl_module.log("train/param_norm_clip", param_norm, on_step=True, on_epoch=False, prog_bar=False)
 
 
 class LRandSchedulerOverrideCallback(Callback):
