@@ -256,7 +256,6 @@ python scripts/inference.py ^
 ### 9.2 参数与梯度范数
 
 - `train/grad_norm`
-- `train/param_norm`
 - `train/grad_norm_clip`
 
 ### 9.3 训练健康度指标

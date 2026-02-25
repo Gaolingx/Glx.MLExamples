@@ -242,65 +242,6 @@ class VAECheckpointCallback(ModelCheckpoint):
             trainer.lightning_module.save_pretrained(hf_dir)
 
 
-class GradientNormLogger(Callback):
-    """
-    Callback for logging gradient norms during training.
-    Useful for debugging training instabilities.
-    """
-
-    def __init__(self, log_every_n_steps: int = 50) -> None:
-        super().__init__()
-        self.log_every_n_steps = max(1, int(log_every_n_steps))
-
-    @staticmethod
-    def _compute_global_norm(pl_module: pl.LightningModule, *, use_grad: bool) -> torch.Tensor:
-        reference = None
-        total = None
-
-        for param in pl_module.parameters():
-            if not param.requires_grad:
-                continue
-
-            tensor = param.grad if use_grad else param.detach()
-            if tensor is None:
-                continue
-
-            reference = tensor
-            part = tensor.detach().float().pow(2).sum()
-            total = part if total is None else total + part
-
-        if total is None:
-            if reference is not None:
-                return torch.tensor(0.0, device=reference.device)
-            return torch.tensor(0.0, device=pl_module.device)
-
-        return total.sqrt()
-
-    def on_after_backward(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        step = int(trainer.global_step)
-        if step == 0 or step % self.log_every_n_steps != 0:
-            return
-
-        grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
-        param_norm = self._compute_global_norm(pl_module, use_grad=False).detach().cpu()
-
-        pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
-        pl_module.log("train/param_norm", param_norm, on_step=True, on_epoch=False, prog_bar=False)
-
-    def on_before_optimizer_step(
-            self,
-            trainer: pl.Trainer,
-            pl_module: pl.LightningModule,
-            optimizer: torch.optim.Optimizer) -> None:
-        step = int(trainer.global_step)
-        if step == 0 or step % self.log_every_n_steps != 0:
-            return
-
-        grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
-
-        pl_module.log("train/grad_norm_clip", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
-
-
 class LRandSchedulerOverrideCallback(Callback):
     """
     Override LR and/or reset scheduler state when resuming from checkpoint.

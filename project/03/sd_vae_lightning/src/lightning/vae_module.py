@@ -441,7 +441,7 @@ class VAELightningModule(pl.LightningModule):
 
             return d_loss, loss_dict
 
-    def _compute_grad_norm(self, parameters) -> torch.Tensor:
+    def _compute_global_norm(self, parameters, use_grad: bool) -> torch.Tensor:
         """
         Compute total gradient norm for given parameters.
 
@@ -451,11 +451,27 @@ class VAELightningModule(pl.LightningModule):
         Returns:
             Total L2 norm of gradients.
         """
-        total_norm_sq = 0.0
-        for p in parameters:
-            if p.grad is not None:
-                total_norm_sq += p.grad.data.norm(2).item() ** 2
-        return torch.tensor(total_norm_sq ** 0.5)
+        reference = None
+        total = None
+
+        for param in parameters:
+            if not param.requires_grad:
+                continue
+
+            tensor = param.grad if use_grad else param.detach()
+            if tensor is None:
+                continue
+
+            reference = tensor
+            part = tensor.detach().float().pow(2).sum()
+            total = part if total is None else total + part
+
+        if total is None:
+            if reference is not None:
+                return torch.tensor(0.0, device=reference.device)
+            return torch.tensor(0.0, device=self.device)
+
+        return total.sqrt()
 
     def training_step(
             self, batch: Dict[str, torch.Tensor], batch_idx: int
@@ -517,12 +533,13 @@ class VAELightningModule(pl.LightningModule):
 
             # Step optimizer only at accumulation boundary
             if is_last_accumulation_step:
-                grad_norm = self._compute_grad_norm(self.vae.parameters())
+                grad_norm_vae = self._compute_global_norm(self.vae.parameters(), use_grad=True)
                 self.clip_gradients(
                     opt_vae,
                     gradient_clip_val=self.gradient_clip_val,
                     gradient_clip_algorithm="norm",
                 )
+                grad_norm_vae_clip = self._compute_global_norm(self.vae.parameters(), use_grad=True)
                 opt_vae.step()
                 opt_vae.zero_grad()
 
@@ -539,7 +556,8 @@ class VAELightningModule(pl.LightningModule):
                     vae_scheduler = schedulers
                 vae_scheduler.step()
 
-                train_metrics["grad_norm_vae"] = grad_norm
+                train_metrics["grad_norm_vae"] = grad_norm_vae
+                train_metrics["grad_norm_vae_clip"] = grad_norm_vae_clip
 
             for key, value in vae_loss_dict.items():
                 train_metrics[key] = value
@@ -572,12 +590,13 @@ class VAELightningModule(pl.LightningModule):
 
                 # Step optimizer only at accumulation boundary
                 if is_last_accumulation_step:
-                    grad_norm = self._compute_grad_norm(self.discriminator.parameters())
+                    grad_norm_disc = self._compute_global_norm(self.discriminator.parameters(), use_grad=True)
                     self.clip_gradients(
                         opt_disc,
                         gradient_clip_val=self.gradient_clip_val,
                         gradient_clip_algorithm="norm"
                     )
+                    grad_norm_disc_clip = self._compute_global_norm(self.discriminator.parameters(), use_grad=True)
                     opt_disc.step()
                     opt_disc.zero_grad()
 
@@ -586,7 +605,8 @@ class VAELightningModule(pl.LightningModule):
                     if isinstance(schedulers, list) and len(schedulers) > 1:
                         disc_scheduler = schedulers[1]
                         disc_scheduler.step()
-                    train_metrics["grad_norm_disc"] = grad_norm
+                    train_metrics["grad_norm_disc"] = grad_norm_disc
+                    train_metrics["grad_norm_disc_clip"] = grad_norm_disc_clip
 
                 if self._cached_g_loss is not None:
                     g_loss = self._cached_g_loss

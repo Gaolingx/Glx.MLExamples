@@ -37,7 +37,6 @@ from src.data.dataset import VAEDataModule
 from src.utils.callbacks import (
     VAELoggingCallback,
     VAECheckpointCallback,
-    GradientNormLogger,
     LRandSchedulerOverrideCallback,
     NaNLossCallback,
     OptionalEarlyStopping,
@@ -198,8 +197,6 @@ def main():
             log_to_tensorboard=True,
             log_images_every_n_steps=logging_config.get("log_images_every_n_steps", 500),
         ),
-        # Gradient norm logger
-        GradientNormLogger(logging_config.get("log_every_n_steps", 50)),
         # LR and Scheduler Override callback for resume
         LRandSchedulerOverrideCallback(
             override_lr_on_resume=train_config_section.get("override_lr_on_resume", True),

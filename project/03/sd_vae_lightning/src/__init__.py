@@ -4,7 +4,6 @@ from .data import VAEDataModule, VAEDataset
 from .lightning import VAELightningModule
 from .models import NLayerDiscriminator
 from .utils import (
-    GradientNormLogger,
     LRandSchedulerOverrideCallback,
     PSIM,
     PSNR,
@@ -24,7 +23,6 @@ __all__ = [
     "NLayerDiscriminator",
     "VAELoggingCallback",
     "VAECheckpointCallback",
-    "GradientNormLogger",
     "LRandSchedulerOverrideCallback",
     "PSNR",
     "SSIM",

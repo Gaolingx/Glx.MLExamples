@@ -148,10 +148,8 @@ class GradParamNormCallback(Callback):
             return
 
         grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
-        param_norm = self._compute_global_norm(pl_module, use_grad=False).detach().cpu()
 
         pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
-        pl_module.log("train/param_norm", param_norm, on_step=True, on_epoch=False, prog_bar=False)
 
     def on_before_optimizer_step(
             self,
