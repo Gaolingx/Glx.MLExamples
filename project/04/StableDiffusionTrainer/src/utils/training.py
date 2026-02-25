@@ -147,13 +147,25 @@ class GradParamNormCallback(Callback):
         if step == 0 or step % self.log_every_n_steps != 0:
             return
 
-        grad_norm = self._compute_global_norm(pl_module, use_grad=True)
-        param_norm = self._compute_global_norm(pl_module, use_grad=False)
+        grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
+        param_norm = self._compute_global_norm(pl_module, use_grad=False).detach().cpu()
 
-        runtime_metrics = getattr(pl_module, "runtime_log_dict", None)
-        if isinstance(runtime_metrics, dict):
-            runtime_metrics["train/grad_norm"] = float(grad_norm.detach().cpu())
-            runtime_metrics["train/param_norm"] = float(param_norm.detach().cpu())
+        pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
+        pl_module.log("train/param_norm", param_norm, on_step=True, on_epoch=False, prog_bar=False)
+
+    def on_before_optimizer_step(self,
+            trainer: pl.Trainer,
+            pl_module: pl.LightningModule,
+            optimizer: torch.optim.Optimizer) -> None:
+        step = int(trainer.global_step)
+        if step == 0 or step % self.log_every_n_steps != 0:
+            return
+
+        grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
+        param_norm = self._compute_global_norm(pl_module, use_grad=False).detach().cpu()
+
+        pl_module.log("train/grad_norm_clip", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
+        pl_module.log("train/param_norm_clip", param_norm, on_step=True, on_epoch=False, prog_bar=False)
 
 
 class LoggingCallback(Callback):
@@ -175,18 +187,14 @@ class LoggingCallback(Callback):
         if step == 0 or step % self.log_every_n_steps != 0:
             return
 
-        runtime_metrics = getattr(pl_module, "runtime_log_dict", {})
-        metrics_to_log: Dict[str, Any] = {}
+        if not isinstance(outputs, dict):
+            return
 
-        if isinstance(runtime_metrics, dict) and len(runtime_metrics) > 0:
-            metrics_to_log.update(runtime_metrics)
-        else:
-            callback_metrics = trainer.callback_metrics
-            for key, value in callback_metrics.items():
-                if key.startswith("train/"):
-                    metrics_to_log[key] = value
+        metrics = outputs.get("train_metrics", {})
+        if not isinstance(metrics, dict):
+            return
 
-        for key, value in metrics_to_log.items():
+        for key, value in metrics.items():
             if value is None:
                 continue
             if torch.is_tensor(value):
@@ -249,17 +257,14 @@ class TrainHealthMetricsCallback(Callback):
         if step == 0 or step % self.log_every_n_steps != 0:
             return
 
-        runtime_metrics = getattr(pl_module, "runtime_log_dict", None)
-
         # Throughput/system-level metrics.
         if self._batch_start_time is not None:
             step_time_ms = (time.perf_counter() - self._batch_start_time) * 1000.0
             batch_size = max(1, self._infer_batch_size(batch))
             samples_per_sec = (batch_size * 1000.0) / max(step_time_ms, 1e-6)
 
-            if isinstance(runtime_metrics, dict):
-                runtime_metrics["train/step_time_ms"] = float(step_time_ms)
-                runtime_metrics["train/samples_per_sec"] = float(samples_per_sec)
+            pl_module.log("train/step_time_ms", float(step_time_ms), on_step=True, on_epoch=False, prog_bar=True)
+            pl_module.log("train/samples_per_sec", float(samples_per_sec), on_step=True, on_epoch=False, prog_bar=True)
 
         # Sanity metrics for diffusion training internals.
         if not isinstance(batch, dict) or "pixel_values" not in batch:
@@ -297,11 +302,10 @@ class TrainHealthMetricsCallback(Callback):
         latent_std = latents.float().std(unbiased=False)
         noise_std = noise.float().std(unbiased=False)
 
-        if isinstance(runtime_metrics, dict):
-            runtime_metrics["train/timestep_mean"] = float(timestep_mean.detach().cpu())
-            runtime_metrics["train/timestep_std"] = float(timestep_std.detach().cpu())
-            runtime_metrics["train/latent_std"] = float(latent_std.detach().cpu())
-            runtime_metrics["train/noise_std"] = float(noise_std.detach().cpu())
+        pl_module.log("train/timestep_mean", float(timestep_mean.detach().cpu()), on_step=True, on_epoch=False, prog_bar=True)
+        pl_module.log("train/timestep_std", float(timestep_std.detach().cpu()), on_step=True, on_epoch=False, prog_bar=True)
+        pl_module.log("train/latent_std", float(latent_std.detach().cpu()), on_step=True, on_epoch=False, prog_bar=True)
+        pl_module.log("train/noise_std", float(noise_std.detach().cpu()), on_step=True, on_epoch=False, prog_bar=True)
 
 
 def build_tensorboard_logger(logging_cfg: Dict[str, Any]) -> TensorBoardLogger:

@@ -77,6 +77,8 @@ def main() -> None:
     print("=" * 60)
     print("Starting sd15 Training")
     print(f"  - Gradient accumulation: {int(cfg["training"].get("accumulate_grad_batches", 1))} steps")
+    print(f"  - Override LR on resume: {cfg["resume_override"].get("reset_lr", False)}")
+    print(f"  - Reset scheduler on resume: {cfg["resume_override"].get("reset_scheduler", False)}")
     print(f"Output directory: {output_dir}")
     print(f"Log directory: {cfg["training"].get("tensorboard_save_dir", "outputs/sd15-lightning/tb_logs")}")
     print(f"Checkpoint directory: {cfg["checkpoint"].get("dirpath", "outputs/sd15-lightning/checkpoints")}")

@@ -123,28 +123,19 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
         return F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-    @staticmethod
-    def _to_float_for_runtime_log(value: Any) -> float:
-        if torch.is_tensor(value):
-            value = value.detach()
-            if value.numel() == 1:
-                return float(value.cpu())
-            return float(value.float().mean().cpu())
-        return float(value)
-
-    def _log_metric(self, name: str, value: Any) -> None:
-        self.runtime_log_dict[name] = self._to_float_for_runtime_log(value)
-
-    def _log_train_metrics(self, loss: torch.Tensor, lr: float) -> None:
-        self._log_metric("train/loss", loss)
-        self._log_metric("train/lr", lr)
-
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        train_metrics: Dict[str, torch.Tensor] = {}
+
         if self.automatic_optimization:
             loss = self._compute_loss(batch)
             lr = self.trainer.optimizers[0].param_groups[0]["lr"]
-            self._log_train_metrics(loss, lr)
-            return loss
+            train_metrics["train/loss"] = loss
+            train_metrics["train/lr"] = lr
+
+            return {
+                "loss": loss,
+                "train_metrics": train_metrics,
+            }
 
         optimizer = self.optimizers()
         scheduler = self.lr_schedulers()
@@ -162,8 +153,13 @@ class StableDiffusionLightningModule(pl.LightningModule):
             scheduler.step()
 
         lr = optimizer.param_groups[0]["lr"]
-        self._log_train_metrics(loss, lr)
-        return loss.detach()
+        train_metrics["train/loss"] = loss
+        train_metrics["train/lr"] = lr
+
+        return {
+            "loss": loss,
+            "train_metrics": train_metrics,
+        }
 
     @torch.no_grad()
     def on_train_batch_end(self, outputs: Any, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
