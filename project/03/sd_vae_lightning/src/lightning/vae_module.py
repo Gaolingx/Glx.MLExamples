@@ -441,12 +441,14 @@ class VAELightningModule(pl.LightningModule):
 
             return d_loss, loss_dict
 
-    def _compute_global_norm(self, parameters, use_grad: bool) -> torch.Tensor:
+    def _compute_global_norm(self, parameters, use_grad: bool = True) -> torch.Tensor:
         """
         Compute total gradient norm for given parameters.
 
         Args:
             parameters: Iterator of model parameters.
+            use_grad: If True, compute the L2 norm of parameter gradients;
+                      if False, compute the L2 norm of the parameter values themselves.
 
         Returns:
             Total L2 norm of gradients.

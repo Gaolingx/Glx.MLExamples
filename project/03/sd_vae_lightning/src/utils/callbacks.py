@@ -6,7 +6,6 @@ Includes image logging, checkpoint management, and training monitoring.
 from typing import Optional, Dict, Any, Tuple, List
 from pathlib import Path
 import json
-import os
 
 import torch
 import torch.nn.functional as F
@@ -239,7 +238,7 @@ class VAECheckpointCallback(ModelCheckpoint):
         if self.save_hf_format and trainer.is_global_zero:
             # Save HuggingFace format
             hf_dir = Path(filepath).parent / "hf_checkpoint"
-            trainer.lightning_module.save_pretrained(hf_dir)
+            trainer.lightning_module.save_hf_checkpoint(hf_dir)
 
 
 class LRandSchedulerOverrideCallback(Callback):
