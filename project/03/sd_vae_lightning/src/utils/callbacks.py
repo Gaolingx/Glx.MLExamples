@@ -297,10 +297,8 @@ class GradientNormLogger(Callback):
             return
 
         grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
-        param_norm = self._compute_global_norm(pl_module, use_grad=False).detach().cpu()
 
         pl_module.log("train/grad_norm_clip", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
-        pl_module.log("train/param_norm_clip", param_norm, on_step=True, on_epoch=False, prog_bar=False)
 
 
 class LRandSchedulerOverrideCallback(Callback):

@@ -258,7 +258,6 @@ python scripts/inference.py ^
 - `train/grad_norm`
 - `train/param_norm`
 - `train/grad_norm_clip`
-- `train/param_norm_clip`
 
 ### 9.3 训练健康度指标
 
