@@ -25,6 +25,7 @@ from typing import Any, Dict, Optional
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
     LearningRateMonitor,
@@ -190,6 +191,11 @@ def main():
         name=logging_config.get("name", "vae_training"),
         default_hp_metric=False,
     )
+
+    # Enable TF32 for faster training on Ampere GPUs,
+    # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
+    if train_config_section.get("allow_tf32", False):
+        torch.backends.cuda.matmul.allow_tf32 = True
 
     callbacks = [
         # NaN/Inf loss guard

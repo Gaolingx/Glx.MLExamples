@@ -13,6 +13,7 @@
         "max_train_steps": -1,
         "override_lr_on_resume": true,
         "reset_scheduler_on_resume": false,
+        "allow_tf32": false,
         "generator_optimizer": {
             "type": "AdamW",
             "learning_rate": 4.5e-6,
@@ -52,7 +53,7 @@
         "disc_start_step": 50001,
         "disc_loss_type": "hinge",
         "use_adaptive_disc_weight": true,
-        "adaptive_weight_max": 1.0
+        "adaptive_weight_max": 10.0
     },
     "data": {
         "dataset_name": "huggan/flowers-102-categories",

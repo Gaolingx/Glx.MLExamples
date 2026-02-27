@@ -69,10 +69,6 @@ class VAELightningModule(pl.LightningModule):
                 "`model_config_name_or_path`, or `vae_config` in the config."
             )
 
-        # Enable gradient checkpointing for memory savings
-        if model_config.get("gradient_checkpointing", False):
-            self.vae.enable_gradient_checkpointing()
-
         # Build discriminator
         self.use_discriminator = loss_config.get("disc_weight", 1.0) > 0
 
@@ -89,13 +85,25 @@ class VAELightningModule(pl.LightningModule):
             self.discriminator = None
             self.disc_start_step = float("inf")
 
+        self.vae.requires_grad_(True)
+        if model_config.get("decoder_only", False):
+            self.vae.encoder.requires_grad_(False)
+            if getattr(self.vae, "quant_conv", None):
+                self.vae.quant_conv.requires_grad_(False)
+        self.vae.train()
+        self.discriminator.requires_grad_(True)
+        self.discriminator.train()
+
+        # Enable gradient checkpointing for memory savings
+        if model_config.get("gradient_checkpointing", False):
+            self.vae.enable_gradient_checkpointing()
+
         # Perceptual loss
         self.perceptual_weight = loss_config.get("perceptual_weight", 0.5)
         if self.perceptual_weight > 0:
             self.perceptual_loss = lpips.LPIPS(net="vgg")
             self.perceptual_loss.eval()
-            for param in self.perceptual_loss.parameters():
-                param.requires_grad = False
+            self.perceptual_loss.requires_grad_(False)
         else:
             self.perceptual_loss = None
 
