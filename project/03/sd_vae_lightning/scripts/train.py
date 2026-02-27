@@ -102,21 +102,37 @@ def merge_configs(train_config: dict, model_config: dict) -> dict:
     return config
 
 
-def find_resume_checkpoint(checkpoint_path: str) -> Optional[str]:
-    ckpt_dir = Path(checkpoint_path)
-    if not ckpt_dir.exists():
+def find_resume_checkpoint(resume_arg: str, default_ckpt_dir: str) -> Optional[str]:
+    """Resolve a checkpoint path for resuming training."""
+    if not resume_arg:
         return None
 
-    last_ckpt = ckpt_dir / "last.ckpt"
-    if last_ckpt.exists():
-        print(f"Resuming from latest checkpoint: {last_ckpt}")
-        return str(last_ckpt)
-
-    candidates = sorted(ckpt_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if len(candidates) == 0:
+    if resume_arg.lower() == "last":
+        last_ckpt = Path(default_ckpt_dir) / "last.ckpt"
+        if last_ckpt.exists():
+            print(f"Resuming from latest checkpoint: {last_ckpt}")
+            return str(last_ckpt)
         return None
 
-    return str(candidates[0])
+    p = Path(resume_arg)
+    if p.is_file() and p.suffix == ".ckpt":
+        print(f"Resuming from checkpoint file: {p}")
+        return str(p)
+    if p.is_dir():
+        candidates = sorted(
+            [x for x in p.rglob("*.ckpt") if x.name != "last.ckpt"],
+            key=lambda x: x.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            print(f"Resuming from checkpoint in dir: {candidates[0]}")
+            return str(candidates[0])
+
+        last_ckpt = p / "last.ckpt"
+        if last_ckpt.exists():
+            print(f"Resuming from last checkpoint in dir: {last_ckpt}")
+            return str(last_ckpt)
+    return None
 
 
 def main():
@@ -239,7 +255,7 @@ def main():
 
     ckpt_path = None
     if args.resume_from_checkpoint:
-        ckpt_path = find_resume_checkpoint(checkpoint_dir)
+        ckpt_path = find_resume_checkpoint(args.resume_from_checkpoint, checkpoint_dir)
 
     # Train
     print("=" * 60)
