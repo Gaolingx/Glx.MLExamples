@@ -314,11 +314,7 @@ class VAELightningModule(pl.LightningModule):
         nll_grad_norm = torch.norm(nll_grads)
         g_grad_norm = torch.norm(g_grads)
 
-        if g_grad_norm < 1e-6:
-            d_weight = torch.tensor(1.0, device=nll_loss.device)
-        else:
-            d_weight = nll_grad_norm / (g_grad_norm + 1e-4)
-
+        d_weight = nll_grad_norm / (g_grad_norm + 1e-4)
         d_weight = torch.clamp(d_weight, 0.0, self.adaptive_weight_max).detach()
 
         return d_weight * self.disc_weight
