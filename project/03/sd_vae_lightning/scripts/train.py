@@ -266,7 +266,6 @@ def main():
     # Train
     print("=" * 60)
     print("Starting VAE Training")
-    print(f"  - Alternating training: VAE (even steps) / Disc (odd steps)")
     print(f"  - Gradient accumulation: {train_config_section.get('accumulate_grad_batches', 1)} steps")
     print(f"  - Override LR on resume: {train_config_section.get('override_lr_on_resume', True)}")
     print(f"  - Reset scheduler on resume: {train_config_section.get('reset_scheduler_on_resume', False)}")

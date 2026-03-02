@@ -165,9 +165,6 @@ class VAELightningModule(pl.LightningModule):
         # rFID metric for reconstruction quality evaluation
         self.rfid_metric = rFID(feature_dim=2048, reset_real_features=True)
 
-        # Cache for G/D loss ratio computation across alternating steps
-        self._cached_g_loss: Optional[torch.Tensor] = None
-
     def on_fit_start(self) -> None:
         """Initialize EMA model at the start of training."""
         if self.use_ema:
@@ -319,6 +316,22 @@ class VAELightningModule(pl.LightningModule):
 
         return d_weight * self.disc_weight
 
+    def _hinge_d_loss(self, logits_real, logits_fake):
+        loss_real = torch.mean(F.relu(1. - logits_real))
+        loss_fake = torch.mean(F.relu(1. + logits_fake))
+        d_loss = 0.5 * (loss_real + loss_fake)
+        return d_loss
+
+    def _vanilla_d_loss(self, logits_real, logits_fake):
+        loss_real = F.binary_cross_entropy_with_logits(
+            logits_real, torch.ones_like(logits_real)
+        )
+        loss_fake = F.binary_cross_entropy_with_logits(
+            logits_fake, torch.zeros_like(logits_fake)
+        )
+        d_loss = 0.5 * (loss_real + loss_fake)
+        return d_loss
+
     def compute_loss(
             self,
             targets: torch.Tensor,
@@ -415,27 +428,15 @@ class VAELightningModule(pl.LightningModule):
 
             logits_real = self.discriminator(targets.detach())
             logits_fake = self.discriminator(reconstructions.detach())
-
-            if self.disc_loss_type == "hinge":
-                d_loss_real = torch.mean(F.relu(1.0 - logits_real))
-                d_loss_fake = torch.mean(F.relu(1.0 + logits_fake))
-            else:  # vanilla
-                d_loss_real = F.binary_cross_entropy_with_logits(
-                    logits_real, torch.ones_like(logits_real)
-                )
-                d_loss_fake = F.binary_cross_entropy_with_logits(
-                    logits_fake, torch.zeros_like(logits_fake)
-                )
+            disc_loss = self._hinge_d_loss if self.disc_loss_type == "hinge" else self._vanilla_d_loss
 
             # Compute disc_factor based on disc_start_step
             disc_factor = self.disc_factor if global_step >= self.disc_start_step else 0.0
 
-            d_loss = disc_factor * 0.5 * (d_loss_real + d_loss_fake)
+            d_loss = disc_factor * disc_loss(logits_real, logits_fake)
 
             loss_dict["d_loss"] = d_loss
             loss_dict["disc_factor"] = torch.tensor(disc_factor, device=targets.device)
-            loss_dict["d_loss_real"] = d_loss_real
-            loss_dict["d_loss_fake"] = d_loss_fake
             loss_dict["logits_real"] = logits_real.mean()
             loss_dict["logits_fake"] = logits_fake.mean()
 
@@ -483,21 +484,16 @@ class VAELightningModule(pl.LightningModule):
             self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> STEP_OUTPUT:
         """
-        Training step with alternating VAE/Discriminator training.
+        Training step that updates VAE (generator) and discriminator in the same step.
 
-        Following the official diffusers implementation:
-        - Even accumulated steps: train VAE (generator)
-        - Odd accumulated steps: train Discriminator
-        - Before disc_start_step: always train VAE only
-
-        Manual gradient accumulation is used to match the official behavior.
+        Manual gradient accumulation is used for both optimizers.
 
         Args:
             batch: Batch dictionary containing 'pixel_values'.
             batch_idx: Batch index.
 
         Returns:
-            Loss tensor.
+            Loss dictionary containing aggregated loss and training metrics.
         """
         targets = batch["pixel_values"]
         train_metrics: Dict[str, torch.Tensor] = {}
@@ -510,125 +506,109 @@ class VAELightningModule(pl.LightningModule):
             opt_vae = optimizers
             opt_disc = None
 
-        # Determine training phase based on accumulated step index
-        accumulated_step_idx = batch_idx // self.accumulate_grad_batches
         is_last_accumulation_step = (batch_idx + 1) % self.accumulate_grad_batches == 0
-
-        # Determine whether to train generator (VAE) or discriminator
-        train_generator = (
-                (accumulated_step_idx % 2 == 0) or
-                (self.global_step < self.disc_start_step) or
-                (self.discriminator is None)
-        )
 
         # Forward pass with latent
         reconstructions, latent, posterior = self.forward_with_latent(targets, sample_posterior=True)
 
-        if train_generator:
-            # ========== Train VAE (Generator) ==========
-            self.toggle_optimizer(opt_vae)
-            vae_loss, vae_loss_dict = self.compute_loss(
-                targets, reconstructions, posterior,
-                optimizer_idx=0, global_step=self.global_step, training=True
+        # ========== Train VAE (Generator) ==========
+        self.toggle_optimizer(opt_vae)
+        vae_loss, vae_loss_dict = self.compute_loss(
+            targets, reconstructions, posterior,
+            optimizer_idx=0, global_step=self.global_step, training=True
+        )
+
+        scaled_vae_loss = vae_loss / self.accumulate_grad_batches
+        self.manual_backward(scaled_vae_loss)
+        self.untoggle_optimizer(opt_vae)
+
+        if is_last_accumulation_step:
+            grad_norm_vae = self._compute_global_norm(self.vae.parameters(), use_grad=True)
+            self.clip_gradients(
+                opt_vae,
+                gradient_clip_val=self.gradient_clip_val,
+                gradient_clip_algorithm="norm",
             )
+            grad_norm_vae_clip = self._compute_global_norm(self.vae.parameters(), use_grad=True)
+            opt_vae.step()
+            opt_vae.zero_grad()
 
-            # Scale loss for manual gradient accumulation
-            scaled_loss = vae_loss / self.accumulate_grad_batches
-            self.manual_backward(scaled_loss)
-            self.untoggle_optimizer(opt_vae)
+            # Update EMA
+            if self.use_ema and self.ema is not None:
+                if self.global_step % self.ema_update_interval == 0:
+                    self.ema.step(self.vae.parameters())
 
-            # Step optimizer only at accumulation boundary
-            if is_last_accumulation_step:
-                grad_norm_vae = self._compute_global_norm(self.vae.parameters(), use_grad=True)
-                self.clip_gradients(
-                    opt_vae,
-                    gradient_clip_val=self.gradient_clip_val,
-                    gradient_clip_algorithm="norm",
-                )
-                grad_norm_vae_clip = self._compute_global_norm(self.vae.parameters(), use_grad=True)
-                opt_vae.step()
-                opt_vae.zero_grad()
-
-                # Update EMA
-                if self.use_ema and self.ema is not None:
-                    if self.global_step % self.ema_update_interval == 0:
-                        self.ema.step(self.vae.parameters())
-
-                # Step the VAE learning rate scheduler
-                schedulers = self.lr_schedulers()
-                if isinstance(schedulers, list):
-                    vae_scheduler = schedulers[0]
-                else:
-                    vae_scheduler = schedulers
-                vae_scheduler.step()
-
-                train_metrics["grad_norm_vae"] = grad_norm_vae
-                train_metrics["grad_norm_vae_clip"] = grad_norm_vae_clip
-
-            for key, value in vae_loss_dict.items():
-                train_metrics[key] = value
-            # Learning rate metric
+            # Step the VAE learning rate scheduler
             schedulers = self.lr_schedulers()
             if isinstance(schedulers, list):
-                vae_lr = schedulers[0].get_last_lr()[0]
+                vae_scheduler = schedulers[0]
             else:
-                vae_lr = schedulers.get_last_lr()[0]
+                vae_scheduler = schedulers
+            vae_scheduler.step()
+
+            train_metrics["grad_norm_vae"] = grad_norm_vae
+            train_metrics["grad_norm_vae_clip"] = grad_norm_vae_clip
+
+        for key, value in vae_loss_dict.items():
+            train_metrics[key] = value
+
+        schedulers = self.lr_schedulers()
+        if isinstance(schedulers, list) and len(schedulers) > 1:
+            vae_lr = schedulers[0].get_last_lr()[0]
             train_metrics["lr"] = torch.tensor(vae_lr, device=targets.device)
 
-            # Cache g_loss for G/D ratio computation in discriminator step
-            self._cached_g_loss = vae_loss_dict.get("g_loss", torch.tensor(0.0, device=targets.device))
+        # ========== Train Discriminator ==========
+        disc_loss = torch.tensor(0.0, device=targets.device)
+        disc_loss_dict: Dict[str, torch.Tensor] = {}
 
-            result = vae_loss
+        if (
+                self.discriminator is not None
+                and opt_disc is not None
+                and self.global_step >= self.disc_start_step
+        ):
+            self.toggle_optimizer(opt_disc)
+            disc_loss, disc_loss_dict = self.compute_loss(
+                targets, reconstructions, posterior,
+                optimizer_idx=1, global_step=self.global_step,
+            )
 
-        else:
-            # ========== Train Discriminator ==========
-            if self.discriminator is not None and opt_disc is not None:
-                self.toggle_optimizer(opt_disc)
-                disc_loss, disc_loss_dict = self.compute_loss(
-                    targets, reconstructions, posterior,
-                    optimizer_idx=1, global_step=self.global_step,
+            scaled_disc_loss = disc_loss / self.accumulate_grad_batches
+            self.manual_backward(scaled_disc_loss)
+            self.untoggle_optimizer(opt_disc)
+
+            if is_last_accumulation_step:
+                grad_norm_disc = self._compute_global_norm(self.discriminator.parameters(), use_grad=True)
+                self.clip_gradients(
+                    opt_disc,
+                    gradient_clip_val=self.gradient_clip_val,
+                    gradient_clip_algorithm="norm"
                 )
+                grad_norm_disc_clip = self._compute_global_norm(self.discriminator.parameters(), use_grad=True)
+                opt_disc.step()
+                opt_disc.zero_grad()
 
-                # Scale loss for manual gradient accumulation
-                scaled_loss = disc_loss / self.accumulate_grad_batches
-                self.manual_backward(scaled_loss)
-                self.untoggle_optimizer(opt_disc)
-
-                # Step optimizer only at accumulation boundary
-                if is_last_accumulation_step:
-                    grad_norm_disc = self._compute_global_norm(self.discriminator.parameters(), use_grad=True)
-                    self.clip_gradients(
-                        opt_disc,
-                        gradient_clip_val=self.gradient_clip_val,
-                        gradient_clip_algorithm="norm"
-                    )
-                    grad_norm_disc_clip = self._compute_global_norm(self.discriminator.parameters(), use_grad=True)
-                    opt_disc.step()
-                    opt_disc.zero_grad()
-
-                    # Step the discriminator learning rate scheduler
-                    schedulers = self.lr_schedulers()
-                    if isinstance(schedulers, list) and len(schedulers) > 1:
-                        disc_scheduler = schedulers[1]
-                        disc_scheduler.step()
-                    train_metrics["grad_norm_disc"] = grad_norm_disc
-                    train_metrics["grad_norm_disc_clip"] = grad_norm_disc_clip
-
-                if self._cached_g_loss is not None:
-                    g_loss = self._cached_g_loss
-                    d_loss = disc_loss_dict.get("d_loss", torch.tensor(1.0, device=targets.device))
-                    gd_ratio = self._compute_loss_ratio(g_loss, d_loss)
-                    disc_loss_dict["gd_loss_ratio"] = gd_ratio
-
-                for key, value in disc_loss_dict.items():
-                    train_metrics[key] = value
+                # Step the discriminator learning rate scheduler
                 schedulers = self.lr_schedulers()
                 if isinstance(schedulers, list) and len(schedulers) > 1:
-                    disc_lr = schedulers[1].get_last_lr()[0]
-                    train_metrics["disc_lr"] = torch.tensor(disc_lr, device=targets.device)
-                result = disc_loss
-            else:
-                result = None
+                    disc_scheduler = schedulers[1]
+                    disc_scheduler.step()
+
+                train_metrics["grad_norm_disc"] = grad_norm_disc
+                train_metrics["grad_norm_disc_clip"] = grad_norm_disc_clip
+
+            g_loss = vae_loss_dict.get("g_loss", torch.tensor(0.0, device=targets.device))
+            d_loss = disc_loss_dict.get("d_loss", torch.tensor(1.0, device=targets.device))
+            disc_loss_dict["gd_loss_ratio"] = self._compute_loss_ratio(g_loss, d_loss)
+
+            for key, value in disc_loss_dict.items():
+                train_metrics[key] = value
+
+            schedulers = self.lr_schedulers()
+            if isinstance(schedulers, list) and len(schedulers) > 1:
+                disc_lr = schedulers[1].get_last_lr()[0]
+                train_metrics["disc_lr"] = torch.tensor(disc_lr, device=targets.device)
+
+        result = vae_loss + disc_loss
 
         return {
             "loss": result,
@@ -803,12 +783,11 @@ class VAELightningModule(pl.LightningModule):
         Configure optimizers and learning rate schedulers.
 
         Uses trainer.estimated_stepping_batches for accurate step count estimation.
-        Handles alternating G/D training by computing separate step counts for
-        each optimizer.
+        In this module, VAE and discriminator is updated every step after ``disc_start_step``.
 
         Important considerations:
-            - VAE scheduler steps on even accumulated steps + all steps before disc_start.
-            - Discriminator scheduler steps on odd accumulated steps after disc_start.
+            - VAE scheduler steps on every accumulation boundary.
+            - Discriminator scheduler steps after ``disc_start_step``.
             - Warmup steps are clamped to each scheduler's total training steps.
         """
         # ---- total training steps estimation ----
@@ -828,12 +807,7 @@ class VAELightningModule(pl.LightningModule):
 
         disc_start_step = self.disc_start_step if self.use_discriminator else float("inf")
 
-        if disc_start_step < total_steps:
-            steps_before_disc = min(int(disc_start_step), total_steps)
-            steps_after_disc = total_steps - steps_before_disc
-            vae_scheduler_steps = steps_before_disc + (steps_after_disc + 1) // 2
-        else:
-            vae_scheduler_steps = total_steps
+        vae_scheduler_steps = total_steps
 
         vae_scheduler = self._build_scheduler(
             opt_vae,
@@ -849,7 +823,7 @@ class VAELightningModule(pl.LightningModule):
             )
 
             if disc_start_step < total_steps:
-                disc_scheduler_steps = (total_steps - int(disc_start_step)) // 2
+                disc_scheduler_steps = total_steps - int(disc_start_step)
             else:
                 disc_scheduler_steps = 0
 
