@@ -88,7 +88,7 @@ def parse_args():
     parser.add_argument(
         "--no_metrics",
         action="store_true",
-        help="Skip printing reconstruction metrics (PSNR/SSIM/rFID/PSIM)",
+        help="Skip printing reconstruction metrics (PSNR/SSIM/PSIM)",
     )
     parser.add_argument(
         "--device",
@@ -154,13 +154,6 @@ def load_image(path: str, width: int, height: int) -> torch.Tensor:
     """Load and preprocess image with center crop only (no resize)."""
     image = Image.open(path).convert("RGB")
 
-    if image.width < width or image.height < height:
-        raise ValueError(
-            f"Input image is too small for requested crop: "
-            f"image=({image.width}x{image.height}), crop=({width}x{height}). "
-            f"This script does center-crop only and does not resize."
-        )
-
     resolution = [height, width]
     transform = transforms.Compose([
         transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -179,7 +172,7 @@ def save_image(tensor: torch.Tensor, path: str) -> None:
     tensor = torch.clamp(tensor, 0, 1)
 
     # Convert to numpy
-    tensor = tensor.squeeze(0).cpu().permute(1, 2, 0).numpy()
+    tensor = tensor.squeeze(0).cpu().permute(1, 2, 0).float().numpy()
     tensor = (tensor * 255).astype(np.uint8)
 
     # Save
@@ -212,7 +205,7 @@ def decode_from_latent(
     return model.decode(z).sample
 
 
-def _get_target_size(args) -> tuple[int, int]:
+def get_target_size(args) -> tuple[int, int]:
     """Resolve target crop size."""
     width = 512 if args.width is None else args.width
     height = 512 if args.height is None else args.height
@@ -220,13 +213,21 @@ def _get_target_size(args) -> tuple[int, int]:
     if width <= 0 or height <= 0:
         raise ValueError("--width and --height must be positive integers")
 
+    # Ensure divisible by 8
+    orig_width, orig_height = width, height
+    width = (width // 8) * 8
+    height = (height // 8) * 8
+
+    if width != orig_width or height != orig_height:
+        print(f"Adjusted resolution: {orig_width}x{orig_height} -> {width}x{height} (must be divisible by 8)")
+
     return width, height
 
 
 def compute_and_print_metrics(target: torch.Tensor, reconstruction: torch.Tensor) -> None:
-    """Compute and print PSNR/SSIM/rFID/PSIM for reconstructed image."""
+    """Compute and print PSNR/SSIM/PSIM for reconstructed image."""
     try:
-        from src.utils.metrics import PSNR, SSIM, rFID, PSIM
+        from src.utils.metrics import PSNR, SSIM, PSIM
     except ImportError as e:
         print(f"Warning: metrics are unavailable ({e}).")
         return
@@ -237,19 +238,15 @@ def compute_and_print_metrics(target: torch.Tensor, reconstruction: torch.Tensor
     with torch.no_grad():
         psnr_metric = PSNR(data_range=2.0)
         ssim_metric = SSIM(data_range=2.0)
-        rfid_metric = rFID(feature_dim=2048, reset_real_features=True)
         psim_metric = PSIM(net="vgg")
 
         psnr = psnr_metric(reconstruction, target)
         ssim = ssim_metric(reconstruction, target)
-        rfid_metric.update(target, reconstruction)
-        rfid = rfid_metric.compute()
         psim = psim_metric(reconstruction, target)
 
     print("Reconstruction metrics:")
     print(f"  PSNR: {float(psnr.item()):.6f}")
     print(f"  SSIM: {float(ssim.item()):.6f}")
-    print(f"  rFID: {float(rfid.item()):.6f}")
     print(f"  PSIM: {float(psim.item()):.6f}")
 
 
@@ -261,7 +258,7 @@ def main():
     if args.encode and args.decode:
         raise ValueError("Cannot specify both --encode and --decode")
 
-    target_width, target_height = _get_target_size(args)
+    target_width, target_height = get_target_size(args)
 
     # Load model
     source = args.checkpoint_path if args.checkpoint_path else args.model_path
@@ -309,6 +306,8 @@ def main():
 
         if not args.no_metrics:
             compute_and_print_metrics(image, reconstruction)
+
+    print("\n✓ Done!")
 
 
 if __name__ == "__main__":
