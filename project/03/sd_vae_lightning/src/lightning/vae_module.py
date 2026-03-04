@@ -544,8 +544,11 @@ class VAELightningModule(pl.LightningModule):
             if isinstance(schedulers, list):
                 vae_scheduler = schedulers[0]
                 vae_lr = schedulers[0].get_last_lr()[0]
-                vae_scheduler.step()
-                train_metrics["lr"] = torch.tensor(vae_lr, device=targets.device)
+            else:
+                vae_scheduler = schedulers
+                vae_lr = schedulers.get_last_lr()[0]
+            vae_scheduler.step()
+            train_metrics["lr"] = torch.tensor(vae_lr, device=targets.device)
 
             train_metrics["grad_norm_vae"] = grad_norm_vae
             train_metrics["grad_norm_vae_clip"] = grad_norm_vae_clip
