@@ -69,6 +69,17 @@ class VAELightningModule(pl.LightningModule):
                 "`model_config_name_or_path`, or `vae_config` in the config."
             )
 
+        self.vae.requires_grad_(True)
+        if model_config.get("decoder_only", False):
+            self.vae.encoder.requires_grad_(False)
+            if getattr(self.vae, "quant_conv", None):
+                self.vae.quant_conv.requires_grad_(False)
+        self.vae.train()
+
+        # Enable gradient checkpointing for memory savings
+        if model_config.get("gradient_checkpointing", False):
+            self.vae.enable_gradient_checkpointing()
+
         # Build discriminator
         self.use_discriminator = loss_config.get("disc_weight", 1.0) > 0
 
@@ -81,22 +92,12 @@ class VAELightningModule(pl.LightningModule):
                 num_groups=disc_config.get("num_groups", 32),
             )
             self.disc_start_step = loss_config.get("disc_start_step", 50001)
+
+            self.discriminator.requires_grad_(True)
+            self.discriminator.train()
         else:
             self.discriminator = None
             self.disc_start_step = float("inf")
-
-        self.vae.requires_grad_(True)
-        if model_config.get("decoder_only", False):
-            self.vae.encoder.requires_grad_(False)
-            if getattr(self.vae, "quant_conv", None):
-                self.vae.quant_conv.requires_grad_(False)
-        self.vae.train()
-        self.discriminator.requires_grad_(True)
-        self.discriminator.train()
-
-        # Enable gradient checkpointing for memory savings
-        if model_config.get("gradient_checkpointing", False):
-            self.vae.enable_gradient_checkpointing()
 
         # Perceptual loss
         self.perceptual_weight = loss_config.get("perceptual_weight", 0.5)
@@ -542,20 +543,15 @@ class VAELightningModule(pl.LightningModule):
             schedulers = self.lr_schedulers()
             if isinstance(schedulers, list):
                 vae_scheduler = schedulers[0]
-            else:
-                vae_scheduler = schedulers
-            vae_scheduler.step()
+                vae_lr = schedulers[0].get_last_lr()[0]
+                vae_scheduler.step()
+                train_metrics["lr"] = torch.tensor(vae_lr, device=targets.device)
 
             train_metrics["grad_norm_vae"] = grad_norm_vae
             train_metrics["grad_norm_vae_clip"] = grad_norm_vae_clip
 
         for key, value in vae_loss_dict.items():
             train_metrics[key] = value
-
-        schedulers = self.lr_schedulers()
-        if isinstance(schedulers, list) and len(schedulers) > 1:
-            vae_lr = schedulers[0].get_last_lr()[0]
-            train_metrics["lr"] = torch.tensor(vae_lr, device=targets.device)
 
         # ========== Train Discriminator ==========
         disc_loss = torch.tensor(0.0, device=targets.device)
@@ -591,7 +587,9 @@ class VAELightningModule(pl.LightningModule):
                 schedulers = self.lr_schedulers()
                 if isinstance(schedulers, list) and len(schedulers) > 1:
                     disc_scheduler = schedulers[1]
+                    disc_lr = schedulers[1].get_last_lr()[0]
                     disc_scheduler.step()
+                    train_metrics["disc_lr"] = torch.tensor(disc_lr, device=targets.device)
 
                 train_metrics["grad_norm_disc"] = grad_norm_disc
                 train_metrics["grad_norm_disc_clip"] = grad_norm_disc_clip
@@ -603,17 +601,23 @@ class VAELightningModule(pl.LightningModule):
             for key, value in disc_loss_dict.items():
                 train_metrics[key] = value
 
-            schedulers = self.lr_schedulers()
-            if isinstance(schedulers, list) and len(schedulers) > 1:
-                disc_lr = schedulers[1].get_last_lr()[0]
-                train_metrics["disc_lr"] = torch.tensor(disc_lr, device=targets.device)
-
         result = vae_loss + disc_loss
 
         return {
             "loss": result,
             "train_metrics": train_metrics,
         }
+
+    def on_validation_epoch_start(self) -> None:
+        """Swap to EMA weights once per validation epoch to avoid per-batch copy."""
+        if self.use_ema and self.ema is not None:
+            self.ema.store(self.vae.parameters())
+            self.ema.copy_to(self.vae.parameters())
+
+    def on_validation_epoch_end(self) -> None:
+        """Restore original training weights after validation epoch."""
+        if self.use_ema and self.ema is not None:
+            self.ema.restore(self.vae.parameters())
 
     def validation_step(
             self, batch: Dict[str, torch.Tensor], batch_idx: int
@@ -630,41 +634,31 @@ class VAELightningModule(pl.LightningModule):
         """
         targets = batch["pixel_values"]
 
-        # Use EMA weights for validation if available
-        if self.use_ema and self.ema is not None:
-            self.ema.store(self.vae.parameters())
-            self.ema.copy_to(self.vae.parameters())
+        reconstructions, latent, posterior = self.forward_with_latent(targets, sample_posterior=False)
 
-        try:
-            reconstructions, latent, posterior = self.forward_with_latent(targets, sample_posterior=False)
+        loss, loss_dict = self.compute_loss(
+            targets, reconstructions, posterior, optimizer_idx=0, global_step=self.global_step, training=False
+        )
 
-            loss, loss_dict = self.compute_loss(
-                targets, reconstructions, posterior, optimizer_idx=0, global_step=self.global_step, training=False
-            )
+        # Compute PSNR, SSIM and PSIM
+        with torch.no_grad():
+            psnr = self.psnr_metric(reconstructions, targets)
+            ssim = self.ssim_metric(reconstructions, targets)
+            psim = self.psim_metric(reconstructions, targets)
 
-            # Compute PSNR, SSIM and PSIM
-            with torch.no_grad():
-                psnr = self.psnr_metric(reconstructions, targets)
-                ssim = self.ssim_metric(reconstructions, targets)
-                psim = self.psim_metric(reconstructions, targets)
+            # Update rFID metric with current batch
+            self.rfid_metric.update(targets, reconstructions)
 
-                # Update rFID metric with current batch
-                self.rfid_metric.update(targets, reconstructions)
+        loss_dict["psnr"] = psnr
+        loss_dict["ssim"] = ssim
+        loss_dict["psim"] = psim
 
-            loss_dict["psnr"] = psnr
-            loss_dict["ssim"] = ssim
-            loss_dict["psim"] = psim
-
-            val_metrics = {key: value for key, value in loss_dict.items()}
-            val_visuals = {
-                "targets": targets.detach().cpu(),
-                "reconstructions": reconstructions.detach().cpu(),
-                "latent": latent.detach().cpu(),
-            }
-        finally:
-            # Restore original weights
-            if self.use_ema and self.ema is not None:
-                self.ema.restore(self.vae.parameters())
+        val_metrics = {key: value for key, value in loss_dict.items()}
+        val_visuals = {
+            "targets": targets.detach().cpu(),
+            "reconstructions": reconstructions.detach().cpu(),
+            "latent": latent.detach().cpu(),
+        }
 
         return {
             "val_metrics": val_metrics,
