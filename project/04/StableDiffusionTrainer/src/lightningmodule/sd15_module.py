@@ -255,7 +255,19 @@ class StableDiffusionLightningModule(pl.LightningModule):
             json.dump(self.cfg, f, indent=2, ensure_ascii=False)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
+        use_8bit_adam = bool(self.training_cfg.get("use_8bit_adam", False))
+        optimizer_cls = torch.optim.AdamW
+
+        if use_8bit_adam:
+            try:
+                import bitsandbytes as bnb
+            except ImportError:
+                raise ImportError(
+                    "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
+                )
+            optimizer_cls = bnb.optim.AdamW8bit
+
+        optimizer = optimizer_cls(
             self.unet.parameters(),
             lr=float(self.training_cfg.get("learning_rate", 1e-4)),
             betas=(
