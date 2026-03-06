@@ -129,6 +129,7 @@ class VAELightningModule(pl.LightningModule):
             "lr_warmup_steps": gen_opt_cfg.get("lr_warmup_steps", 500),
             "lr_num_cycles": gen_opt_cfg.get("lr_num_cycles", 1),
             "lr_power": gen_opt_cfg.get("lr_power", 1.0),
+            "use_8bit_adam": gen_opt_cfg.get("use_8bit_adam", False),
         }
 
         # Discriminator optimizer config
@@ -143,6 +144,7 @@ class VAELightningModule(pl.LightningModule):
             "lr_warmup_steps": disc_opt_cfg.get("lr_warmup_steps", 500),
             "lr_num_cycles": disc_opt_cfg.get("lr_num_cycles", 1),
             "lr_power": disc_opt_cfg.get("lr_power", 1.0),
+            "use_8bit_adam": disc_opt_cfg.get("use_8bit_adam", False),
         }
 
         # Keep top-level attributes for backward compatibility with training_step logging
@@ -685,6 +687,7 @@ class VAELightningModule(pl.LightningModule):
                 - adam_beta2: Beta2 for Adam-family optimizers.
                 - weight_decay: Weight decay coefficient.
                 - momentum: Momentum for SGD (default 0.9).
+                - use_8bit_adam: Whether to use bitsandbytes 8-bit Adam/AdamW.
 
         Returns:
             Configured optimizer instance.
@@ -696,6 +699,24 @@ class VAELightningModule(pl.LightningModule):
         lr = opt_config["learning_rate"]
         betas = (opt_config.get("adam_beta1", 0.9), opt_config.get("adam_beta2", 0.999))
         weight_decay = opt_config.get("weight_decay", 0.01)
+        use_8bit_adam = opt_config.get("use_8bit_adam", False)
+
+        if use_8bit_adam:
+            try:
+                import bitsandbytes as bnb
+            except ImportError:
+                raise ImportError(
+                    "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
+                )
+
+            if opt_type == "adamw":
+                return bnb.optim.AdamW8bit(params, lr=lr, betas=betas, weight_decay=weight_decay)
+            elif opt_type == "adam":
+                return bnb.optim.Adam8bit(params, lr=lr, betas=betas, weight_decay=weight_decay)
+            else:
+                raise ValueError(
+                    f"8-bit Adam is only supported for 'AdamW' and 'Adam', got: {opt_type}."
+                )
 
         if opt_type == "adamw":
             return torch.optim.AdamW(params, lr=lr, betas=betas, weight_decay=weight_decay)
