@@ -29,6 +29,7 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
     LearningRateMonitor,
+    EarlyStopping,
     RichProgressBar,
 )
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -237,6 +238,16 @@ def main():
         # Progress bar
         RichProgressBar(),
     ]
+
+    # Optional early stopping
+    if checkpoint_config.get("early_stopping", False):
+        callbacks.append(
+            EarlyStopping(
+                monitor=checkpoint_config.get("monitor", "val/rec_loss"),
+                patience=checkpoint_config.get("patience", 10),
+                mode=checkpoint_config.get("mode", "min"),
+            )
+        )
 
     # Create trainer
     # NOTE: accumulate_grad_batches is set to 1 because we handle gradient accumulation
