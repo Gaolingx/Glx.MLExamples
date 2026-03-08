@@ -9,11 +9,9 @@ import json
 
 import torch
 import torch.nn.functional as F
-from diffusers.optimization import get_scheduler
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint, EarlyStopping
 from pytorch_lightning.utilities.types import STEP_OUTPUT
-from torch.optim.lr_scheduler import LambdaLR
 import torchvision
 
 
@@ -137,6 +135,7 @@ class VAELoggingCallback(Callback):
         if (
                 self.log_to_tensorboard
                 and trainer.logger is not None
+                and trainer.is_global_zero
                 and trainer.global_step % self.log_images_every_n_steps == 0
                 and isinstance(batch, dict)
                 and "pixel_values" in batch
@@ -202,18 +201,21 @@ class VAELoggingCallback(Callback):
             pl_module.log("val/rfid", rfid_score, on_epoch=True, prog_bar=True, sync_dist=True)
             pl_module.rfid_metric.reset()
 
-        if not self.log_to_tensorboard or trainer.logger is None or len(self._val_outputs) == 0:
-            return
+        if (
+                self.log_to_tensorboard
+                and trainer.logger is not None
+                and trainer.is_global_zero
+                and len(self._val_outputs) > 0
+        ):
+            targets = torch.cat([out["targets"] for out in self._val_outputs], dim=0)
+            reconstructions = torch.cat([out["reconstructions"] for out in self._val_outputs], dim=0)
+            latent = torch.cat([out["latent"] for out in self._val_outputs], dim=0)
 
-        targets = torch.cat([out["targets"] for out in self._val_outputs], dim=0)
-        reconstructions = torch.cat([out["reconstructions"] for out in self._val_outputs], dim=0)
-        latent = torch.cat([out["latent"] for out in self._val_outputs], dim=0)
-
-        n = min(self.num_val_images, targets.shape[0])
-        targets = targets[:n]
-        reconstructions = reconstructions[:n]
-        latent = latent[:n]
-        self._log_images(trainer.logger, targets, reconstructions, latent, "val", trainer.global_step)
+            n = min(self.num_val_images, targets.shape[0])
+            targets = targets[:n]
+            reconstructions = reconstructions[:n]
+            latent = latent[:n]
+            self._log_images(trainer.logger, targets, reconstructions, latent, "val", trainer.global_step)
 
 
 class VAECheckpointCallback(ModelCheckpoint):
@@ -285,29 +287,52 @@ class LRandSchedulerOverrideCallback(Callback):
         self.verbose = verbose
         self.applied = False
 
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"[LRandSchedulerOverrideCallback] {msg}")
+
     def _is_resume_run(self, trainer: pl.Trainer) -> bool:
         return bool(getattr(trainer, "ckpt_path", None))
 
+    @staticmethod
+    def _compute_total_steps(trainer: pl.Trainer) -> int:
+        estimated_steps = trainer.estimated_stepping_batches
+        if estimated_steps is None:
+            raise ValueError("trainer.estimated_stepping_batches is None; cannot rebuild LR scheduler.")
+        return max(1, int(estimated_steps))
+
+    @staticmethod
+    def _iter_scheduler_configs_for_optimizer(
+            trainer: pl.Trainer,
+            optimizer: torch.optim.Optimizer,
+    ):
+        for scheduler_config in trainer.lr_scheduler_configs:
+            scheduler = scheduler_config.scheduler
+            if getattr(scheduler, "optimizer", None) is optimizer:
+                yield scheduler_config
+
     def _override_optimizer_lr(
             self,
+            trainer: pl.Trainer,
             optimizer: torch.optim.Optimizer,
             opt_config: Dict[str, Any],
             optimizer_name: str,
-            trainer: pl.Trainer,
     ) -> None:
         target_lr = float(opt_config.get("learning_rate", 1e-4))
+
         for group in optimizer.param_groups:
             group["lr"] = target_lr
             group["initial_lr"] = target_lr
 
-        if trainer.is_global_zero and self.verbose:
-            print(f"[LRandSchedulerOverrideCallback] Reset {optimizer_name} optimizer LR to {target_lr}.")
+        for scheduler_config in self._iter_scheduler_configs_for_optimizer(trainer, optimizer):
+            scheduler = scheduler_config.scheduler
+            if hasattr(scheduler, "base_lrs"):
+                scheduler.base_lrs = [target_lr for _ in optimizer.param_groups]
+            if hasattr(scheduler, "_last_lr"):
+                scheduler._last_lr = [target_lr for _ in optimizer.param_groups]
 
-    @staticmethod
-    def _compute_total_steps(trainer: pl.Trainer, pl_module: pl.LightningModule) -> int:
-        estimated_steps = trainer.estimated_stepping_batches
-        accumulate_grad_batches = max(1, int(getattr(pl_module, "accumulate_grad_batches", 1)))
-        return max(1, int((estimated_steps + accumulate_grad_batches - 1) // accumulate_grad_batches))
+        if trainer.is_global_zero:
+            self._log(f"Override {optimizer_name} optimizer LR to {target_lr}.")
 
     def _reset_scheduler(
             self,
@@ -319,30 +344,21 @@ class LRandSchedulerOverrideCallback(Callback):
             scheduler_name: str,
             total_steps: int,
     ) -> None:
-        scheduler_type = opt_config.get("lr_scheduler", "constant_with_warmup")
-        warmup_steps = min(int(opt_config.get("lr_warmup_steps", 500)), total_steps)
-        num_cycles = opt_config.get("lr_num_cycles", 1)
-        power = opt_config.get("lr_power", 1.0)
-        step_rules = opt_config.get("lr_step_rules", None)
-
-        new_scheduler = get_scheduler(
-            name=scheduler_type,
+        new_scheduler = pl_module._build_scheduler(
             optimizer=optimizer,
-            step_rules=step_rules,
-            num_warmup_steps=warmup_steps,
+            opt_config=opt_config,
             num_training_steps=max(1, total_steps),
-            num_cycles=num_cycles,
-            power=power,
             last_epoch=-1,
         )
 
         if scheduler_idx < len(trainer.lr_scheduler_configs):
             trainer.lr_scheduler_configs[scheduler_idx].scheduler = new_scheduler
 
-        if trainer.is_global_zero and self.verbose:
-            print(
-                "[LRandSchedulerOverrideCallback] Reset scheduler state "
-                f"for {scheduler_name} (type={scheduler_type}, warmup={warmup_steps}, total_steps={total_steps})."
+        if trainer.is_global_zero:
+            scheduler_type = opt_config.get("lr_scheduler", "constant_with_warmup")
+            self._log(
+                f"Reset scheduler for {scheduler_name} "
+                f"(type={scheduler_type}, total_steps={total_steps})."
             )
 
     def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
@@ -358,11 +374,11 @@ class LRandSchedulerOverrideCallback(Callback):
         if not trainer.optimizers:
             return
 
-        total_steps = self._compute_total_steps(trainer, pl_module)
+        total_steps = self._compute_total_steps(trainer)
 
         if len(trainer.optimizers) >= 1 and self.gen_opt_config:
             if self.override_lr_on_resume:
-                self._override_optimizer_lr(trainer.optimizers[0], self.gen_opt_config, "generator", trainer)
+                self._override_optimizer_lr(trainer, trainer.optimizers[0], self.gen_opt_config, "generator")
             if self.reset_scheduler_on_resume and trainer.lr_scheduler_configs:
                 self._reset_scheduler(
                     trainer,
@@ -381,7 +397,7 @@ class LRandSchedulerOverrideCallback(Callback):
                 disc_total_steps = max(1, total_steps - disc_start_step)
 
             if self.override_lr_on_resume:
-                self._override_optimizer_lr(trainer.optimizers[1], self.disc_opt_config, "discriminator", trainer)
+                self._override_optimizer_lr(trainer, trainer.optimizers[1], self.disc_opt_config, "discriminator")
             if self.reset_scheduler_on_resume and len(trainer.lr_scheduler_configs) >= 2:
                 self._reset_scheduler(
                     trainer,
@@ -391,6 +407,14 @@ class LRandSchedulerOverrideCallback(Callback):
                     scheduler_idx=1,
                     scheduler_name="discriminator",
                     total_steps=disc_total_steps,
+                )
+
+        if self.override_lr_on_resume:
+            if hasattr(pl_module, "learning_rate") and self.gen_opt_config:
+                pl_module.learning_rate = float(self.gen_opt_config.get("learning_rate", pl_module.learning_rate))
+            if hasattr(pl_module, "disc_learning_rate") and self.disc_opt_config:
+                pl_module.disc_learning_rate = float(
+                    self.disc_opt_config.get("learning_rate", pl_module.disc_learning_rate)
                 )
 
         self.applied = True

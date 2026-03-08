@@ -37,6 +37,14 @@
             "lr_power": 1.0
         }
     },
+    "distributed": {
+        "accelerator": "gpu",
+        "devices": 1,
+        "strategy": "auto",
+        "sync_batchnorm": false,
+        "find_unused_parameters": false,
+        "gradient_as_bucket_view": true
+    },
     "discriminator": {
         "input_nc": 3,
         "ndf": 64,
