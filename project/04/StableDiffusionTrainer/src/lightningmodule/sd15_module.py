@@ -53,8 +53,6 @@ class StableDiffusionLightningModule(pl.LightningModule):
         # Runtime metric cache for callback-side unified stdout logging.
         self.runtime_log_dict: Dict[str, float] = {}
 
-        self.automatic_optimization = not bool(self.training_cfg.get("manual_optimization", False))
-
         if bool(self.training_cfg.get("gradient_checkpointing", False)):
             self.unet.enable_gradient_checkpointing()
 
@@ -123,38 +121,14 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
         return F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        train_metrics: Dict[str, torch.Tensor] = {}
-
-        if self.automatic_optimization:
-            loss = self._compute_loss(batch)
-            lr = self.trainer.optimizers[0].param_groups[0]["lr"]
-            train_metrics["train/loss"] = loss
-            train_metrics["train/lr"] = lr
-
-            return {
-                "loss": loss,
-                "train_metrics": train_metrics,
-            }
-
-        optimizer = self.optimizers()
-        scheduler = self.lr_schedulers()
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, Any]:
         loss = self._compute_loss(batch)
+        train_metrics: Dict[str, Any] = {
+            "train/loss": loss.detach(),
+        }
 
-        optimizer.zero_grad(set_to_none=True)
-        self.manual_backward(loss)
-        self.clip_gradients(
-            optimizer,
-            gradient_clip_val=float(self.training_cfg.get("max_grad_norm", 1.0)),
-            gradient_clip_algorithm="norm",
-        )
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
-
-        lr = optimizer.param_groups[0]["lr"]
-        train_metrics["train/loss"] = loss
-        train_metrics["train/lr"] = lr
+        if self.trainer.optimizers:
+            train_metrics["train/lr"] = float(self.trainer.optimizers[0].param_groups[0]["lr"])
 
         return {
             "loss": loss,

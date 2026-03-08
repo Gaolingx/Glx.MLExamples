@@ -172,6 +172,16 @@ class LoggingCallback(Callback):
         super().__init__()
         self.log_every_n_steps = max(1, int(log_every_n_steps))
 
+    @staticmethod
+    def _format_metric_value(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            if value.numel() != 1:
+                return None
+            return float(value.detach().float().cpu().item())
+        return float(value)
+
     def on_train_batch_end(
         self,
         trainer: Trainer,
@@ -192,12 +202,7 @@ class LoggingCallback(Callback):
             return
 
         for key, value in metrics.items():
-            if value is None:
-                continue
-            if torch.is_tensor(value):
-                metric_value = value.detach()
-            else:
-                metric_value = float(value)
+            metric_value = self._format_metric_value(value)
             pl_module.log(key, metric_value, on_step=True, on_epoch=False, prog_bar=True)
 
 

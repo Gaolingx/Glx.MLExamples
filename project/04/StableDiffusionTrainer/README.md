@@ -94,7 +94,6 @@ StableDiffusionTrainer/
 - 支持 `epsilon` / `v_prediction` 目标
 - 支持 mixed precision（配置项 `training.precision`）
 - 支持梯度检查点（`gradient_checkpointing`）
-- 支持自动/手动优化流程切换（`manual_optimization`）
 
 ### 4.2 工程能力
 

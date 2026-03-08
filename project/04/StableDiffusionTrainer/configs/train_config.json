@@ -34,8 +34,7 @@
     "num_train_timesteps": 1000,
     "prediction_type": "epsilon",
     "gradient_checkpointing": false,
-    "enable_xformers_memory_efficient_attention": false,
-    "manual_optimization": false
+    "enable_xformers_memory_efficient_attention": false
   },
   "validation": {
     "enabled": true,
