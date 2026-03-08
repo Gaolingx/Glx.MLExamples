@@ -9,6 +9,7 @@ import json
 
 import torch
 import torch.nn.functional as F
+from diffusers.optimization import get_scheduler
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint, EarlyStopping
 from pytorch_lightning.utilities.types import STEP_OUTPUT
@@ -39,6 +40,16 @@ class VAELoggingCallback(Callback):
         self.log_images_every_n_steps = log_images_every_n_steps
         self._train_epoch_metrics: Dict[str, List[torch.Tensor]] = {}
         self._val_outputs: List[Dict[str, torch.Tensor]] = []
+
+    @staticmethod
+    def _format_metric_value(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            if value.numel() != 1:
+                return None
+            return float(value.detach().float().cpu().item())
+        return float(value)
 
     def _visualize_latent(
             self,
@@ -109,12 +120,15 @@ class VAELoggingCallback(Callback):
             return
 
         for key, value in metrics.items():
-            if isinstance(value, torch.Tensor):
-                metric_value = value.detach()
-            else:
-                metric_value = torch.tensor(float(value), device=pl_module.device)
-
-            pl_module.log(f"train/{key}", metric_value, on_step=True, on_epoch=False, prog_bar=True)
+            metric_value = self._format_metric_value(value)
+            pl_module.log(
+                f"train/{key}",
+                metric_value,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=True,
+                sync_dist=True,
+            )
 
             if key not in self._train_epoch_metrics:
                 self._train_epoch_metrics[key] = []
@@ -140,7 +154,14 @@ class VAELoggingCallback(Callback):
             if len(values) == 0:
                 continue
             mean_value = torch.stack(values).mean()
-            pl_module.log(f"epoch/{key}", mean_value, on_step=False, on_epoch=True, prog_bar=False)
+            pl_module.log(
+                f"epoch/{key}",
+                mean_value,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                sync_dist=True,
+            )
         self._train_epoch_metrics = {}
 
     def on_validation_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
@@ -161,11 +182,15 @@ class VAELoggingCallback(Callback):
         metrics = outputs.get("val_metrics", {})
         if isinstance(metrics, dict):
             for key, value in metrics.items():
-                if isinstance(value, torch.Tensor):
-                    metric_value = value.detach()
-                else:
-                    metric_value = torch.tensor(float(value), device=pl_module.device)
-                pl_module.log(f"val/{key}", metric_value, on_step=False, on_epoch=True, prog_bar=True)
+                metric_value = self._format_metric_value(value)
+                pl_module.log(
+                    f"val/{key}",
+                    metric_value,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=True,
+                    sync_dist=True,
+                )
 
         visuals = outputs.get("val_visuals")
         if isinstance(visuals, dict) and len(self._val_outputs) < self.num_val_images:
@@ -174,7 +199,7 @@ class VAELoggingCallback(Callback):
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if hasattr(pl_module, "rfid_metric"):
             rfid_score = pl_module.rfid_metric.compute()
-            pl_module.log("val/rfid", rfid_score, on_epoch=True, prog_bar=True)
+            pl_module.log("val/rfid", rfid_score, on_epoch=True, prog_bar=True, sync_dist=True)
             pl_module.rfid_metric.reset()
 
         if not self.log_to_tensorboard or trainer.logger is None or len(self._val_outputs) == 0:
@@ -242,278 +267,133 @@ class VAECheckpointCallback(ModelCheckpoint):
 
 
 class LRandSchedulerOverrideCallback(Callback):
-    """
-    Override LR and/or reset scheduler state when resuming from checkpoint.
-
-    Supports:
-    1) Override LR only, keep scheduler progress
-    2) Override LR + reset scheduler (restart warmup/progress)
-    3) Reset scheduler only
-
-    Notes:
-    - Designed for diffusers.optimization.get_scheduler (typically LambdaLR),
-      but includes fallbacks for non-Lambda schedulers.
-    """
+    """Override optimizer LR and optionally rebuild schedulers when resuming from a checkpoint."""
 
     def __init__(
             self,
-            override_lr_on_resume: bool = True,
+            override_lr_on_resume: bool = False,
             reset_scheduler_on_resume: bool = False,
             gen_opt_config: Optional[Dict[str, Any]] = None,
             disc_opt_config: Optional[Dict[str, Any]] = None,
             verbose: bool = True,
-    ):
+    ) -> None:
         super().__init__()
         self.override_lr_on_resume = override_lr_on_resume
         self.reset_scheduler_on_resume = reset_scheduler_on_resume
         self.gen_opt_config = gen_opt_config or {}
         self.disc_opt_config = disc_opt_config or {}
         self.verbose = verbose
+        self.applied = False
 
-    # ----------------------------
-    # Public hook
-    # ----------------------------
-    def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        if not self._is_resuming(trainer):
-            self._log("Starting fresh training, no LR/scheduler override applied.")
+    def _is_resume_run(self, trainer: pl.Trainer) -> bool:
+        return bool(getattr(trainer, "ckpt_path", None))
+
+    def _override_optimizer_lr(
+            self,
+            optimizer: torch.optim.Optimizer,
+            opt_config: Dict[str, Any],
+            optimizer_name: str,
+            trainer: pl.Trainer,
+    ) -> None:
+        target_lr = float(opt_config.get("learning_rate", 1e-4))
+        for group in optimizer.param_groups:
+            group["lr"] = target_lr
+            group["initial_lr"] = target_lr
+
+        if trainer.is_global_zero and self.verbose:
+            print(f"[LRandSchedulerOverrideCallback] Reset {optimizer_name} optimizer LR to {target_lr}.")
+
+    @staticmethod
+    def _compute_total_steps(trainer: pl.Trainer, pl_module: pl.LightningModule) -> int:
+        estimated_steps = trainer.estimated_stepping_batches
+        accumulate_grad_batches = max(1, int(getattr(pl_module, "accumulate_grad_batches", 1)))
+        return max(1, int((estimated_steps + accumulate_grad_batches - 1) // accumulate_grad_batches))
+
+    def _reset_scheduler(
+            self,
+            trainer: pl.Trainer,
+            pl_module: pl.LightningModule,
+            optimizer: torch.optim.Optimizer,
+            opt_config: Dict[str, Any],
+            scheduler_idx: int,
+            scheduler_name: str,
+            total_steps: int,
+    ) -> None:
+        scheduler_type = opt_config.get("lr_scheduler", "constant_with_warmup")
+        warmup_steps = min(int(opt_config.get("lr_warmup_steps", 500)), total_steps)
+        num_cycles = opt_config.get("lr_num_cycles", 1)
+        power = opt_config.get("lr_power", 1.0)
+        step_rules = opt_config.get("lr_step_rules", None)
+
+        new_scheduler = get_scheduler(
+            name=scheduler_type,
+            optimizer=optimizer,
+            step_rules=step_rules,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=max(1, total_steps),
+            num_cycles=num_cycles,
+            power=power,
+            last_epoch=-1,
+        )
+
+        if scheduler_idx < len(trainer.lr_scheduler_configs):
+            trainer.lr_scheduler_configs[scheduler_idx].scheduler = new_scheduler
+
+        if trainer.is_global_zero and self.verbose:
+            print(
+                "[LRandSchedulerOverrideCallback] Reset scheduler state "
+                f"for {scheduler_name} (type={scheduler_type}, warmup={warmup_steps}, total_steps={total_steps})."
+            )
+
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if self.applied:
+            return
+
+        if not self._is_resume_run(trainer):
             return
 
         if not self.override_lr_on_resume and not self.reset_scheduler_on_resume:
-            self._log("Resuming from checkpoint, but both override/reset are disabled.")
             return
 
-        self._log(f"Resuming from checkpoint: {trainer.ckpt_path}")
-
-        optimizers = self._as_list(getattr(trainer, "optimizers", []))
-        scheduler_configs = self._as_list(getattr(trainer, "lr_scheduler_configs", []))
-        schedulers = [
-            cfg.scheduler for cfg in scheduler_configs
-            if hasattr(cfg, "scheduler")
-        ]
-
-        role_configs: List[Tuple[str, Dict[str, Any]]] = [
-            ("VAE", self.gen_opt_config),
-            ("Discriminator", self.disc_opt_config),
-        ]
-
-        num_slots = max(len(optimizers), len(schedulers), len(role_configs))
-        for idx in range(num_slots):
-            name, opt_cfg = role_configs[idx] if idx < len(role_configs) else (f"Optimizer_{idx}", {})
-            optimizer = optimizers[idx] if idx < len(optimizers) else None
-            scheduler = schedulers[idx] if idx < len(schedulers) else None
-            target_lr = opt_cfg.get("learning_rate")
-
-            self._process_one(name, optimizer, scheduler, target_lr)
-
-    # ----------------------------
-    # Core per-optimizer logic
-    # ----------------------------
-    def _process_one(
-            self,
-            name: str,
-            optimizer: Optional[torch.optim.Optimizer],
-            scheduler: Optional[Any],
-            target_lr: Optional[float],
-    ) -> None:
-        if optimizer is None:
-            self._log(f"{name}: optimizer not found, skip.")
+        if not trainer.optimizers:
             return
 
-        # 1) Reset scheduler state if requested
-        if self.reset_scheduler_on_resume and scheduler is not None:
-            self._reset_scheduler_state(name, scheduler)
+        total_steps = self._compute_total_steps(trainer, pl_module)
 
-        # 2) Override LR if requested
-        if self.override_lr_on_resume and target_lr is not None:
-            self._override_optimizer_and_scheduler_lr(
-                name=name,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                new_lr=float(target_lr),
-                reset_mode=self.reset_scheduler_on_resume,
-            )
-            return
-
-        # 3) Reset-only (no LR override): re-derive current lr from reset scheduler
-        if self.reset_scheduler_on_resume and scheduler is not None:
-            reset_lrs = self._compute_reset_current_lrs(scheduler, optimizer)
-            self._apply_optimizer_lrs(optimizer, reset_lrs)
-            self._set_scheduler_last_lrs(scheduler, reset_lrs)
-            self._step_scheduler_to_epoch_zero(name, scheduler)
-            self._log(f"{name}: scheduler reset only, synced optimizer lr -> {reset_lrs}")
-
-    def _override_optimizer_and_scheduler_lr(
-            self,
-            name: str,
-            optimizer: torch.optim.Optimizer,
-            scheduler: Optional[Any],
-            new_lr: float,
-            reset_mode: bool,
-    ) -> None:
-        n_groups = len(optimizer.param_groups)
-        new_base_lrs = [new_lr] * n_groups
-
-        old_current_lrs = [float(pg.get("lr", 0.0)) for pg in optimizer.param_groups]
-
-        if scheduler is not None:
-            old_base_lrs = self._get_base_lrs(scheduler, optimizer)
-
-            if reset_mode:
-                multipliers = self._get_reset_multipliers(scheduler, n_groups)
-            else:
-                multipliers = self._compute_progress_multipliers(
-                    old_current_lrs=old_current_lrs,
-                    old_base_lrs=old_base_lrs,
-                    n_groups=n_groups,
+        if len(trainer.optimizers) >= 1 and self.gen_opt_config:
+            if self.override_lr_on_resume:
+                self._override_optimizer_lr(trainer.optimizers[0], self.gen_opt_config, "generator", trainer)
+            if self.reset_scheduler_on_resume and trainer.lr_scheduler_configs:
+                self._reset_scheduler(
+                    trainer,
+                    pl_module,
+                    trainer.optimizers[0],
+                    self.gen_opt_config,
+                    scheduler_idx=0,
+                    scheduler_name="generator",
+                    total_steps=total_steps,
                 )
 
-            self._set_scheduler_base_lrs(scheduler, new_base_lrs)
-        else:
-            multipliers = [1.0] * n_groups
+        if len(trainer.optimizers) >= 2 and self.disc_opt_config:
+            disc_total_steps = total_steps
+            if getattr(pl_module, "use_discriminator", False):
+                disc_start_step = int(getattr(pl_module, "disc_start_step", 0))
+                disc_total_steps = max(1, total_steps - disc_start_step)
 
-        new_current_lrs = [b * m for b, m in zip(new_base_lrs, multipliers)]
+            if self.override_lr_on_resume:
+                self._override_optimizer_lr(trainer.optimizers[1], self.disc_opt_config, "discriminator", trainer)
+            if self.reset_scheduler_on_resume and len(trainer.lr_scheduler_configs) >= 2:
+                self._reset_scheduler(
+                    trainer,
+                    pl_module,
+                    trainer.optimizers[1],
+                    self.disc_opt_config,
+                    scheduler_idx=1,
+                    scheduler_name="discriminator",
+                    total_steps=disc_total_steps,
+                )
 
-        # Apply to optimizer param groups
-        for pg, base_lr, cur_lr in zip(optimizer.param_groups, new_base_lrs, new_current_lrs):
-            pg["initial_lr"] = float(base_lr)
-            pg["lr"] = float(cur_lr)
-
-        # Sync scheduler internal bookkeeping
-        if scheduler is not None:
-            self._set_scheduler_last_lrs(scheduler, new_current_lrs)
-            if reset_mode:
-                self._step_scheduler_to_epoch_zero(name, scheduler)
-
-        self._log(
-            f"{name}: override lr -> base={new_lr:.3e}, "
-            f"current={new_current_lrs}, reset_mode={reset_mode}"
-        )
-
-    # ----------------------------
-    # Scheduler state helpers
-    # ----------------------------
-    def _reset_scheduler_state(self, name: str, scheduler: Any) -> None:
-        """Reset scheduler progress counters back to initial state."""
-        old_last_epoch = getattr(scheduler, "last_epoch", None)
-
-        if hasattr(scheduler, "last_epoch"):
-            scheduler.last_epoch = -1
-        if hasattr(scheduler, "_step_count"):
-            scheduler._step_count = 0
-        if hasattr(scheduler, "_get_lr_called_within_step"):
-            scheduler._get_lr_called_within_step = False
-
-        self._log(
-            f"{name}: reset scheduler {type(scheduler).__name__} "
-            f"(last_epoch: {old_last_epoch} -> -1)"
-        )
-
-    def _step_scheduler_to_epoch_zero(self, name: str, scheduler: Any) -> None:
-        try:
-            scheduler.step()
-            self._log(
-                f"{name}: stepped scheduler to epoch 0 "
-                f"(last_epoch={getattr(scheduler, 'last_epoch', '?')})"
-            )
-        except Exception as e:
-            self._log(f"{name}: failed to step scheduler to epoch 0: {e}")
-
-    def _compute_reset_current_lrs(
-            self,
-            scheduler: Any,
-            optimizer: torch.optim.Optimizer,
-    ) -> List[float]:
-        base_lrs = self._get_base_lrs(scheduler, optimizer)
-        multipliers = self._get_reset_multipliers(scheduler, len(base_lrs))
-        return [b * m for b, m in zip(base_lrs, multipliers)]
-
-    def _get_reset_multipliers(self, scheduler: Any, n_groups: int) -> List[float]:
-        """Compute the LR multiplier at step 0 (post-reset)."""
-        if isinstance(scheduler, LambdaLR) and hasattr(scheduler, "lr_lambdas"):
-            vals = []
-            for fn in scheduler.lr_lambdas:
-                try:
-                    vals.append(float(fn(0)))
-                except Exception:
-                    vals.append(1.0)
-            return self._match_len(vals, n_groups, fill=1.0)
-
-        return [1.0] * n_groups
-
-    def _compute_progress_multipliers(
-            self,
-            old_current_lrs: List[float],
-            old_base_lrs: List[float],
-            n_groups: int,
-    ) -> List[float]:
-        cur = self._match_len(old_current_lrs, n_groups, fill=0.0)
-        base = self._match_len(old_base_lrs, n_groups, fill=0.0)
-
-        multipliers = []
-        eps = 1e-12
-        for c, b in zip(cur, base):
-            if abs(b) < eps:
-                multipliers.append(1.0)
-            else:
-                multipliers.append(float(c / b))
-        return multipliers
-
-    def _get_base_lrs(
-            self,
-            scheduler: Optional[Any],
-            optimizer: torch.optim.Optimizer,
-    ) -> List[float]:
-        if scheduler is not None and hasattr(scheduler, "base_lrs"):
-            base = list(scheduler.base_lrs)
-            return self._match_len(base, len(optimizer.param_groups), fill=base[-1] if len(base) > 0 else 0.0)
-
-        vals = []
-        for pg in optimizer.param_groups:
-            vals.append(float(pg.get("initial_lr", pg.get("lr", 0.0))))
-        return vals
-
-    def _set_scheduler_base_lrs(self, scheduler: Any, base_lrs: List[float]) -> None:
-        if hasattr(scheduler, "base_lrs"):
-            scheduler.base_lrs = list(base_lrs)
-
-    def _set_scheduler_last_lrs(self, scheduler: Any, lrs: List[float]) -> None:
-        if hasattr(scheduler, "_last_lr"):
-            scheduler._last_lr = list(lrs)
-
-    def _apply_optimizer_lrs(
-            self,
-            optimizer: torch.optim.Optimizer,
-            lrs: List[float],
-    ) -> None:
-        for pg, lr in zip(optimizer.param_groups, lrs):
-            pg["lr"] = float(lr)
-
-    # ----------------------------
-    # Utility helpers
-    # ----------------------------
-    @staticmethod
-    def _as_list(x: Any) -> List[Any]:
-        if x is None:
-            return []
-        if isinstance(x, list):
-            return x
-        return [x]
-
-    @staticmethod
-    def _match_len(values: List[float], n: int, fill: float = 0.0) -> List[float]:
-        if len(values) >= n:
-            return values[:n]
-        if len(values) == 0:
-            return [fill] * n
-        return values + [values[-1]] * (n - len(values))
-
-    @staticmethod
-    def _is_resuming(trainer: pl.Trainer) -> bool:
-        return getattr(trainer, "ckpt_path", None) is not None
-
-    def _log(self, msg: str) -> None:
-        if self.verbose:
-            print(f"[LRandSchedulerOverrideCallback] {msg}")
+        self.applied = True
 
 
 class NaNLossCallback(Callback):

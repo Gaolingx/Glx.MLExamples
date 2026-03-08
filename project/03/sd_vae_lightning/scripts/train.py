@@ -19,7 +19,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -33,6 +33,8 @@ from pytorch_lightning.callbacks import (
     RichProgressBar,
 )
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.strategies import DDPStrategy
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
 
 from src.lightning.vae_module import VAELightningModule
 from src.data.dataset import VAEDataModule
@@ -41,7 +43,6 @@ from src.utils.callbacks import (
     VAECheckpointCallback,
     LRandSchedulerOverrideCallback,
     NaNLossCallback,
-    OptionalEarlyStopping,
 )
 
 
@@ -137,6 +138,52 @@ def find_resume_checkpoint(resume_arg: str, default_ckpt_dir: str) -> Optional[s
     return None
 
 
+def build_trainer_kwargs(config: dict, args: argparse.Namespace) -> Dict[str, Any]:
+    """Build Trainer kwargs with optional DDP/multi-GPU support."""
+    train_config = config.get("training", {})
+    distributed_config = config.get("distributed", {})
+
+    accelerator = distributed_config.get("accelerator", "auto")
+    devices: Union[str, int, list] = distributed_config.get("devices", "auto")
+    strategy: Union[str, DDPStrategy] = distributed_config.get("strategy", "auto")
+
+    if args.gpus is not None:
+        accelerator = "gpu"
+        devices = args.gpus
+    elif accelerator == "gpu" and devices == "auto" and torch.cuda.is_available():
+        devices = torch.cuda.device_count()
+
+    if isinstance(strategy, str) and strategy.lower() == "ddp":
+        strategy = DDPStrategy(
+            find_unused_parameters=distributed_config.get("find_unused_parameters", False),
+            gradient_as_bucket_view=distributed_config.get("gradient_as_bucket_view", True),
+        )
+
+    trainer_kwargs = {
+        "accelerator": accelerator,
+        "devices": devices,
+        "strategy": strategy,
+    }
+
+    if distributed_config.get("sync_batchnorm", False):
+        trainer_kwargs["sync_batchnorm"] = True
+
+    return trainer_kwargs
+
+
+@rank_zero_only
+def rank_zero_print(message: str) -> None:
+    """Print only on global rank zero to avoid duplicated logs in DDP."""
+    print(message)
+
+
+@rank_zero_only
+def save_runtime_config(config: dict, config_save_path: str) -> None:
+    """Persist merged runtime config only once in distributed training."""
+    with open(config_save_path, "w") as f:
+        json.dump(config, f, indent=2)
+
+
 def main():
     """Main training function."""
     args = parse_args()
@@ -167,10 +214,9 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Save config
+    # Save config only once to avoid duplicated writes in DDP
     config_save_path = os.path.join(output_dir, "config.json")
-    with open(config_save_path, "w") as f:
-        json.dump(config, f, indent=2)
+    save_runtime_config(config, config_save_path)
 
     # Create data module
     data_module = VAEDataModule(config)
@@ -222,18 +268,11 @@ def main():
         ),
         # LR and Scheduler Override callback for resume
         LRandSchedulerOverrideCallback(
-            override_lr_on_resume=train_config_section.get("override_lr_on_resume", True),
+            override_lr_on_resume=train_config_section.get("override_lr_on_resume", False),
             reset_scheduler_on_resume=train_config_section.get("reset_scheduler_on_resume", False),
             gen_opt_config=gen_opt_cfg,
             disc_opt_config=disc_opt_cfg,
             verbose=True,
-        ),
-        # Optional Early Stopping
-        OptionalEarlyStopping(
-            enabled=checkpoint_config.get("early_stopping", False),
-            monitor=checkpoint_config.get("monitor", "val/rec_loss"),
-            patience=checkpoint_config.get("patience", 10),
-            mode=checkpoint_config.get("mode", "min"),
         ),
         # Progress bar
         RichProgressBar(),
@@ -253,11 +292,9 @@ def main():
     # NOTE: accumulate_grad_batches is set to 1 because we handle gradient accumulation
     # manually in VAELightningModule.training_step() for proper alternating training
     # between VAE and Discriminator (following official diffusers implementation)
+    trainer_kwargs = build_trainer_kwargs(config, args)
     trainer = pl.Trainer(
         default_root_dir=output_dir,
-        accelerator="auto",
-        devices="auto",
-        strategy="auto",
         max_epochs=train_config_section.get("num_epochs", 100),
         max_steps=train_config_section.get("max_train_steps", -1),
         precision=train_config_section.get("precision", "16-mixed"),
@@ -268,6 +305,7 @@ def main():
         callbacks=callbacks,
         enable_checkpointing=True,
         deterministic=True,
+        **trainer_kwargs,
     )
 
     ckpt_path = None
@@ -275,16 +313,23 @@ def main():
         ckpt_path = find_resume_checkpoint(args.resume_from_checkpoint, checkpoint_dir)
 
     # Train
-    print("=" * 60)
-    print("Starting VAE Training")
-    print(f"  - Gradient accumulation: {train_config_section.get('accumulate_grad_batches', 1)} steps")
-    print(f"  - Override LR on resume: {train_config_section.get('override_lr_on_resume', True)}")
-    print(f"  - Reset scheduler on resume: {train_config_section.get('reset_scheduler_on_resume', False)}")
-    print(f"Output directory: {output_dir}")
-    print(f"Log directory: {log_dir}")
-    print(f"Checkpoint directory: {checkpoint_dir}")
-    print(f"TensorBoard: tensorboard --logdir {log_dir}")
-    print("=" * 60)
+    distributed_config = config.get("distributed", {})
+    requested_devices = args.gpus if args.gpus is not None else distributed_config.get("devices", "auto")
+    requested_strategy = distributed_config.get("strategy", "auto")
+
+    rank_zero_print("=" * 60)
+    rank_zero_print("Starting VAE Training")
+    rank_zero_print(f"  - Gradient accumulation: {train_config_section.get('accumulate_grad_batches', 1)} steps")
+    rank_zero_print(f"  - Override LR on resume: {train_config_section.get('override_lr_on_resume', True)}")
+    rank_zero_print(f"  - Reset scheduler on resume: {train_config_section.get('reset_scheduler_on_resume', False)}")
+    rank_zero_print(f"  - Accelerator: {distributed_config.get('accelerator', 'auto')}")
+    rank_zero_print(f"  - Devices: {requested_devices}")
+    rank_zero_print(f"  - Strategy: {requested_strategy}")
+    rank_zero_print(f"Output directory: {output_dir}")
+    rank_zero_print(f"Log directory: {log_dir}")
+    rank_zero_print(f"Checkpoint directory: {checkpoint_dir}")
+    rank_zero_print(f"TensorBoard: tensorboard --logdir {log_dir}")
+    rank_zero_print("=" * 60)
 
     trainer.fit(model, datamodule=data_module, ckpt_path=ckpt_path)
 
