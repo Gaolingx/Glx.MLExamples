@@ -187,7 +187,7 @@ class VAELoggingCallback(Callback):
                     metric_value,
                     on_step=False,
                     on_epoch=True,
-                    prog_bar=True,
+                    prog_bar=False,
                     sync_dist=True,
                 )
 
@@ -198,7 +198,14 @@ class VAELoggingCallback(Callback):
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if hasattr(pl_module, "rfid_metric"):
             rfid_score = pl_module.rfid_metric.compute()
-            pl_module.log("val/rfid", rfid_score, on_epoch=True, prog_bar=True, sync_dist=True)
+            pl_module.log(
+                "val/rfid",
+                rfid_score,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                sync_dist=True
+            )
             pl_module.rfid_metric.reset()
 
         if (
