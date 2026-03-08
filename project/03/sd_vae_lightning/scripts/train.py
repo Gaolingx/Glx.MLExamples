@@ -19,7 +19,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -138,13 +138,30 @@ def find_resume_checkpoint(resume_arg: str, default_ckpt_dir: str) -> Optional[s
     return None
 
 
+def resolve_parallel_devices(
+        accelerator: str, devices: Union[str, int, List[int]]
+) -> Optional[List[torch.device]]:
+    """Resolve explicit parallel devices for DDPStrategy when GPU ids are provided."""
+    if accelerator != "gpu":
+        return None
+
+    if isinstance(devices, list):
+        gpu_ids = devices
+    elif isinstance(devices, int):
+        gpu_ids = list(range(devices))
+    else:
+        return None
+
+    return [torch.device(f"cuda:{i}") for i in gpu_ids]
+
+
 def build_trainer_kwargs(config: dict, args: argparse.Namespace) -> Dict[str, Any]:
     """Build Trainer kwargs with optional DDP/multi-GPU support."""
     train_config = config.get("training", {})
     distributed_config = config.get("distributed", {})
 
     accelerator = distributed_config.get("accelerator", "auto")
-    devices: Union[str, int, list] = distributed_config.get("devices", "auto")
+    devices: Union[str, int, List[int]] = distributed_config.get("devices", "auto")
     strategy: Union[str, DDPStrategy] = distributed_config.get("strategy", "auto")
 
     if args.gpus is not None:
@@ -154,7 +171,9 @@ def build_trainer_kwargs(config: dict, args: argparse.Namespace) -> Dict[str, An
         devices = torch.cuda.device_count()
 
     if isinstance(strategy, str) and strategy.lower() == "ddp":
+        parallel_devices = resolve_parallel_devices(accelerator, devices)
         strategy = DDPStrategy(
+            parallel_devices=parallel_devices,
             find_unused_parameters=distributed_config.get("find_unused_parameters", False),
             gradient_as_bucket_view=distributed_config.get("gradient_as_bucket_view", True),
         )
