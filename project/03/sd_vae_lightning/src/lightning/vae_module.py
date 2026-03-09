@@ -104,8 +104,8 @@ class VAELightningModule(pl.LightningModule):
         self.perceptual_weight = loss_config.get("perceptual_weight", 0.5)
         if self.perceptual_weight > 0:
             self.perceptual_loss = lpips.LPIPS(net="vgg")
-            self.perceptual_loss.eval()
             self.perceptual_loss.requires_grad_(False)
+            self.perceptual_loss.eval()
         else:
             self.perceptual_loss = None
 
