@@ -34,7 +34,7 @@ from pytorch_lightning.callbacks import (
 )
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.strategies import DDPStrategy
-from pytorch_lightning.utilities.rank_zero import rank_zero_only
+from pytorch_lightning.utilities.rank_zero import rank_zero_only, rank_zero_info
 
 from src.lightning.vae_module import VAELightningModule
 from src.data.dataset import VAEDataModule
@@ -113,13 +113,13 @@ def find_resume_checkpoint(resume_arg: str, default_ckpt_dir: str) -> Optional[s
     if resume_arg.lower() == "last":
         last_ckpt = Path(default_ckpt_dir) / "last.ckpt"
         if last_ckpt.exists():
-            print(f"Resuming from latest checkpoint: {last_ckpt}")
+            rank_zero_info(f"Resuming from latest checkpoint: {last_ckpt}")
             return str(last_ckpt)
         return None
 
     p = Path(resume_arg)
     if p.is_file() and p.suffix == ".ckpt":
-        print(f"Resuming from checkpoint file: {p}")
+        rank_zero_info(f"Resuming from checkpoint file: {p}")
         return str(p)
     if p.is_dir():
         candidates = sorted(
@@ -128,12 +128,12 @@ def find_resume_checkpoint(resume_arg: str, default_ckpt_dir: str) -> Optional[s
             reverse=True,
         )
         if candidates:
-            print(f"Resuming from checkpoint in dir: {candidates[0]}")
+            rank_zero_info(f"Resuming from checkpoint in dir: {candidates[0]}")
             return str(candidates[0])
 
         last_ckpt = p / "last.ckpt"
         if last_ckpt.exists():
-            print(f"Resuming from last checkpoint in dir: {last_ckpt}")
+            rank_zero_info(f"Resuming from last checkpoint in dir: {last_ckpt}")
             return str(last_ckpt)
     return None
 
@@ -188,12 +188,6 @@ def build_trainer_kwargs(config: dict, args: argparse.Namespace) -> Dict[str, An
         trainer_kwargs["sync_batchnorm"] = True
 
     return trainer_kwargs
-
-
-@rank_zero_only
-def rank_zero_print(message: str) -> None:
-    """Print only on global rank zero to avoid duplicated logs in DDP."""
-    print(message)
 
 
 @rank_zero_only
@@ -336,19 +330,19 @@ def main():
     requested_devices = args.gpus if args.gpus is not None else distributed_config.get("devices", "auto")
     requested_strategy = distributed_config.get("strategy", "auto")
 
-    rank_zero_print("=" * 60)
-    rank_zero_print("Starting VAE Training")
-    rank_zero_print(f"  - Gradient accumulation: {train_config_section.get('accumulate_grad_batches', 1)} steps")
-    rank_zero_print(f"  - Override LR on resume: {train_config_section.get('override_lr_on_resume', True)}")
-    rank_zero_print(f"  - Reset scheduler on resume: {train_config_section.get('reset_scheduler_on_resume', False)}")
-    rank_zero_print(f"  - Accelerator: {distributed_config.get('accelerator', 'auto')}")
-    rank_zero_print(f"  - Devices: {requested_devices}")
-    rank_zero_print(f"  - Strategy: {requested_strategy}")
-    rank_zero_print(f"Output directory: {output_dir}")
-    rank_zero_print(f"Log directory: {log_dir}")
-    rank_zero_print(f"Checkpoint directory: {checkpoint_dir}")
-    rank_zero_print(f"TensorBoard: tensorboard --logdir {log_dir}")
-    rank_zero_print("=" * 60)
+    rank_zero_info("=" * 60)
+    rank_zero_info("Starting VAE Training")
+    rank_zero_info(f"  - Gradient accumulation: {train_config_section.get('accumulate_grad_batches', 1)} steps")
+    rank_zero_info(f"  - Override LR on resume: {train_config_section.get('override_lr_on_resume', True)}")
+    rank_zero_info(f"  - Reset scheduler on resume: {train_config_section.get('reset_scheduler_on_resume', False)}")
+    rank_zero_info(f"  - Accelerator: {distributed_config.get('accelerator', 'auto')}")
+    rank_zero_info(f"  - Devices: {requested_devices}")
+    rank_zero_info(f"  - Strategy: {requested_strategy}")
+    rank_zero_info(f"Output directory: {output_dir}")
+    rank_zero_info(f"Log directory: {log_dir}")
+    rank_zero_info(f"Checkpoint directory: {checkpoint_dir}")
+    rank_zero_info(f"TensorBoard: tensorboard --logdir {log_dir}")
+    rank_zero_info("=" * 60)
 
     trainer.fit(model, datamodule=data_module, ckpt_path=ckpt_path)
 

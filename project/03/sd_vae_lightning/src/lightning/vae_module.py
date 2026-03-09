@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.utilities.types import STEP_OUTPUT
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from diffusers import AutoencoderKL
 from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_scheduler
@@ -868,6 +869,7 @@ class VAELightningModule(pl.LightningModule):
             },
         }
 
+    @rank_zero_only
     def save_hf_checkpoint(self, checkpoint_filepath: str) -> None:
         """
         Save HuggingFace format model to directory.
@@ -892,6 +894,7 @@ class VAELightningModule(pl.LightningModule):
         with open(config_path, "w") as f:
             json.dump(self.config, f, indent=2)
 
+    @rank_zero_only
     def save_pretrained(self, save_directory: str) -> None:
         """
         Save model to directory.

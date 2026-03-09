@@ -10,8 +10,9 @@ import json
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback, ModelCheckpoint, EarlyStopping
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from pytorch_lightning.utilities.types import STEP_OUTPUT
+from pytorch_lightning.utilities.rank_zero import rank_zero_info
 import torchvision
 
 
@@ -36,7 +37,6 @@ class VAELoggingCallback(Callback):
         self.num_val_images = num_val_images
         self.log_to_tensorboard = log_to_tensorboard
         self.log_images_every_n_steps = log_images_every_n_steps
-        self._train_epoch_metrics: Dict[str, List[torch.Tensor]] = {}
         self._val_outputs: List[Dict[str, torch.Tensor]] = []
 
     @staticmethod
@@ -99,9 +99,6 @@ class VAELoggingCallback(Callback):
         if hasattr(logger, "experiment"):
             logger.experiment.add_image(f"{prefix}/reconstruction", grid, step)
 
-    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        self._train_epoch_metrics = {}
-
     def on_train_batch_end(
             self,
             trainer: pl.Trainer,
@@ -128,10 +125,6 @@ class VAELoggingCallback(Callback):
                 sync_dist=True,
             )
 
-            if key not in self._train_epoch_metrics:
-                self._train_epoch_metrics[key] = []
-            self._train_epoch_metrics[key].append(metric_value)
-
         if (
                 self.log_to_tensorboard
                 and trainer.logger is not None
@@ -147,21 +140,6 @@ class VAELoggingCallback(Callback):
                 reconstructions = pl_module.vae.decode(latent).sample
 
             self._log_images(trainer.logger, targets, reconstructions, latent, "train", trainer.global_step)
-
-    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        for key, values in self._train_epoch_metrics.items():
-            if len(values) == 0:
-                continue
-            mean_value = torch.stack(values).mean()
-            pl_module.log(
-                f"epoch/{key}",
-                mean_value,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                sync_dist=True,
-            )
-        self._train_epoch_metrics = {}
 
     def on_validation_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         self._val_outputs = []
@@ -269,7 +247,7 @@ class VAECheckpointCallback(ModelCheckpoint):
         """Save checkpoint in both Lightning and HuggingFace formats."""
         super()._save_checkpoint(trainer, filepath)
 
-        if self.save_hf_format and trainer.is_global_zero:
+        if self.save_hf_format:
             # Save HuggingFace format
             hf_dir = Path(filepath).parent / "hf_checkpoint"
             trainer.lightning_module.save_hf_checkpoint(hf_dir)
@@ -296,7 +274,7 @@ class LRandSchedulerOverrideCallback(Callback):
 
     def _log(self, msg: str) -> None:
         if self.verbose:
-            print(f"[LRandSchedulerOverrideCallback] {msg}")
+            rank_zero_info(f"[LRandSchedulerOverrideCallback] {msg}")
 
     def _is_resume_run(self, trainer: pl.Trainer) -> bool:
         return bool(getattr(trainer, "ckpt_path", None))
@@ -338,8 +316,7 @@ class LRandSchedulerOverrideCallback(Callback):
             if hasattr(scheduler, "_last_lr"):
                 scheduler._last_lr = [target_lr for _ in optimizer.param_groups]
 
-        if trainer.is_global_zero:
-            self._log(f"Override {optimizer_name} optimizer LR to {target_lr}.")
+        self._log(f"Override {optimizer_name} optimizer LR to {target_lr}.")
 
     def _reset_scheduler(
             self,
@@ -361,12 +338,11 @@ class LRandSchedulerOverrideCallback(Callback):
         if scheduler_idx < len(trainer.lr_scheduler_configs):
             trainer.lr_scheduler_configs[scheduler_idx].scheduler = new_scheduler
 
-        if trainer.is_global_zero:
-            scheduler_type = opt_config.get("lr_scheduler", "constant_with_warmup")
-            self._log(
-                f"Reset scheduler for {scheduler_name} "
-                f"(type={scheduler_type}, total_steps={total_steps})."
-            )
+        scheduler_type = opt_config.get("lr_scheduler", "constant_with_warmup")
+        self._log(
+            f"Reset scheduler for {scheduler_name} "
+            f"(type={scheduler_type}, total_steps={total_steps})."
+        )
 
     def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if self.applied:
