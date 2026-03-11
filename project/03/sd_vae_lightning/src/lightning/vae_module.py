@@ -336,7 +336,7 @@ class VAELightningModule(pl.LightningModule):
         d_loss = 0.5 * (loss_real + loss_fake)
         return d_loss
 
-    def compute_loss(
+    def _compute_loss(
             self,
             targets: torch.Tensor,
             reconstructions: torch.Tensor,
@@ -517,7 +517,7 @@ class VAELightningModule(pl.LightningModule):
 
         # ========== Train VAE (Generator) ==========
         self.toggle_optimizer(opt_vae)
-        vae_loss, vae_loss_dict = self.compute_loss(
+        vae_loss, vae_loss_dict = self._compute_loss(
             targets, reconstructions, posterior,
             optimizer_idx=0, global_step=self.global_step, training=True
         )
@@ -569,7 +569,7 @@ class VAELightningModule(pl.LightningModule):
                 and self.global_step >= self.disc_start_step
         ):
             self.toggle_optimizer(opt_disc)
-            disc_loss, disc_loss_dict = self.compute_loss(
+            disc_loss, disc_loss_dict = self._compute_loss(
                 targets, reconstructions, posterior,
                 optimizer_idx=1, global_step=self.global_step,
             )
@@ -642,7 +642,7 @@ class VAELightningModule(pl.LightningModule):
 
         reconstructions, latent, posterior = self.forward_with_latent(targets, sample_posterior=False)
 
-        loss, loss_dict = self.compute_loss(
+        loss, loss_dict = self._compute_loss(
             targets, reconstructions, posterior, optimizer_idx=0, global_step=self.global_step, training=False
         )
 
@@ -812,11 +812,8 @@ class VAELightningModule(pl.LightningModule):
         # ---- total training steps estimation ----
         estimated = self.trainer.estimated_stepping_batches
         if estimated is None or not math.isfinite(estimated):
-            raise ValueError(
-                "Cannot infer total training steps from Trainer. "
-                "Please set `max_steps` in `pl.Trainer(...)`, or use finite "
-                "`max_epochs` with a finite-length dataloader."
-            )
+            raise ValueError("trainer.estimated_stepping_batches is None or infinite; cannot build LR scheduler.")
+
         total_steps = max(1, int(math.ceil(estimated / self.accumulate_grad_batches)))
         # ---- Generator (VAE) ----
         opt_vae = self._build_optimizer(

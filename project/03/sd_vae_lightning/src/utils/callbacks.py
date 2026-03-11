@@ -14,6 +14,7 @@ from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 from pytorch_lightning.utilities.rank_zero import rank_zero_info
 import torchvision
+import math
 
 
 class VAELoggingCallback(Callback):
@@ -280,11 +281,13 @@ class LRandSchedulerOverrideCallback(Callback):
         return bool(getattr(trainer, "ckpt_path", None))
 
     @staticmethod
-    def _compute_total_steps(trainer: pl.Trainer) -> int:
+    def _compute_total_steps(trainer: pl.Trainer, pl_module: pl.LightningModule) -> int:
         estimated_steps = trainer.estimated_stepping_batches
-        if estimated_steps is None:
-            raise ValueError("trainer.estimated_stepping_batches is None; cannot rebuild LR scheduler.")
-        return max(1, int(estimated_steps))
+        if estimated_steps is None or not math.isfinite(estimated_steps):
+            raise ValueError("trainer.estimated_stepping_batches is None or infinite; cannot rebuild LR scheduler.")
+
+        accumulate_grad_batches = max(1, int(getattr(pl_module, "accumulate_grad_batches", 1)))
+        return max(1, int(math.ceil(estimated_steps / accumulate_grad_batches)))
 
     @staticmethod
     def _iter_scheduler_configs_for_optimizer(
@@ -357,7 +360,7 @@ class LRandSchedulerOverrideCallback(Callback):
         if not trainer.optimizers:
             return
 
-        total_steps = self._compute_total_steps(trainer)
+        total_steps = self._compute_total_steps(trainer, pl_module)
 
         if len(trainer.optimizers) >= 1 and self.gen_opt_config:
             if self.override_lr_on_resume:
