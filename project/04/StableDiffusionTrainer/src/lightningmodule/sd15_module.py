@@ -13,6 +13,7 @@ from diffusers import (
     UNet2DConditionModel,
 )
 from diffusers.optimization import get_scheduler
+from pytorch_lightning.utilities.rank_zero import rank_zero_info
 from PIL import Image
 from transformers import CLIPTextModel, CLIPTokenizer
 
@@ -60,7 +61,7 @@ class StableDiffusionLightningModule(pl.LightningModule):
             try:
                 self.unet.enable_xformers_memory_efficient_attention()
             except Exception as exc:
-                print(
+                rank_zero_info(
                     f"[warning] xFormers attention requested but unavailable; falling back to standard attention. ({exc})"
                 )
 
@@ -138,6 +139,9 @@ class StableDiffusionLightningModule(pl.LightningModule):
     @torch.no_grad()
     def on_train_batch_end(self, outputs: Any, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
         if not self.validation_cfg.get("enabled", True):
+            return
+
+        if self.trainer is not None and not self.trainer.is_global_zero:
             return
 
         every_n_steps = int(self.validation_cfg.get("every_n_steps", 0))

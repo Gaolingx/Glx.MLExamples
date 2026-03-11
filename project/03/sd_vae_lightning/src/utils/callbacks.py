@@ -430,7 +430,7 @@ class NaNLossCallback(Callback):
             loss = outputs["loss"]
 
         if loss is not None and not torch.isfinite(loss):
-            print(
+            rank_zero_info(
                 f"\n[NaNLossCallback] Non-finite loss detected at "
                 f"step {trainer.global_step} (batch_idx={batch_idx}): {loss.item():.6f}. "
                 f"Stopping training."

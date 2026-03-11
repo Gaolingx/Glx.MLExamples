@@ -8,6 +8,7 @@ import torch
 from diffusers.optimization import get_scheduler
 from pytorch_lightning import Callback, Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.utilities.rank_zero import rank_zero_info
 from pytorch_lightning.loggers import TensorBoardLogger
 
 
@@ -34,8 +35,7 @@ class NaNLossCallback(Callback):
 
         if not torch.isfinite(loss_tensor).all():
             trainer.should_stop = True
-            if trainer.is_global_zero:
-                print(f"[NaNLossCallback] Non-finite loss detected at global_step={trainer.global_step}. Stopping training.")
+            rank_zero_info(f"[NaNLossCallback] Non-finite loss detected at global_step={trainer.global_step}. Stopping training.")
 
 
 class LRandSchedulerOverrideCallback(Callback):
@@ -67,8 +67,7 @@ class LRandSchedulerOverrideCallback(Callback):
             for group in optimizer.param_groups:
                 group["lr"] = target_lr
                 group["initial_lr"] = target_lr
-            if trainer.is_global_zero:
-                print(f"[LRandSchedulerOverrideCallback] Reset optimizer LR to {target_lr}.")
+            rank_zero_info(f"[LRandSchedulerOverrideCallback] Reset optimizer LR to {target_lr}.")
 
         if reset_scheduler:
             scheduler_type = self.training_cfg.get("lr_scheduler", "cosine")
@@ -84,11 +83,10 @@ class LRandSchedulerOverrideCallback(Callback):
 
             if trainer.lr_scheduler_configs:
                 trainer.lr_scheduler_configs[0].scheduler = new_scheduler
-            if trainer.is_global_zero:
-                print(
-                    "[LRandSchedulerOverrideCallback] Reset scheduler state "
-                    f"(type={scheduler_type}, warmup={warmup_steps}, total_steps={total_steps})."
-                )
+            rank_zero_info(
+                "[LRandSchedulerOverrideCallback] Reset scheduler state "
+                f"(type={scheduler_type}, warmup={warmup_steps}, total_steps={total_steps})."
+            )
 
         self.applied = True
 
@@ -149,7 +147,7 @@ class GradParamNormCallback(Callback):
 
         grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
 
-        pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
+        pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
     def on_before_optimizer_step(
             self,
@@ -162,7 +160,7 @@ class GradParamNormCallback(Callback):
 
         grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
 
-        pl_module.log("train/grad_norm_clip", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
+        pl_module.log("train/grad_norm_clip", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
 
 class LoggingCallback(Callback):
@@ -203,7 +201,14 @@ class LoggingCallback(Callback):
 
         for key, value in metrics.items():
             metric_value = self._format_metric_value(value)
-            pl_module.log(key, metric_value, on_step=True, on_epoch=False, prog_bar=True)
+            pl_module.log(
+                key,
+                metric_value,
+                on_step=True,
+                on_epoch=(key == "train/loss"),
+                prog_bar=True,
+                sync_dist=True,
+            )
 
 
 class TrainHealthMetricsCallback(Callback):
@@ -265,8 +270,22 @@ class TrainHealthMetricsCallback(Callback):
             batch_size = max(1, self._infer_batch_size(batch))
             samples_per_sec = (batch_size * 1000.0) / max(step_time_ms, 1e-6)
 
-            pl_module.log("train/step_time_ms", float(step_time_ms), on_step=True, on_epoch=False, prog_bar=True)
-            pl_module.log("train/samples_per_sec", float(samples_per_sec), on_step=True, on_epoch=False, prog_bar=True)
+            pl_module.log(
+                "train/step_time_ms",
+                float(step_time_ms),
+                on_step=True,
+                on_epoch=False,
+                prog_bar=True,
+                sync_dist=True,
+            )
+            pl_module.log(
+                "train/samples_per_sec",
+                float(samples_per_sec),
+                on_step=True,
+                on_epoch=False,
+                prog_bar=True,
+                sync_dist=True,
+            )
 
         # Sanity metrics for diffusion training internals.
         if not isinstance(batch, dict) or "pixel_values" not in batch:
@@ -304,10 +323,38 @@ class TrainHealthMetricsCallback(Callback):
         latent_std = latents.float().std(unbiased=False)
         noise_std = noise.float().std(unbiased=False)
 
-        pl_module.log("train/timestep_mean", float(timestep_mean.detach().cpu()), on_step=True, on_epoch=False, prog_bar=True)
-        pl_module.log("train/timestep_std", float(timestep_std.detach().cpu()), on_step=True, on_epoch=False, prog_bar=True)
-        pl_module.log("train/latent_std", float(latent_std.detach().cpu()), on_step=True, on_epoch=False, prog_bar=True)
-        pl_module.log("train/noise_std", float(noise_std.detach().cpu()), on_step=True, on_epoch=False, prog_bar=True)
+        pl_module.log(
+            "train/timestep_mean",
+            float(timestep_mean.detach().cpu()),
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            sync_dist=True,
+        )
+        pl_module.log(
+            "train/timestep_std",
+            float(timestep_std.detach().cpu()),
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            sync_dist=True,
+        )
+        pl_module.log(
+            "train/latent_std",
+            float(latent_std.detach().cpu()),
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            sync_dist=True,
+        )
+        pl_module.log(
+            "train/noise_std",
+            float(noise_std.detach().cpu()),
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            sync_dist=True,
+        )
 
 
 def build_tensorboard_logger(logging_cfg: Dict[str, Any]) -> TensorBoardLogger:
@@ -325,7 +372,7 @@ def build_callbacks(cfg: Dict[str, Any]) -> list:
     ckpt_callback = CheckpointCallback(
         dirpath=checkpoint_cfg.get("dirpath", "outputs/checkpoints"),
         filename="sd15-epoch={epoch:02d}-step={step:06d}-val",
-        monitor=checkpoint_cfg.get("monitor", "train/loss_epoch"),
+        monitor=checkpoint_cfg.get("monitor", "train/loss"),
         mode=checkpoint_cfg.get("mode", "min"),
         save_top_k=int(checkpoint_cfg.get("save_top_k", 3)),
         save_last=bool(checkpoint_cfg.get("save_last", True)),

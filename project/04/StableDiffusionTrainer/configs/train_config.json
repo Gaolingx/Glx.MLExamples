@@ -11,7 +11,7 @@
     "image_column": "image",
     "caption_column": "text",
     "cache_dir": "./.cache/huggingface",
-    "max_train_samples": 833,
+    "max_train_samples": 2000,
     "resolution": 512,
     "center_crop": true,
     "random_flip": true,
@@ -34,7 +34,16 @@
     "num_train_timesteps": 1000,
     "prediction_type": "epsilon",
     "gradient_checkpointing": false,
-    "enable_xformers_memory_efficient_attention": false
+    "enable_xformers_memory_efficient_attention": false,
+    "allow_tf32": true
+  },
+  "distributed": {
+    "accelerator": "auto",
+    "devices": "auto",
+    "strategy": "auto",
+    "sync_batchnorm": false,
+    "find_unused_parameters": false,
+    "gradient_as_bucket_view": true
   },
   "validation": {
     "enabled": true,
@@ -46,14 +55,14 @@
       "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k"
     ]
   },
-"checkpoint": {
-  "dirpath": "outputs/sd15-lightning/checkpoints",
-  "save_top_k": 3,
-  "monitor": "train/loss_epoch",
-  "mode": "min",
-  "save_last": true,
-  "every_n_train_steps": 100
-},
+  "checkpoint": {
+    "dirpath": "outputs/sd15-lightning/checkpoints",
+    "save_top_k": 3,
+    "monitor": "train/loss",
+    "mode": "min",
+    "save_last": true,
+    "every_n_train_steps": 100
+  },
   "logging": {
     "tensorboard_save_dir": "outputs/sd15-lightning/tb_logs",
     "name": "sd15_lightning",
