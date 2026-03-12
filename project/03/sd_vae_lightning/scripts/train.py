@@ -141,9 +141,6 @@ def build_trainer_kwargs(config: dict) -> Dict[str, Any]:
     strategy: Union[str, DDPStrategy] = distributed_config.get("strategy", "auto")
     num_nodes = int(distributed_config.get("num_nodes", 1))
 
-    if accelerator == "gpu" and devices == "auto" and torch.cuda.is_available():
-        devices = torch.cuda.device_count()
-
     if isinstance(strategy, str) and strategy.lower() == "ddp":
         strategy = DDPStrategy(
             find_unused_parameters=distributed_config.get("find_unused_parameters", False),
