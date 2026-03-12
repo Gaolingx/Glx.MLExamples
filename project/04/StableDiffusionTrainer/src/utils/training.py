@@ -1,13 +1,13 @@
 import json
-import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import pytorch_lightning as pl
 import torch
 from diffusers.optimization import get_scheduler
 from pytorch_lightning import Callback, Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.utilities.rank_zero import rank_zero_info
 from pytorch_lightning.loggers import TensorBoardLogger
 
@@ -149,7 +149,7 @@ class GradParamNormCallback(Callback):
 
         pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
-    def on_before_optimizer_step(
+    def on_before_zero_grad(
             self,
             trainer: pl.Trainer,
             pl_module: pl.LightningModule,
@@ -180,6 +180,22 @@ class LoggingCallback(Callback):
             return float(value.detach().float().cpu().item())
         return float(value)
 
+    @staticmethod
+    def _to_epoch_metric_name(metric_name: str) -> Optional[str]:
+        if not metric_name.startswith("train/"):
+            return None
+        return metric_name.replace("train/", "epoch/", 1)
+
+    @staticmethod
+    def _is_prog_bar_metric(metric_name: str) -> bool:
+        return metric_name in {
+            "train/loss",
+            "train/loss_ema",
+            "train/lr",
+            "train/grad_norm",
+            "train/grad_norm_clip",
+        }
+
     def on_train_batch_end(
         self,
         trainer: Trainer,
@@ -192,169 +208,44 @@ class LoggingCallback(Callback):
         if step == 0 or step % self.log_every_n_steps != 0:
             return
 
-        if not isinstance(outputs, dict):
-            return
+        metrics: Dict[str, Any] = {}
+        runtime_metrics = getattr(pl_module, "runtime_log_dict", None)
+        if isinstance(runtime_metrics, dict):
+            metrics.update(runtime_metrics)
 
-        metrics = outputs.get("train_metrics", {})
-        if not isinstance(metrics, dict):
+        if isinstance(outputs, dict):
+            output_metrics = outputs.get("train_metrics", {})
+            if isinstance(output_metrics, dict):
+                metrics.update(output_metrics)
+
+        if not metrics:
             return
 
         for key, value in metrics.items():
             metric_value = self._format_metric_value(value)
+            if metric_value is None:
+                continue
+
+            train_key = key if key.startswith("train/") else f"train/{key}"
+            epoch_key = self._to_epoch_metric_name(train_key)
+            if epoch_key is not None:
+                pl_module.log(
+                    epoch_key,
+                    metric_value,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    sync_dist=True,
+                )
+
             pl_module.log(
-                key,
+                train_key,
                 metric_value,
                 on_step=True,
-                on_epoch=(key == "train/loss"),
-                prog_bar=True,
-                sync_dist=True,
-            )
-
-
-class TrainHealthMetricsCallback(Callback):
-    """Log timing/throughput and latent/noise/timestep distribution sanity metrics."""
-
-    def __init__(self, log_every_n_steps: int = 10) -> None:
-        super().__init__()
-        self.log_every_n_steps = max(1, int(log_every_n_steps))
-        self._batch_start_time: Optional[float] = None
-
-    @staticmethod
-    def _infer_batch_size(batch: Any) -> int:
-        if torch.is_tensor(batch):
-            return int(batch.shape[0]) if batch.ndim > 0 else 1
-
-        if isinstance(batch, dict):
-            for value in batch.values():
-                if torch.is_tensor(value):
-                    return int(value.shape[0]) if value.ndim > 0 else 1
-
-        if isinstance(batch, (list, tuple)) and len(batch) > 0:
-            first = batch[0]
-            if torch.is_tensor(first):
-                return int(first.shape[0]) if first.ndim > 0 else 1
-
-        return 1
-
-    @staticmethod
-    def _to_device(value: torch.Tensor, device: torch.device) -> torch.Tensor:
-        if value.device == device:
-            return value
-        return value.to(device)
-
-    def on_train_batch_start(
-        self,
-        trainer: Trainer,
-        pl_module: pl.LightningModule,
-        batch: Any,
-        batch_idx: int,
-    ) -> None:
-        self._batch_start_time = time.perf_counter()
-
-    @torch.no_grad()
-    def on_train_batch_end(
-        self,
-        trainer: Trainer,
-        pl_module: pl.LightningModule,
-        outputs: Any,
-        batch: Any,
-        batch_idx: int,
-    ) -> None:
-        step = int(trainer.global_step)
-        if step == 0 or step % self.log_every_n_steps != 0:
-            return
-
-        # Throughput/system-level metrics.
-        if self._batch_start_time is not None:
-            step_time_ms = (time.perf_counter() - self._batch_start_time) * 1000.0
-            batch_size = max(1, self._infer_batch_size(batch))
-            samples_per_sec = (batch_size * 1000.0) / max(step_time_ms, 1e-6)
-
-            pl_module.log(
-                "train/step_time_ms",
-                float(step_time_ms),
-                on_step=True,
                 on_epoch=False,
-                prog_bar=True,
+                prog_bar=self._is_prog_bar_metric(key),
                 sync_dist=True,
             )
-            pl_module.log(
-                "train/samples_per_sec",
-                float(samples_per_sec),
-                on_step=True,
-                on_epoch=False,
-                prog_bar=True,
-                sync_dist=True,
-            )
-
-        # Sanity metrics for diffusion training internals.
-        if not isinstance(batch, dict) or "pixel_values" not in batch:
-            return
-
-        if not hasattr(pl_module, "vae") or not hasattr(pl_module, "noise_scheduler"):
-            return
-
-        pixel_values = batch["pixel_values"]
-        if not torch.is_tensor(pixel_values):
-            return
-
-        if pixel_values.ndim == 3:
-            pixel_values = pixel_values.unsqueeze(0)
-        elif pixel_values.ndim != 4:
-            return
-
-        pixel_values = self._to_device(pixel_values, pl_module.device)
-
-        latents = pl_module.vae.encode(pixel_values).latent_dist.sample()
-        latents = latents * pl_module.vae.config.scaling_factor
-
-        noise = torch.randn_like(latents)
-        bsz = latents.shape[0]
-        timesteps = torch.randint(
-            0,
-            pl_module.noise_scheduler.config.num_train_timesteps,
-            (bsz,),
-            device=latents.device,
-            dtype=torch.long,
-        )
-
-        timestep_mean = timesteps.float().mean()
-        timestep_std = timesteps.float().std(unbiased=False)
-        latent_std = latents.float().std(unbiased=False)
-        noise_std = noise.float().std(unbiased=False)
-
-        pl_module.log(
-            "train/timestep_mean",
-            float(timestep_mean.detach().cpu()),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=True,
-            sync_dist=True,
-        )
-        pl_module.log(
-            "train/timestep_std",
-            float(timestep_std.detach().cpu()),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=True,
-            sync_dist=True,
-        )
-        pl_module.log(
-            "train/latent_std",
-            float(latent_std.detach().cpu()),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=True,
-            sync_dist=True,
-        )
-        pl_module.log(
-            "train/noise_std",
-            float(noise_std.detach().cpu()),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=True,
-            sync_dist=True,
-        )
 
 
 def build_tensorboard_logger(logging_cfg: Dict[str, Any]) -> TensorBoardLogger:
@@ -386,26 +277,69 @@ def build_callbacks(cfg: Dict[str, Any]) -> list:
         NaNLossCallback(),
         LRandSchedulerOverrideCallback(cfg),
         GradParamNormCallback(log_every_n_steps=int(logging_cfg.get("norm_log_every_n_steps", 1))),
-        TrainHealthMetricsCallback(log_every_n_steps=int(logging_cfg.get("health_log_every_n_steps", 10))),
         LoggingCallback(log_every_n_steps=int(logging_cfg.get("log_every_n_steps", 10))),
     ]
 
 
-def find_resume_checkpoint(checkpoint_cfg: Dict[str, Any]) -> Optional[str]:
-    ckpt_dir = Path(checkpoint_cfg.get("dirpath", "outputs/checkpoints"))
-    if not ckpt_dir.exists():
+def find_resume_checkpoint(resume_arg: str, default_ckpt_dir: str) -> Optional[str]:
+    """Resolve a checkpoint path for resuming training."""
+    if not resume_arg:
         return None
 
-    last_ckpt = ckpt_dir / "last.ckpt"
-    if last_ckpt.exists():
-        print(f"Resuming from latest checkpoint: {last_ckpt}")
-        return str(last_ckpt)
-
-    candidates = sorted(ckpt_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if len(candidates) == 0:
+    if resume_arg.lower() == "last":
+        last_ckpt = Path(default_ckpt_dir) / "last.ckpt"
+        if last_ckpt.exists():
+            print(f"Resuming from latest checkpoint: {last_ckpt}")
+            return str(last_ckpt)
         return None
 
-    return str(candidates[0])
+    p = Path(resume_arg)
+    if p.is_file() and p.suffix == ".ckpt":
+        print(f"Resuming from checkpoint file: {p}")
+        return str(p)
+    if p.is_dir():
+        candidates = sorted(
+            [x for x in p.rglob("*.ckpt") if x.name != "last.ckpt"],
+            key=lambda x: x.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            print(f"Resuming from checkpoint in dir: {candidates[0]}")
+            return str(candidates[0])
+
+        last_ckpt = p / "last.ckpt"
+        if last_ckpt.exists():
+            print(f"Resuming from last checkpoint in dir: {last_ckpt}")
+            return str(last_ckpt)
+    return None
+
+
+def build_trainer_kwargs(config: dict) -> Dict[str, Any]:
+    """Build Trainer kwargs with optional DDP/multi-GPU support."""
+    distributed_config = config.get("distributed", {})
+
+    accelerator = distributed_config.get("accelerator", "auto")
+    devices: Union[str, int, List[int]] = distributed_config.get("devices", "auto")
+    strategy: Union[str, DDPStrategy] = distributed_config.get("strategy", "auto")
+    num_nodes = int(distributed_config.get("num_nodes", 1))
+
+    if isinstance(strategy, str) and strategy.lower() == "ddp":
+        strategy = DDPStrategy(
+            find_unused_parameters=distributed_config.get("find_unused_parameters", False),
+            gradient_as_bucket_view=distributed_config.get("gradient_as_bucket_view", True),
+        )
+
+    trainer_kwargs = {
+        "accelerator": accelerator,
+        "devices": devices,
+        "strategy": strategy,
+        "num_nodes": num_nodes,
+    }
+
+    if distributed_config.get("sync_batchnorm", False):
+        trainer_kwargs["sync_batchnorm"] = True
+
+    return trainer_kwargs
 
 
 def seed_everything(seed: int) -> None:

@@ -50,6 +50,12 @@ class VAELoggingCallback(Callback):
             return float(value.detach().float().cpu().item())
         return float(value)
 
+    @staticmethod
+    def _to_epoch_metric_name(metric_name: str) -> Optional[str]:
+        if not metric_name.startswith("train/"):
+            return None
+        return metric_name.replace("train/", "epoch/", 1)
+
     def _visualize_latent(
             self,
             latent: torch.Tensor,
@@ -108,17 +114,34 @@ class VAELoggingCallback(Callback):
             batch: Any,
             batch_idx: int,
     ) -> None:
-        if not isinstance(outputs, dict):
-            return
+        metrics: Dict[str, Any] = {}
+        if isinstance(outputs, dict):
+            output_metrics = outputs.get("train_metrics", {})
+            if isinstance(output_metrics, dict):
+                metrics.update(output_metrics)
 
-        metrics = outputs.get("train_metrics", {})
-        if not isinstance(metrics, dict):
+        if not metrics:
             return
 
         for key, value in metrics.items():
             metric_value = self._format_metric_value(value)
+            if metric_value is None:
+                continue
+
+            train_key = key if key.startswith("train/") else f"train/{key}"
+            epoch_key = self._to_epoch_metric_name(train_key)
+            if epoch_key is not None:
+                pl_module.log(
+                    epoch_key,
+                    metric_value,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    sync_dist=True,
+                )
+
             pl_module.log(
-                f"train/{key}",
+                train_key,
                 metric_value,
                 on_step=True,
                 on_epoch=False,

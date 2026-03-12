@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytorch_lightning as pl
 import torch
@@ -26,23 +26,35 @@ class StableDiffusionLightningModule(pl.LightningModule):
         self.cfg = cfg
         self.save_hyperparameters(cfg)
 
-        model_name = cfg["pretrained_model_name_or_path"]
+        model_name = cfg.get("pretrained_model_name_or_path")
         clip_model_name = cfg.get("clip_model_name_or_path", "CompVis/stable-diffusion-v1-4")
         vae_name = cfg.get("vae_model_name_or_path", "stabilityai/sd-vae-ft-mse")
-
-        self.tokenizer = CLIPTokenizer.from_pretrained(clip_model_name, subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained(clip_model_name, subfolder="text_encoder")
-        self.noise_scheduler = DDPMScheduler.from_pretrained(model_name, subfolder="scheduler")
-        self.vae = AutoencoderKL.from_pretrained(vae_name)
-
         unet_config_path = cfg.get("unet_config_path")
-        if unet_config_path:
-            with open(unet_config_path, "r", encoding="utf-8") as f:
-                raw_unet_config = json.load(f)
-            unet_config = {k: v for k, v in raw_unet_config.items() if not k.startswith("_")}
-            self.unet = UNet2DConditionModel.from_config(unet_config)
-        else:
+        scheduler_config_path = cfg.get("scheduler_config_path")
+
+        if model_name:
+            self.tokenizer = CLIPTokenizer.from_pretrained(model_name, subfolder="tokenizer")
+            self.text_encoder = CLIPTextModel.from_pretrained(model_name, subfolder="text_encoder")
+            self.noise_scheduler = DDPMScheduler.from_pretrained(model_name, subfolder="scheduler")
+            self.vae = AutoencoderKL.from_pretrained(model_name, subfolder="vae")
             self.unet = UNet2DConditionModel.from_pretrained(model_name, subfolder="unet")
+        else:
+            self.tokenizer = CLIPTokenizer.from_pretrained(clip_model_name, subfolder="tokenizer")
+            self.text_encoder = CLIPTextModel.from_pretrained(clip_model_name, subfolder="text_encoder")
+            self.vae = AutoencoderKL.from_pretrained(vae_name)
+
+            if scheduler_config_path:
+                self.noise_scheduler = DDPMScheduler.from_config(scheduler_config_path)
+            else:
+                raise ValueError("scheduler_config_path must be provided when pretrained_model_name_or_path is empty")
+
+            if unet_config_path:
+                with open(unet_config_path, "r", encoding="utf-8") as f:
+                    raw_unet_config = json.load(f)
+                unet_config = {k: v for k, v in raw_unet_config.items() if not k.startswith("_")}
+                self.unet = UNet2DConditionModel.from_config(unet_config)
+            else:
+                raise ValueError("unet_config_path must be provided when pretrained_model_name_or_path is empty")
 
         self.vae.requires_grad_(False)
         self.text_encoder.requires_grad_(False)
@@ -53,6 +65,7 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
         # Runtime metric cache for callback-side unified stdout logging.
         self.runtime_log_dict: Dict[str, float] = {}
+        self.loss_ema: Optional[float] = None
 
         if bool(self.training_cfg.get("gradient_checkpointing", False)):
             self.unet.enable_gradient_checkpointing()
@@ -74,7 +87,13 @@ class StableDiffusionLightningModule(pl.LightningModule):
     def encode_prompt(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.text_encoder(input_ids, attention_mask=None)[0]
 
-    def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _compute_snr(self, timesteps: torch.Tensor) -> torch.Tensor:
+        alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(device=timesteps.device, dtype=torch.float32)
+        alpha = alphas_cumprod[timesteps]
+        sigma = (1.0 - alpha).clamp(min=1e-8)
+        return alpha / sigma
+
+    def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
         pixel_values = batch["pixel_values"]
         input_ids = batch["input_ids"]
 
@@ -120,16 +139,42 @@ class StableDiffusionLightningModule(pl.LightningModule):
         else:
             raise ValueError(f"Unknown prediction type: {prediction_type}")
 
-        return F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+        snr = self._compute_snr(timesteps)
+
+        metrics: Dict[str, Any] = {
+            "train/loss": loss.detach(),
+            "train/batch_size": float(bsz),
+            "train/timestep_mean": timesteps.detach().float().mean(),
+            "train/timestep_std": timesteps.detach().float().std(unbiased=False),
+            "train/snr_mean": snr.detach().mean(),
+            "train/latent_std": latents.detach().float().std(unbiased=False),
+            "train/noisy_latent_std": noisy_latents.detach().float().std(unbiased=False),
+            "train/noise_std": noise.detach().float().std(unbiased=False),
+            "train/pred_std": model_pred.detach().float().std(unbiased=False),
+            "train/target_std": target.detach().float().std(unbiased=False),
+            "train/pred_target_mse": (model_pred.detach().float() - target.detach().float()).pow(2).mean(),
+        }
+        return loss, metrics
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, Any]:
-        loss = self._compute_loss(batch)
-        train_metrics: Dict[str, Any] = {
-            "train/loss": loss.detach(),
-        }
+        loss, train_metrics = self._compute_loss(batch)
+
+        loss_value = float(loss.detach().float().cpu().item())
+        ema_decay = float(self.training_cfg.get("loss_ema_decay", 0.95))
+        if self.loss_ema is None:
+            self.loss_ema = loss_value
+        else:
+            self.loss_ema = ema_decay * self.loss_ema + (1.0 - ema_decay) * loss_value
+        train_metrics["train/loss_ema"] = self.loss_ema
 
         if self.trainer.optimizers:
             train_metrics["train/lr"] = float(self.trainer.optimizers[0].param_groups[0]["lr"])
+
+        self.runtime_log_dict = {
+            key: float(value.detach().float().cpu().item()) if torch.is_tensor(value) else float(value)
+            for key, value in train_metrics.items()
+        }
 
         return {
             "loss": loss,

@@ -1,9 +1,10 @@
 {
   "seed": 42,
   "output_dir": "outputs/sd15-lightning",
-  "pretrained_model_name_or_path": "runwayml/stable-diffusion-v1-5",
+  "pretrained_model_name_or_path": null,
   "clip_model_name_or_path": "CompVis/stable-diffusion-v1-4",
   "vae_model_name_or_path": "stabilityai/sd-vae-ft-mse",
+  "scheduler_config_path": "models/scheduler/scheduler_config.json",
   "unet_config_path": "models/unet/config.json",
   "dataset": {
     "name": "reach-vb/pokemon-blip-captions",
