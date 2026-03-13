@@ -275,7 +275,7 @@ def main():
     # NOTE: accumulate_grad_batches is set to 1 because we handle gradient accumulation
     # manually in VAELightningModule.training_step() for proper alternating training
     # between VAE and Discriminator (following official diffusers implementation)
-    trainer_kwargs = build_trainer_kwargs(config, args)
+    trainer_kwargs = build_trainer_kwargs(config)
     trainer = pl.Trainer(
         default_root_dir=output_dir,
         max_epochs=train_config_section.get("num_epochs", 100),

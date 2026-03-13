@@ -56,6 +56,15 @@ class VAELoggingCallback(Callback):
             return None
         return metric_name.replace("train/", "epoch/", 1)
 
+    @staticmethod
+    def _is_prog_bar_metric(metric_name: str) -> bool:
+        return metric_name in {
+            "train/rec_loss",
+            "train/nll_loss",
+            "train/lr",
+            "train/disc_lr",
+        }
+
     def _visualize_latent(
             self,
             latent: torch.Tensor,
@@ -145,7 +154,7 @@ class VAELoggingCallback(Callback):
                 metric_value,
                 on_step=True,
                 on_epoch=False,
-                prog_bar=True,
+                prog_bar=self._is_prog_bar_metric(train_key),
                 sync_dist=True,
             )
 

@@ -192,8 +192,6 @@ class LoggingCallback(Callback):
             "train/loss",
             "train/loss_ema",
             "train/lr",
-            "train/grad_norm",
-            "train/grad_norm_clip",
         }
 
     def on_train_batch_end(
@@ -243,7 +241,7 @@ class LoggingCallback(Callback):
                 metric_value,
                 on_step=True,
                 on_epoch=False,
-                prog_bar=self._is_prog_bar_metric(key),
+                prog_bar=self._is_prog_bar_metric(train_key),
                 sync_dist=True,
             )
 
