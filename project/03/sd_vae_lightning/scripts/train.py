@@ -15,11 +15,8 @@ Usage:
 """
 
 import argparse
-import json
-import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -27,22 +24,19 @@ sys.path.insert(0, str(project_root))
 
 import torch
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import (
-    LearningRateMonitor,
-    EarlyStopping,
-    RichProgressBar,
-)
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.strategies import DDPStrategy
-from pytorch_lightning.utilities.rank_zero import rank_zero_only
 
 from src.lightning.vae_module import VAELightningModule
 from src.data.dataset import VAEDataModule
-from src.utils.callbacks import (
-    VAELoggingCallback,
-    VAECheckpointCallback,
-    LRandSchedulerOverrideCallback,
-    NaNLossCallback,
+
+from src.utils.config import load_json_config
+from src.utils.training import (
+    merge_configs,
+    seed_everything,
+    save_runtime_config,
+    build_callbacks,
+    build_tensorboard_logger,
+    build_trainer_kwargs,
+    find_resume_checkpoint,
 )
 
 
@@ -54,14 +48,8 @@ def parse_args():
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/train_config.json",
+        default="./configs/train_config.json",
         help="Path to training config file",
-    )
-    parser.add_argument(
-        "--model_config",
-        type=str,
-        default="configs/model_config.json",
-        help="Path to model config file",
     )
     parser.add_argument(
         "--resume_from_checkpoint",
@@ -85,95 +73,13 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_config(config_path: str) -> dict:
-    """Load configuration from JSON file."""
-    with open(config_path, "r") as f:
-        return json.load(f)
-
-
-def merge_configs(train_config: dict, model_config: dict) -> dict:
-    """Merge training and model configs."""
-    config = {}
-    config.update(train_config)
-    config["model"] = model_config.get("model", {})
-    return config
-
-
-def find_resume_checkpoint(resume_arg: str, default_ckpt_dir: str) -> Optional[str]:
-    """Resolve a checkpoint path for resuming training."""
-    if not resume_arg:
-        return None
-
-    if resume_arg.lower() == "last":
-        last_ckpt = Path(default_ckpt_dir) / "last.ckpt"
-        if last_ckpt.exists():
-            print(f"Resuming from latest checkpoint: {last_ckpt}")
-            return str(last_ckpt)
-        return None
-
-    p = Path(resume_arg)
-    if p.is_file() and p.suffix == ".ckpt":
-        print(f"Resuming from checkpoint file: {p}")
-        return str(p)
-    if p.is_dir():
-        candidates = sorted(
-            [x for x in p.rglob("*.ckpt") if x.name != "last.ckpt"],
-            key=lambda x: x.stat().st_mtime,
-            reverse=True,
-        )
-        if candidates:
-            print(f"Resuming from checkpoint in dir: {candidates[0]}")
-            return str(candidates[0])
-
-        last_ckpt = p / "last.ckpt"
-        if last_ckpt.exists():
-            print(f"Resuming from last checkpoint in dir: {last_ckpt}")
-            return str(last_ckpt)
-    return None
-
-
-def build_trainer_kwargs(config: dict) -> Dict[str, Any]:
-    """Build Trainer kwargs with optional DDP/multi-GPU support."""
-    distributed_config = config.get("distributed", {})
-
-    accelerator = distributed_config.get("accelerator", "auto")
-    devices: Union[str, int, List[int]] = distributed_config.get("devices", "auto")
-    strategy: Union[str, DDPStrategy] = distributed_config.get("strategy", "auto")
-    num_nodes = int(distributed_config.get("num_nodes", 1))
-
-    if isinstance(strategy, str) and strategy.lower() == "ddp":
-        strategy = DDPStrategy(
-            find_unused_parameters=distributed_config.get("find_unused_parameters", False),
-            gradient_as_bucket_view=distributed_config.get("gradient_as_bucket_view", True),
-        )
-
-    trainer_kwargs = {
-        "accelerator": accelerator,
-        "devices": devices,
-        "strategy": strategy,
-        "num_nodes": num_nodes,
-    }
-
-    if distributed_config.get("sync_batchnorm", False):
-        trainer_kwargs["sync_batchnorm"] = True
-
-    return trainer_kwargs
-
-
-@rank_zero_only
-def save_runtime_config(config: dict, config_save_path: str) -> None:
-    """Persist merged runtime config only once in distributed training."""
-    with open(config_save_path, "w") as f:
-        json.dump(config, f, indent=2)
-
-
 def main():
     """Main training function."""
     args = parse_args()
 
     # Load configs
-    train_config = load_config(args.config)
-    model_config = load_config(args.model_config)
+    train_config = load_json_config(args.config)
+    model_config = load_json_config(train_config.get("vae_config_path", "./configs/model_config.json"))
     config = merge_configs(train_config, model_config)
 
     # Override with command line arguments
@@ -182,23 +88,21 @@ def main():
     if args.precision is not None:
         config["training"]["precision"] = args.precision
 
+    training_config = config.get("training", {})
+    logging_config = config.get("logging", {})
+    path_config = config.get("paths", {})
+
     # Set seed
-    seed = config.get("training", {}).get("seed", 42)
-    pl.seed_everything(seed, workers=True)
+    seed_everything(int(training_config.get("seed", 42)))
 
     # Get paths
-    paths = config.get("paths", {})
-    output_dir = paths.get("output_dir", "./outputs")
-    log_dir = paths.get("log_dir", "./logs")
-    checkpoint_dir = paths.get("checkpoint_dir", "./checkpoints")
+    output_dir = Path(path_config.get("output_dir", "./outputs"))
 
     # Create directories
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Save config only once to avoid duplicated writes in DDP
-    config_save_path = os.path.join(output_dir, "config.json")
+    config_save_path = Path(output_dir) / "config.json"
     save_runtime_config(config, config_save_path)
 
     # Create data module
@@ -208,68 +112,15 @@ def main():
     model = VAELightningModule(config)
 
     # Setup callbacks
-    train_config_section = config.get("training", {})
-    checkpoint_config = config.get("checkpoint", {})
-    logging_config = config.get("logging", {})
-
-    gen_opt_cfg = train_config_section.get("generator_optimizer", {})
-    disc_opt_cfg = train_config_section.get("discriminator_optimizer", {})
+    callbacks = build_callbacks(config)
 
     # Setup logger
-    logger = TensorBoardLogger(
-        save_dir=log_dir,
-        name=logging_config.get("name", "vae_training"),
-        default_hp_metric=False,
-    )
+    logger = build_tensorboard_logger(logging_config)
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
-    torch.backends.cudnn.allow_tf32 = train_config_section.get("allow_tf32", False)
-    torch.set_float32_matmul_precision("high" if train_config_section.get("allow_tf32", False) else "highest")
-
-    callbacks = [
-        # NaN/Inf loss guard
-        NaNLossCallback(),
-        # Checkpoint callback
-        VAECheckpointCallback(
-            dirpath=checkpoint_dir,
-            filename="vae-{epoch:02d}-{step:06d}-{val/rec_loss:.4f}",
-            save_top_k=checkpoint_config.get("save_top_k", 3),
-            monitor=checkpoint_config.get("monitor", "val/rec_loss"),
-            mode=checkpoint_config.get("mode", "min"),
-            save_last=True,
-            every_n_train_steps=checkpoint_config.get("save_every_n_steps", 1000),
-            save_hf_format=True,
-        ),
-        # Learning rate monitor
-        LearningRateMonitor(logging_interval="step"),
-        # Unified VAE metrics/images logging
-        VAELoggingCallback(
-            num_val_images=logging_config.get("num_val_images", 4),
-            log_to_tensorboard=True,
-            log_images_every_n_steps=logging_config.get("log_images_every_n_steps", 500),
-        ),
-        # LR and Scheduler Override callback for resume
-        LRandSchedulerOverrideCallback(
-            override_lr_on_resume=train_config_section.get("override_lr_on_resume", False),
-            reset_scheduler_on_resume=train_config_section.get("reset_scheduler_on_resume", False),
-            gen_opt_config=gen_opt_cfg,
-            disc_opt_config=disc_opt_cfg,
-            verbose=True,
-        ),
-        # Progress bar
-        RichProgressBar(),
-    ]
-
-    # Optional early stopping
-    if checkpoint_config.get("early_stopping", False):
-        callbacks.append(
-            EarlyStopping(
-                monitor=checkpoint_config.get("monitor", "val/rec_loss"),
-                patience=checkpoint_config.get("patience", 10),
-                mode=checkpoint_config.get("mode", "min"),
-            )
-        )
+    torch.backends.cudnn.allow_tf32 = training_config.get("allow_tf32", False)
+    torch.set_float32_matmul_precision("high" if training_config.get("allow_tf32", False) else "highest")
 
     # Create trainer
     # NOTE: accumulate_grad_batches is set to 1 because we handle gradient accumulation
@@ -278,9 +129,9 @@ def main():
     trainer_kwargs = build_trainer_kwargs(config)
     trainer = pl.Trainer(
         default_root_dir=output_dir,
-        max_epochs=train_config_section.get("num_epochs", 100),
-        max_steps=train_config_section.get("max_train_steps", -1),
-        precision=train_config_section.get("precision", "16-mixed"),
+        max_epochs=training_config.get("num_epochs", 100),
+        max_steps=training_config.get("max_train_steps", -1),
+        precision=training_config.get("precision", "16-mixed"),
         accumulate_grad_batches=1,  # Manual accumulation in training_step
         log_every_n_steps=logging_config.get("log_every_n_steps", 50),
         val_check_interval=logging_config.get("val_check_interval", 500),
@@ -293,16 +144,16 @@ def main():
 
     ckpt_path = None
     if args.resume_from_checkpoint:
-        ckpt_path = find_resume_checkpoint(args.resume_from_checkpoint, checkpoint_dir)
+        ckpt_dir = path_config.get("checkpoint_dir", "./checkpoints")
+        ckpt_path = find_resume_checkpoint(args.resume_from_checkpoint, ckpt_dir)
 
     trainer.fit(model, datamodule=data_module, ckpt_path=ckpt_path)
 
     # Save final model
     if trainer.is_global_zero:
-        final_model_path = os.path.join(output_dir, "final_model")
+        final_model_path = Path(output_dir) / "final_model"
         trainer.lightning_module.save_pretrained(final_model_path)
         print(f"Final model saved to: {final_model_path}")
-
 
 if __name__ == "__main__":
     main()

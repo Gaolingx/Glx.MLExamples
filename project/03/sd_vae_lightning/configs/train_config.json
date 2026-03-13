@@ -1,4 +1,5 @@
 {
+    "vae_config_path": "configs/model_config.json",
     "training": {
         "seed": 42,
         "batch_size": 4,
@@ -11,7 +12,7 @@
         "ema_decay": 0.9999,
         "ema_update_interval": 1,
         "max_train_steps": -1,
-        "override_lr_on_resume": true,
+        "override_lr_on_resume": false,
         "reset_scheduler_on_resume": false,
         "allow_tf32": false,
         "generator_optimizer": {
@@ -86,7 +87,7 @@
     },
     "paths": {
         "output_dir": "./outputs",
-        "log_dir": "./logs",
-        "checkpoint_dir": "./checkpoints"
+        "log_dir": "./outputs/logs",
+        "checkpoint_dir": "./outputs/checkpoints"
     }
 }

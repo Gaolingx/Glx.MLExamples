@@ -1,6 +1,5 @@
 import argparse
 from pathlib import Path
-import os
 import sys
 
 import torch
@@ -29,11 +28,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="./configs/train_config.json",
         help="Path to JSON config file.",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Auto-resume from latest checkpoint in checkpoint.dirpath.",
     )
     parser.add_argument(
         "--resume_from_checkpoint",
@@ -116,7 +110,7 @@ def main() -> None:
 
     # Save final model
     if trainer.is_global_zero:
-        final_model_path = os.path.join(output_dir, "final_model")
+        final_model_path = Path(output_dir) / "final_model"
         trainer.lightning_module.save_pretrained(final_model_path)
         print(f"Final model saved to: {final_model_path}")
 
