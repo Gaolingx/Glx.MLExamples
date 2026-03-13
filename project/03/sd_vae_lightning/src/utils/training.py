@@ -149,10 +149,13 @@ def build_callbacks(cfg: Dict[str, Any]) -> list:
     return callbacks
 
 
-def build_tensorboard_logger(logging_cfg: Dict[str, Any]) -> TensorBoardLogger:
+def build_tensorboard_logger(cfg: Dict[str, Any]) -> TensorBoardLogger:
+    path_config = cfg.get("paths", {})
+    logging_config = cfg.get("logging", {})
+
     return TensorBoardLogger(
-        save_dir=logging_cfg.get("log_dir", "./logs"),
-        name=logging_cfg.get("name", "vae_training"),
+        save_dir=path_config.get("log_dir", "./logs"),
+        name=logging_config.get("name", "vae_training"),
         default_hp_metric=False,
     )
 

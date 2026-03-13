@@ -123,13 +123,11 @@ class VAELoggingCallback(Callback):
             batch: Any,
             batch_idx: int,
     ) -> None:
-        metrics: Dict[str, Any] = {}
-        if isinstance(outputs, dict):
-            output_metrics = outputs.get("train_metrics", {})
-            if isinstance(output_metrics, dict):
-                metrics.update(output_metrics)
+        if not isinstance(outputs, dict):
+            return
 
-        if not metrics:
+        metrics = outputs.get("train_metrics", {})
+        if not isinstance(metrics, dict):
             return
 
         for key, value in metrics.items():

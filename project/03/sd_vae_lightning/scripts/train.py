@@ -115,7 +115,7 @@ def main():
     callbacks = build_callbacks(config)
 
     # Setup logger
-    logger = build_tensorboard_logger(logging_config)
+    logger = build_tensorboard_logger(config)
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
