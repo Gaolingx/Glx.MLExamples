@@ -48,6 +48,12 @@ def parse_args() -> argparse.Namespace:
         choices=["16", "32", "bf16", "16-mixed", "bf16-mixed"],
         help="Training precision",
     )
+    parser.add_argument(
+        "--gpus",
+        type=int,
+        default=None,
+        help="Number of GPUs to use",
+    )
     return parser.parse_args()
 
 
@@ -63,9 +69,11 @@ def main() -> None:
     if args.seed is not None:
         cfg["training"]["seed"] = args.seed
     if args.precision is not None:
-        training_cfg["training"]["precision"] = args.precision
+        cfg["training"]["precision"] = args.precision
+    if args.gpus is not None:
+        cfg["distributed"]["devices"] = args.gpus
 
-    seed_everything(int(cfg.get("seed", 42)))
+    seed_everything(int(training_cfg.get("seed", 42)))
 
     allow_tf32 = bool(training_cfg.get("allow_tf32", False))
     torch.backends.cudnn.allow_tf32 = allow_tf32
@@ -76,7 +84,7 @@ def main() -> None:
         dataset_cfg=cfg["dataset"],
         tokenizer=model.tokenizer,
         train_batch_size=int(training_cfg.get("batch_size", 1)),
-        seed=int(cfg.get("seed", 42)),
+        seed=int(training_cfg.get("seed", 42)),
     )
 
     logger = build_tensorboard_logger(logging_cfg)

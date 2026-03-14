@@ -70,6 +70,12 @@ def parse_args():
         choices=["16", "32", "bf16", "16-mixed", "bf16-mixed"],
         help="Training precision",
     )
+    parser.add_argument(
+        "--gpus",
+        type=int,
+        default=None,
+        help="Number of GPUs to use",
+    )
     return parser.parse_args()
 
 
@@ -87,6 +93,8 @@ def main():
         config["training"]["seed"] = args.seed
     if args.precision is not None:
         config["training"]["precision"] = args.precision
+    if args.gpus is not None:
+        config["distributed"]["devices"] = args.gpus
 
     training_config = config.get("training", {})
     logging_config = config.get("logging", {})

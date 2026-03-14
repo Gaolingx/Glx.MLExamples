@@ -1,5 +1,4 @@
 {
-  "seed": 42,
   "output_dir": "outputs/sd15-lightning",
   "pretrained_model_name_or_path": null,
   "clip_model_name_or_path": "CompVis/stable-diffusion-v1-4",
@@ -19,6 +18,7 @@
     "num_workers": 4
   },
   "training": {
+    "seed": 42,
     "batch_size": 2,
     "max_epochs": 1,
     "max_steps": 200,
