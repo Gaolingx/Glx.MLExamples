@@ -170,7 +170,7 @@ class VAELightningModule(pl.LightningModule):
         self.rfid_metric = rFID(feature_dim=2048, reset_real_features=True)
 
     def on_fit_start(self) -> None:
-        """Initialize EMA model at the start of training."""
+        # Initialize EMA model at the start of training.
         if self.use_ema:
             if self.ema is None:
                 self.ema = EMAModel(
@@ -220,6 +220,26 @@ class VAELightningModule(pl.LightningModule):
             z = posterior.mode()
         dec = self.vae.decode(z).sample
         return dec, z, posterior
+
+    def _compute_latent_stats(
+            self,
+            latent: torch.Tensor,
+            posterior: Any,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute latent-space monitoring metrics.
+
+        Args:
+            latent: Sampled or mode latent tensor.
+            posterior: Latent posterior distribution.
+
+        Returns:
+            Dictionary containing latent std statistics.
+        """
+        return {
+            "latent_std": latent.detach().float().std(unbiased=False),
+            "posterior_std": posterior.std.detach().float().mean(),
+        }
 
     def _compute_discriminator_win_rate(
             self,
@@ -390,7 +410,6 @@ class VAELightningModule(pl.LightningModule):
 
             # Compute disc_factor based on disc_start_step
             disc_factor = self.disc_factor if global_step >= self.disc_start_step else 0.0
-            loss_dict["disc_factor"] = torch.tensor(disc_factor, device=targets.device)
 
             if (
                     self.discriminator is not None
@@ -514,6 +533,7 @@ class VAELightningModule(pl.LightningModule):
 
         # Forward pass with latent
         reconstructions, latent, posterior = self.forward_with_latent(targets, sample_posterior=True)
+        train_metrics.update(self._compute_latent_stats(latent, posterior))
 
         # ========== Train VAE (Generator) ==========
         self.toggle_optimizer(opt_vae)
@@ -615,13 +635,13 @@ class VAELightningModule(pl.LightningModule):
         }
 
     def on_validation_epoch_start(self) -> None:
-        """Swap to EMA weights once per validation epoch to avoid per-batch copy."""
+        # Swap to EMA weights once per validation epoch to avoid per-batch copy.
         if self.use_ema and self.ema is not None:
             self.ema.store(self.vae.parameters())
             self.ema.copy_to(self.vae.parameters())
 
     def on_validation_epoch_end(self) -> None:
-        """Restore original training weights after validation epoch."""
+        # Restore original training weights after validation epoch.
         if self.use_ema and self.ema is not None:
             self.ema.restore(self.vae.parameters())
 
@@ -658,6 +678,7 @@ class VAELightningModule(pl.LightningModule):
         loss_dict["psnr"] = psnr
         loss_dict["ssim"] = ssim
         loss_dict["psim"] = psim
+        loss_dict.update(self._compute_latent_stats(latent, posterior))
 
         val_metrics = {key: value for key, value in loss_dict.items()}
         val_visuals = {
@@ -742,39 +763,16 @@ class VAELightningModule(pl.LightningModule):
             last_epoch: int = -1,
     ):
         """
-        Build a learning rate scheduler from a per-role config dict.
-
-        Delegates entirely to ``diffusers.optimization.get_scheduler``, which
-        internally validates required arguments per scheduler type.
+        Build a learning rate scheduler from the optimizer config.
 
         Args:
-            optimizer: The optimizer to schedule.
-            opt_config: Dictionary with keys:
-                - lr_scheduler: Scheduler type. Supported:
-                    'constant', 'constant_with_warmup', 'linear',
-                    'cosine', 'cosine_with_restarts', 'polynomial',
-                    'piecewise_constant'.
-                - lr_warmup_steps: Number of warmup steps (default 500,
-                    clamped to ``num_training_steps``).
-                - lr_num_cycles: Cycles for cosine-family schedulers.
-                    For 'cosine' this controls the fraction of a cosine
-                    period (default 0.5 = half-cosine decay).
-                    For 'cosine_with_restarts' this is the number of
-                    hard restarts (default 1).
-                - lr_power: Exponent for 'polynomial' decay (default 1.0).
-                - lr_end: Final learning rate for 'polynomial' (default 1e-7).
-                - lr_step_rules: Step rules string for 'piecewise_constant'
-                    (e.g. "1:10,0.1:20,0.01:30,0.005").
-            num_training_steps: Total training steps for this scheduler
-                (already accounts for alternating G/D splits).
-            last_epoch: Index of the last epoch for resuming training
-                (default -1, meaning fresh start).
+            optimizer: Optimizer to schedule.
+            opt_config: Scheduler-related optimizer config.
+            num_training_steps: Total scheduler steps.
+            last_epoch: Last epoch index when resuming training.
 
         Returns:
-            ``LambdaLR`` scheduler from ``diffusers.optimization.get_scheduler``.
-
-        Raises:
-            ValueError: If scheduler type is not recognised by diffusers.
+            Scheduler created by ``diffusers.optimization.get_scheduler``.
         """
         scheduler_type = opt_config.get("lr_scheduler", "constant_with_warmup")
         num_training_steps = max(1, num_training_steps)
@@ -798,17 +796,6 @@ class VAELightningModule(pl.LightningModule):
         )
 
     def configure_optimizers(self):
-        """
-        Configure optimizers and learning rate schedulers.
-
-        Uses trainer.estimated_stepping_batches for accurate step count estimation.
-        In this module, VAE and discriminator is updated every step after ``disc_start_step``.
-
-        Important considerations:
-            - VAE scheduler steps on every accumulation boundary.
-            - Discriminator scheduler steps after ``disc_start_step``.
-            - Warmup steps are clamped to each scheduler's total training steps.
-        """
         # ---- total training steps estimation ----
         estimated = self.trainer.estimated_stepping_batches
         if estimated is None or not math.isfinite(estimated):
