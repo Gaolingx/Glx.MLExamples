@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+from torch import nn
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
@@ -62,6 +63,26 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
         self.training_cfg = cfg["training"]
         self.validation_cfg = cfg.get("validation", {})
+        self.use_spatial_conditioning = bool(self.training_cfg.get("use_spatial_conditioning", True))
+        self.use_aspect_ratio_conditioning = bool(self.training_cfg.get("use_aspect_ratio_conditioning", True))
+        self.vae_scale_factor = int(2 ** (len(self.vae.config.block_out_channels) - 1))
+
+        self.aspect_ratio_mlp: Optional[nn.Module]
+        if self.use_aspect_ratio_conditioning:
+            self.aspect_ratio_mlp = nn.Sequential(
+                nn.Linear(1, 32),
+                nn.SiLU(),
+                nn.Linear(32, 1),
+            )
+        else:
+            self.aspect_ratio_mlp = None
+
+        if self.use_spatial_conditioning or self.use_aspect_ratio_conditioning:
+            self._expand_unet_input_channels(
+                int(self.unet.config.in_channels)
+                + (2 if self.use_spatial_conditioning else 0)
+                + (1 if self.use_aspect_ratio_conditioning else 0)
+            )
 
         # Runtime metric cache for callback-side unified stdout logging.
         self.runtime_log_dict: Dict[str, float] = {}
@@ -92,6 +113,88 @@ class StableDiffusionLightningModule(pl.LightningModule):
         alpha = alphas_cumprod[timesteps]
         sigma = (1.0 - alpha).clamp(min=1e-8)
         return alpha / sigma
+
+    def _expand_unet_input_channels(self, target_in_channels: int) -> None:
+        current_in_channels = int(self.unet.config.in_channels)
+        if target_in_channels <= current_in_channels:
+            return
+
+        conv_in = self.unet.conv_in
+        expanded_conv = nn.Conv2d(
+            in_channels=target_in_channels,
+            out_channels=conv_in.out_channels,
+            kernel_size=conv_in.kernel_size,
+            stride=conv_in.stride,
+            padding=conv_in.padding,
+        )
+        with torch.no_grad():
+            expanded_conv.weight.zero_()
+            expanded_conv.bias.copy_(conv_in.bias)
+            expanded_conv.weight[:, :current_in_channels].copy_(conv_in.weight)
+
+        self.unet.conv_in = expanded_conv
+        self.unet.config.in_channels = target_in_channels
+        if hasattr(self.unet, "register_to_config"):
+            self.unet.register_to_config(in_channels=target_in_channels)
+
+    def _build_pos_map(self, batch: Dict[str, torch.Tensor], latent_height: int, latent_width: int) -> Optional[torch.Tensor]:
+        if not self.use_spatial_conditioning:
+            return None
+
+        original_size = batch.get("original_size")
+        crop_top_left = batch.get("crop_top_left")
+        target_size = batch.get("target_size")
+        if original_size is None or crop_top_left is None or target_size is None:
+            return None
+
+        pos_maps: List[torch.Tensor] = []
+        for crop, target in zip(crop_top_left, target_size):
+            target_h = max(int(target[0].item()), 1)
+            target_w = max(int(target[1].item()), 1)
+            latent_target_h = max(int(round(target_h / self.vae_scale_factor)), latent_height)
+            latent_target_w = max(int(round(target_w / self.vae_scale_factor)), latent_width)
+            crop_top = max(0, min(int(round(crop[0].item() / self.vae_scale_factor)), max(0, latent_target_h - latent_height)))
+            crop_left = max(0, min(int(round(crop[1].item() / self.vae_scale_factor)), max(0, latent_target_w - latent_width)))
+
+            y_coords = torch.linspace(-1.0, 1.0, steps=latent_target_h, device=self.device, dtype=torch.float32)
+            x_coords = torch.linspace(-1.0, 1.0, steps=latent_target_w, device=self.device, dtype=torch.float32)
+            grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing="ij")
+            pos_map = torch.stack((grid_y, grid_x), dim=0)
+            pos_map = pos_map[:, crop_top: crop_top + latent_height, crop_left: crop_left + latent_width]
+            if pos_map.shape[-2:] != (latent_height, latent_width):
+                pos_map = F.interpolate(pos_map.unsqueeze(0), size=(latent_height, latent_width), mode="bilinear", align_corners=False).squeeze(0)
+            pos_maps.append(pos_map)
+
+        return torch.stack(pos_maps, dim=0)
+
+    def _build_aspect_ratio_map(self, batch: Dict[str, torch.Tensor], latent_height: int, latent_width: int) -> Optional[torch.Tensor]:
+        if not self.use_aspect_ratio_conditioning:
+            return None
+
+        aspect_ratio = batch.get("aspect_ratio")
+        if aspect_ratio is None:
+            return None
+
+        aspect_ratio = aspect_ratio.to(device=self.device, dtype=torch.float32).view(-1, 1)
+        if self.aspect_ratio_mlp is not None:
+            aspect_ratio = self.aspect_ratio_mlp(aspect_ratio)
+        return aspect_ratio.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, latent_height, latent_width)
+
+    def _augment_unet_input(self, noisy_latents: torch.Tensor, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        conditioning_tensors: List[torch.Tensor] = [noisy_latents]
+        latent_height, latent_width = noisy_latents.shape[-2:]
+
+        pos_map = self._build_pos_map(batch, latent_height, latent_width)
+        if pos_map is not None:
+            conditioning_tensors.append(pos_map.to(device=noisy_latents.device, dtype=noisy_latents.dtype))
+
+        aspect_ratio_map = self._build_aspect_ratio_map(batch, latent_height, latent_width)
+        if aspect_ratio_map is not None:
+            conditioning_tensors.append(aspect_ratio_map.to(device=noisy_latents.device, dtype=noisy_latents.dtype))
+
+        if len(conditioning_tensors) == 1:
+            return noisy_latents
+        return torch.cat(conditioning_tensors, dim=1)
 
     def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
         pixel_values = batch["pixel_values"]
@@ -124,9 +227,10 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
         encoder_hidden_states = self.encode_prompt(input_ids)
+        unet_input = self._augment_unet_input(noisy_latents, batch)
 
         model_pred = self.unet(
-            noisy_latents,
+            unet_input,
             timesteps,
             encoder_hidden_states,
         ).sample
@@ -150,6 +254,7 @@ class StableDiffusionLightningModule(pl.LightningModule):
             "train/snr_mean": snr.detach().mean(),
             "train/latent_std": latents.detach().float().std(unbiased=False),
             "train/noisy_latent_std": noisy_latents.detach().float().std(unbiased=False),
+            "train/unet_input_std": unet_input.detach().float().std(unbiased=False),
             "train/noise_std": noise.detach().float().std(unbiased=False),
             "train/pred_std": model_pred.detach().float().std(unbiased=False),
             "train/target_std": target.detach().float().std(unbiased=False),

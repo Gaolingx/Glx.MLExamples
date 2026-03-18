@@ -171,6 +171,8 @@ class StableDiffusionDataModule(pl.LightningDataModule):
             batch["crop_top_left"] = torch.stack([example["crop_top_left"] for example in examples])
         if "target_size" in examples[0]:
             batch["target_size"] = torch.stack([example["target_size"] for example in examples])
+        if "aspect_ratio" in examples[0]:
+            batch["aspect_ratio"] = torch.stack([example["aspect_ratio"] for example in examples])
         return batch
 
     def train_dataloader(self) -> DataLoader:

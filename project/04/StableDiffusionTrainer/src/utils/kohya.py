@@ -110,6 +110,7 @@ class HuggingFaceImageTextDataset(TorchDataset):
         if not isinstance(image, Image.Image):
             image = Image.open(image)
         image = _convert_rgb(image)
+        original_size = (image.height, image.width)
         pixel_values = self.image_transforms(image)
         tokenized = self.tokenizer(
             caption,
@@ -122,6 +123,13 @@ class HuggingFaceImageTextDataset(TorchDataset):
             "pixel_values": pixel_values,
             "input_ids": tokenized.input_ids.squeeze(0),
             "caption": caption,
+            "original_size": torch.tensor([original_size[0], original_size[1]], dtype=torch.long),
+            "crop_top_left": torch.tensor([0, 0], dtype=torch.long),
+            "target_size": torch.tensor([pixel_values.shape[1], pixel_values.shape[2]], dtype=torch.long),
+            "aspect_ratio": torch.tensor(
+                math.log(max(original_size[1], 1) / max(original_size[0], 1)),
+                dtype=torch.float32,
+            ),
         }
 
 
@@ -223,19 +231,12 @@ class KohyaStyleDataset(TorchDataset):
 
         target_res = int(self.arb_config.get("target_res", self.size))
         res_step = int(self.arb_config.get("res_step", 64))
-        min_size = int(self.arb_config.get("min_size", res_step))
         max_size = int(self.arb_config.get("max_size", target_res * 2))
-        max_area = target_res * target_res
 
-        resolutions = {(target_res, target_res)}
-        for width in range(min_size, max_size + 1, res_step):
-            for height in range(min_size, max_size + 1, res_step):
-                area = width * height
-                if area > max_area:
-                    continue
-                if width < res_step or height < res_step:
-                    continue
-                resolutions.add((width, height))
+        resolutions = {(self.size, self.size)}
+        for long_edge in range(self.size, max_size + 1, res_step):
+            resolutions.add((self.size, long_edge))
+            resolutions.add((long_edge, self.size))
 
         return sorted(resolutions, key=lambda item: (item[0] * item[1], item[0]))
 
@@ -314,8 +315,33 @@ class KohyaStyleDataset(TorchDataset):
         crop_top = random.randint(0, max_top) if max_top > 0 else 0
         return crop_left, crop_top
 
+    def _apply_square_crop(
+            self,
+            image: Image.Image,
+            crop_top: int,
+            crop_left: int,
+    ) -> Tuple[Image.Image, Tuple[int, int]]:
+        crop_top_offset = 0
+        crop_left_offset = 0
+        if image.height > image.width:
+            max_offset = image.height - self.size
+            crop_top_offset = max_offset // 2 if self.center_crop else random.randint(0, max_offset)
+        elif image.width > image.height:
+            max_offset = image.width - self.size
+            crop_left_offset = max_offset // 2 if self.center_crop else random.randint(0, max_offset)
+
+        square = image.crop(
+            (
+                crop_left_offset,
+                crop_top_offset,
+                crop_left_offset + self.size,
+                crop_top_offset + self.size,
+            )
+        )
+        return square, (crop_top + crop_top_offset, crop_left + crop_left_offset)
+
     def _load_and_transform_image(self, image_path: str, bucket: Tuple[int, int]) -> Tuple[
-        torch.Tensor, Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
+        torch.Tensor, Tuple[int, int], Tuple[int, int], Tuple[int, int], float]:
         target_w, target_h = bucket
         with Image.open(image_path) as image:
             image = _convert_rgb(image)
@@ -326,11 +352,13 @@ class KohyaStyleDataset(TorchDataset):
             image = image.resize((resized_w, resized_h), resample=Image.Resampling.BICUBIC)
             crop_left, crop_top = self._get_crop_coordinates(resized_w, resized_h, target_w, target_h)
             image = image.crop((crop_left, crop_top, crop_left + target_w, crop_top + target_h))
+            image, crop_coords = self._apply_square_crop(image, crop_top, crop_left)
             if self.random_flip and random.random() < 0.5:
                 image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
             tensor = self.to_tensor(image)
+            aspect_ratio = math.log(max(original_size[0], 1) / max(original_size[1], 1))
 
-        return tensor, original_size, (crop_top, crop_left), (target_h, target_w)
+        return tensor, original_size, crop_coords, (target_h, target_w), aspect_ratio
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         sample = self.samples[index]
@@ -338,7 +366,10 @@ class KohyaStyleDataset(TorchDataset):
         text_path = sample["text_path"]
         bucket = tuple(sample.get("bucket", (self.size, self.size)))
         caption = self._process_caption(self._read_caption(text_path))
-        pixel_values, original_size, crop_coords, target_size = self._load_and_transform_image(image_path, bucket)
+        pixel_values, original_size, crop_coords, target_size, aspect_ratio = self._load_and_transform_image(
+            image_path,
+            bucket,
+        )
         tokenized = self.tokenizer(
             caption,
             truncation=True,
@@ -354,4 +385,5 @@ class KohyaStyleDataset(TorchDataset):
             "original_size": torch.tensor([original_size[1], original_size[0]], dtype=torch.long),
             "crop_top_left": torch.tensor([crop_coords[0], crop_coords[1]], dtype=torch.long),
             "target_size": torch.tensor([target_size[0], target_size[1]], dtype=torch.long),
+            "aspect_ratio": torch.tensor(aspect_ratio, dtype=torch.float32),
         }
