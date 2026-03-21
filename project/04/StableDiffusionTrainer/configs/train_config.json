@@ -6,12 +6,12 @@
   "scheduler_config_path": "models/scheduler/scheduler_config.json",
   "unet_config_path": "models/unet/config.json",
   "dataset": {
-    "name": "reach-vb/pokemon-blip-captions",
+    "name": "Mercity/laion-subset",
     "split": "train",
     "image_column": "image",
-    "caption_column": "text",
+    "caption_column": "caption",
     "cache_dir": "./.cache/huggingface",
-    "max_train_samples": 2000,
+    "max_train_samples": null,
     "resolution": 512,
     "center_crop": true,
     "random_flip": true,
@@ -21,10 +21,10 @@
     "seed": 42,
     "batch_size": 2,
     "max_epochs": 1,
-    "max_steps": 200,
+    "max_steps": -1,
     "accumulate_grad_batches": 1,
     "precision": "16-mixed",
-    "learning_rate": 0.0001,
+    "learning_rate": 4.5e-6,
     "weight_decay": 0.01,
     "adam_beta1": 0.9,
     "adam_beta2": 0.999,
@@ -32,9 +32,11 @@
     "max_grad_norm": 1.0,
     "lr_scheduler": "cosine",
     "lr_warmup_steps": 100,
+    "override_lr_on_resume": false,
+    "reset_scheduler_on_resume": false,
     "num_train_timesteps": 1000,
     "prediction_type": "epsilon",
-    "gradient_checkpointing": false,
+    "gradient_checkpointing": true,
     "enable_xformers_memory_efficient_attention": false,
     "allow_tf32": true
   },
@@ -46,9 +48,25 @@
     "find_unused_parameters": false,
     "gradient_as_bucket_view": true
   },
+  "lora": {
+    "enabled": false,
+    "adapter_name": "default",
+    "rank": 16,
+    "alpha": 16,
+    "dropout": 0.0,
+    "bias": "none",
+    "target_modules": [
+      "to_q",
+      "to_k",
+      "to_v",
+      "to_out.0"
+    ],
+    "init_lora_weights": true,
+    "init_path": null
+  },
   "validation": {
     "enabled": true,
-    "every_n_steps": 100,
+    "every_n_steps": 500,
     "num_inference_steps": 25,
     "guidance_scale": 7.5,
     "prompts": [
@@ -62,20 +80,15 @@
     "monitor": "train/loss",
     "mode": "min",
     "save_last": true,
-    "every_n_train_steps": 100
+    "every_n_train_steps": 500
   },
   "logging": {
     "tensorboard_save_dir": "outputs/sd15-lightning/tb_logs",
     "name": "sd15_lightning",
     "log_every_n_steps": 10
   },
-  "resume_override": {
-    "reset_lr": false,
-    "learning_rate": 0.0001,
-    "reset_scheduler": false
-  },
   "inference": {
-    "num_inference_steps": 30,
+    "num_inference_steps": 100,
     "guidance_scale": 7.5,
     "height": 512,
     "width": 512,

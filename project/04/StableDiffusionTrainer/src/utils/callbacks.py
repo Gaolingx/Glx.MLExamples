@@ -41,15 +41,14 @@ class LRandSchedulerOverrideCallback(Callback):
     def __init__(self, cfg: Dict[str, Any]) -> None:
         super().__init__()
         self.training_cfg = cfg.get("training", {})
-        self.override_cfg = cfg.get("resume_override", {})
         self.applied = False
 
     def on_fit_start(self, trainer: Trainer, pl_module: pl.LightningModule) -> None:
         if self.applied:
             return
 
-        reset_lr = bool(self.override_cfg.get("reset_lr", False))
-        reset_scheduler = bool(self.override_cfg.get("reset_scheduler", False))
+        reset_lr = bool(self.training_cfg.get("override_lr_on_resume", False))
+        reset_scheduler = bool(self.training_cfg.get("reset_scheduler_on_resume", False))
 
         if not reset_lr and not reset_scheduler:
             return
@@ -58,7 +57,7 @@ class LRandSchedulerOverrideCallback(Callback):
             return
 
         optimizer = trainer.optimizers[0]
-        target_lr = float(self.override_cfg.get("learning_rate", self.training_cfg.get("learning_rate", 1e-4)))
+        target_lr = float(self.training_cfg.get("learning_rate", 1e-4))
 
         if reset_lr:
             for group in optimizer.param_groups:

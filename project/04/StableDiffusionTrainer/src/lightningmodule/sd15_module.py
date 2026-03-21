@@ -1,4 +1,5 @@
 import json
+import importlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,6 +26,9 @@ class StableDiffusionLightningModule(pl.LightningModule):
         super().__init__()
         self.cfg = cfg
         self.save_hyperparameters(cfg)
+        self.lora_cfg = cfg.get("lora", {})
+        self.lora_enabled = bool(self.lora_cfg.get("enabled", False))
+        self.lora_adapter_name = str(self.lora_cfg.get("adapter_name", "default"))
 
         model_name = cfg.get("pretrained_model_name_or_path")
         clip_model_name = cfg.get("clip_model_name_or_path", "CompVis/stable-diffusion-v1-4")
@@ -58,7 +62,10 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
         self.vae.requires_grad_(False)
         self.text_encoder.requires_grad_(False)
-        self.unet.requires_grad_(True)
+        if self.lora_enabled:
+            self._setup_lora()
+        else:
+            self.unet.requires_grad_(True)
 
         self.training_cfg = cfg["training"]
         self.validation_cfg = cfg.get("validation", {})
@@ -77,6 +84,84 @@ class StableDiffusionLightningModule(pl.LightningModule):
                 rank_zero_info(
                     f"[warning] xFormers attention requested but unavailable; falling back to standard attention. ({exc})"
                 )
+
+    def _setup_lora(self) -> None:
+        try:
+            LoraConfig = importlib.import_module("peft").LoraConfig
+        except ImportError as exc:
+            raise ImportError("LoRA training requires `peft`. Please install it with `pip install peft`.") from exc
+
+        if not self.cfg.get("pretrained_model_name_or_path"):
+            raise ValueError("`pretrained_model_name_or_path` must be provided when `lora.enabled=true`.")
+
+        init_path = self.lora_cfg.get("init_path")
+        resolved_init_path = self._resolve_lora_init_path(init_path) if init_path else None
+
+        if resolved_init_path is None:
+            target_modules = self.lora_cfg.get("target_modules", ["to_q", "to_k", "to_v", "to_out.0"])
+            lora_config = LoraConfig(
+                r=int(self.lora_cfg.get("rank", 16)),
+                lora_alpha=int(self.lora_cfg.get("alpha", 16)),
+                lora_dropout=float(self.lora_cfg.get("dropout", 0.0)),
+                bias=str(self.lora_cfg.get("bias", "none")),
+                target_modules=target_modules,
+                init_lora_weights=self.lora_cfg.get("init_lora_weights", True),
+            )
+            self.unet.add_adapter(lora_config, adapter_name=self.lora_adapter_name)
+            rank_zero_info(
+                f"[LoRA] Added new adapter '{self.lora_adapter_name}' with rank={lora_config.r}, alpha={lora_config.lora_alpha}."
+            )
+        else:
+            self.unet.load_lora_adapter(
+                resolved_init_path,
+                prefix=None,
+                adapter_name=self.lora_adapter_name,
+            )
+            rank_zero_info(f"[LoRA] Loaded adapter '{self.lora_adapter_name}' from {resolved_init_path}.")
+
+        self.unet.set_adapter(self.lora_adapter_name)
+        self.unet.requires_grad_(False)
+        for name, parameter in self.unet.named_parameters():
+            parameter.requires_grad = "lora_" in name
+
+        trainable_params = sum(param.numel() for param in self.unet.parameters() if param.requires_grad)
+        all_params = sum(param.numel() for param in self.unet.parameters())
+        rank_zero_info(
+            f"[LoRA] Training {trainable_params:,} / {all_params:,} UNet parameters "
+            f"({(100.0 * trainable_params / max(all_params, 1)):.4f}%)."
+        )
+
+    def _resolve_lora_init_path(self, init_path: str) -> str:
+        path = Path(init_path)
+
+        if path.is_dir():
+            candidate_dirs = [
+                path,
+                path / "unet_lora",
+                path / "hf_checkpoint" / "unet_lora",
+            ]
+            for candidate in candidate_dirs:
+                if candidate.is_dir():
+                    return str(candidate)
+
+        if path.is_file() and path.suffix == ".ckpt":
+            checkpoint_dir = path.with_suffix("")
+            candidate_dirs = [
+                checkpoint_dir / "hf_checkpoint" / "unet_lora",
+                path.parent / "hf_checkpoint" / "unet_lora",
+            ]
+            for candidate in candidate_dirs:
+                if candidate.is_dir():
+                    return str(candidate)
+            raise FileNotFoundError(
+                "LoRA init checkpoint was provided, but no exported adapter directory was found next to it. "
+                "Expected `hf_checkpoint/unet_lora`."
+            )
+
+        if path.exists():
+            return str(path)
+
+        raise FileNotFoundError(f"LoRA init path not found: {init_path}")
 
     def on_fit_start(self) -> None:
         # Keep frozen modules in eval mode during training.
@@ -239,6 +324,20 @@ class StableDiffusionLightningModule(pl.LightningModule):
         save_dir = Path(save_directory)
         save_dir.mkdir(parents=True, exist_ok=True)
 
+        if self.lora_enabled:
+            lora_dir = save_dir / "unet_lora"
+            self.unet.save_lora_adapter(str(lora_dir), adapter_name=self.lora_adapter_name)
+
+            export_payload = {
+                "base_model_name_or_path": self.cfg.get("pretrained_model_name_or_path"),
+                "adapter_name": self.lora_adapter_name,
+                "lora": self.lora_cfg,
+                "training_config": self.cfg,
+            }
+            with open(save_dir / "lora_config.json", "w", encoding="utf-8") as f:
+                json.dump(export_payload, f, ensure_ascii=False, indent=2)
+            return
+
         pipeline = StableDiffusionPipeline(
             vae=self.vae,
             text_encoder=self.text_encoder,
@@ -259,6 +358,26 @@ class StableDiffusionLightningModule(pl.LightningModule):
         checkpoint_dir = Path(checkpoint_filepath).with_suffix("")
         hf_dir = checkpoint_dir / "hf_checkpoint"
         hf_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.lora_enabled:
+            unet_lora_dir = hf_dir / "unet_lora"
+            self.unet.save_lora_adapter(str(unet_lora_dir), adapter_name=self.lora_adapter_name)
+
+            with open(hf_dir / "lora_config.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "base_model_name_or_path": self.cfg.get("pretrained_model_name_or_path"),
+                        "adapter_name": self.lora_adapter_name,
+                        "lora": self.lora_cfg,
+                    },
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+            with open(hf_dir / "training_config.json", "w", encoding="utf-8") as f:
+                json.dump(self.cfg, f, indent=2, ensure_ascii=False)
+            return
 
         unet_save_dir = hf_dir / "unet"
         self.unet.save_pretrained(str(unet_save_dir))
@@ -291,7 +410,7 @@ class StableDiffusionLightningModule(pl.LightningModule):
             optimizer_cls = bnb.optim.AdamW8bit
 
         optimizer = optimizer_cls(
-            self.unet.parameters(),
+            [param for param in self.unet.parameters() if param.requires_grad],
             lr=float(self.training_cfg.get("learning_rate", 1e-4)),
             betas=(
                 float(self.training_cfg.get("adam_beta1", 0.9)),

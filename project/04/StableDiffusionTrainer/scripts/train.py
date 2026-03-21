@@ -54,6 +54,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Number of GPUs to use",
     )
+    parser.add_argument(
+        "--lora_init_path",
+        type=str,
+        default=None,
+        help="Optional LoRA init path. Supports adapter dir or Lightning ckpt exported with hf_checkpoint/unet_lora.",
+    )
     return parser.parse_args()
 
 
@@ -72,6 +78,9 @@ def main() -> None:
         cfg["training"]["precision"] = args.precision
     if args.gpus is not None:
         cfg["distributed"]["devices"] = args.gpus
+    if args.lora_init_path is not None:
+        cfg.setdefault("lora", {})["enabled"] = True
+        cfg["lora"]["init_path"] = args.lora_init_path
 
     seed_everything(int(training_cfg.get("seed", 42)))
 
@@ -118,7 +127,7 @@ def main() -> None:
 
     # Save final model
     if trainer.is_global_zero:
-        final_model_path = Path(output_dir) / "final_model"
+        final_model_path = Path(output_dir) / ("final_lora" if cfg.get("lora", {}).get("enabled", False) else "final_model")
         trainer.lightning_module.save_pretrained(final_model_path)
         print(f"Final model saved to: {final_model_path}")
 

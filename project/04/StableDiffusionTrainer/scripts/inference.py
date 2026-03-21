@@ -16,7 +16,9 @@ from src.utils.config import load_json_config
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Inference for SD1.5 Lightning checkpoint.")
     parser.add_argument("--config", type=str, default="./configs/train_config.json", help="Path to JSON config file.")
-    parser.add_argument("--ckpt_path", type=str, required=True, help="Lightning .ckpt path.")
+    parser.add_argument("--ckpt_path", type=str, default=None, help="Lightning .ckpt path.")
+    parser.add_argument("--base_model", type=str, default=None, help="Base SD model for standalone LoRA inference.")
+    parser.add_argument("--lora_path", type=str, default=None, help="Optional LoRA adapter directory to load.")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt.")
     parser.add_argument("--negative_prompt", type=str, default=None, help="Negative prompt.")
     parser.add_argument("--num_images", type=int, default=1, help="Number of images.")
@@ -28,20 +30,33 @@ def main() -> None:
     args = parse_args()
     cfg = load_json_config(args.config)
 
-    module = StableDiffusionLightningModule.load_from_checkpoint(args.ckpt_path, cfg=cfg, map_location="cpu")
-    module.eval()
+    if args.ckpt_path is None and (args.base_model is None or args.lora_path is None):
+        raise ValueError("Provide either --ckpt_path, or both --base_model and --lora_path.")
 
-    scheduler = DPMSolverMultistepScheduler.from_config(module.noise_scheduler.config)
-    pipe = StableDiffusionPipeline(
-        vae=module.vae,
-        text_encoder=module.text_encoder,
-        tokenizer=module.tokenizer,
-        unet=module.unet,
-        scheduler=scheduler,
-        safety_checker=None,
-        feature_extractor=None,
-        requires_safety_checker=False,
-    )
+    if args.ckpt_path is not None:
+        module = StableDiffusionLightningModule.load_from_checkpoint(args.ckpt_path, cfg=cfg, map_location="cpu")
+        module.eval()
+
+        scheduler = DPMSolverMultistepScheduler.from_config(module.noise_scheduler.config)
+        pipe = StableDiffusionPipeline(
+            vae=module.vae,
+            text_encoder=module.text_encoder,
+            tokenizer=module.tokenizer,
+            unet=module.unet,
+            scheduler=scheduler,
+            safety_checker=None,
+            feature_extractor=None,
+            requires_safety_checker=False,
+        )
+    else:
+        pipe = StableDiffusionPipeline.from_pretrained(
+            args.base_model,
+            safety_checker=None,
+            feature_extractor=None,
+            requires_safety_checker=False,
+        )
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+        pipe.unet.load_lora_adapter(args.lora_path, prefix=None, adapter_name=cfg.get("lora", {}).get("adapter_name", "default"))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     pipe = pipe.to(device)
