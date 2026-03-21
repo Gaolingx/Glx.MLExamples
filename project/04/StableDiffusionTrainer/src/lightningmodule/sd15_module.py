@@ -50,7 +50,8 @@ class StableDiffusionLightningModule(pl.LightningModule):
             self.vae = AutoencoderKL.from_pretrained(vae_name)
 
             if scheduler_config_path:
-                self.noise_scheduler = DDPMScheduler.from_config(scheduler_config_path)
+                 scheduler_config = load_json_config(scheduler_config_path)
+                 self.noise_scheduler = DDPMScheduler.from_config(scheduler_config)
             else:
                 raise ValueError("scheduler_config_path must be provided when pretrained_model_name_or_path is empty")
 
