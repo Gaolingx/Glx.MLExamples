@@ -18,7 +18,7 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_info
 from PIL import Image
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from src.utils.config import save_json_config
+from src.utils.config import load_json_config, save_json_config
 
 
 class StableDiffusionLightningModule(pl.LightningModule):
@@ -55,8 +55,7 @@ class StableDiffusionLightningModule(pl.LightningModule):
                 raise ValueError("scheduler_config_path must be provided when pretrained_model_name_or_path is empty")
 
             if unet_config_path:
-                with open(unet_config_path, "r", encoding="utf-8") as f:
-                    raw_unet_config = json.load(f)
+                raw_unet_config = load_json_config(unet_config_path)
                 unet_config = {k: v for k, v in raw_unet_config.items() if not k.startswith("_")}
                 self.unet = UNet2DConditionModel.from_config(unet_config)
             else:
