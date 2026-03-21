@@ -175,8 +175,10 @@ class StableDiffusionLightningModule(pl.LightningModule):
         if aspect_ratio is None:
             return None
 
-        aspect_ratio = aspect_ratio.to(device=self.device, dtype=torch.float32).view(-1, 1)
+        aspect_ratio = aspect_ratio.to(device=self.device).view(-1, 1)
         if self.aspect_ratio_mlp is not None:
+            mlp_param = next(self.aspect_ratio_mlp.parameters())
+            aspect_ratio = aspect_ratio.to(device=mlp_param.device, dtype=mlp_param.dtype)
             aspect_ratio = self.aspect_ratio_mlp(aspect_ratio)
         return aspect_ratio.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, latent_height, latent_width)
 
@@ -194,6 +196,36 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
         if len(conditioning_tensors) == 1:
             return noisy_latents
+        return torch.cat(conditioning_tensors, dim=1)
+
+    def _build_generation_conditioning(
+        self,
+        batch_size: int,
+        latent_height: int,
+        latent_width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        conditioning_tensors: List[torch.Tensor] = []
+
+        if self.use_spatial_conditioning:
+            conditioning_tensors.append(
+                torch.zeros(batch_size, 2, latent_height, latent_width, device=device, dtype=dtype)
+            )
+
+        if self.use_aspect_ratio_conditioning:
+            aspect_ratio = torch.ones(batch_size, 1, device=device, dtype=dtype)
+            if self.aspect_ratio_mlp is not None:
+                mlp_param = next(self.aspect_ratio_mlp.parameters())
+                aspect_ratio = aspect_ratio.to(device=mlp_param.device, dtype=mlp_param.dtype)
+                aspect_ratio = self.aspect_ratio_mlp(aspect_ratio)
+                aspect_ratio = aspect_ratio.to(device=device, dtype=dtype)
+            conditioning_tensors.append(
+                aspect_ratio.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, latent_height, latent_width)
+            )
+
+        if len(conditioning_tensors) == 0:
+            return None
         return torch.cat(conditioning_tensors, dim=1)
 
     def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
@@ -319,14 +351,42 @@ class StableDiffusionLightningModule(pl.LightningModule):
         pipeline = pipeline.to(self.device)
         pipeline.set_progress_bar_config(disable=True)
 
+        original_forward = pipeline.unet.forward
+        original_in_channels = int(pipeline.unet.config.in_channels)
+
+        if self.use_spatial_conditioning or self.use_aspect_ratio_conditioning:
+            pipeline.unet.config.in_channels = 4
+            if hasattr(pipeline.unet, "register_to_config"):
+                pipeline.unet.register_to_config(in_channels=4)
+
+            def conditioned_forward(sample: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+                conditioning = self._build_generation_conditioning(
+                    batch_size=sample.shape[0],
+                    latent_height=sample.shape[-2],
+                    latent_width=sample.shape[-1],
+                    device=sample.device,
+                    dtype=sample.dtype,
+                )
+                if conditioning is not None:
+                    sample = torch.cat((sample, conditioning), dim=1)
+                return original_forward(sample, *args, **kwargs)
+
+            pipeline.unet.forward = conditioned_forward
+
         images: List[Image.Image] = []
-        for prompt in prompts:
-            image = pipeline(
-                prompt,
-                num_inference_steps=int(self.validation_cfg.get("num_inference_steps", 25)),
-                guidance_scale=float(self.validation_cfg.get("guidance_scale", 7.5)),
-            ).images[0]
-            images.append(image)
+        try:
+            for prompt in prompts:
+                image = pipeline(
+                    prompt,
+                    num_inference_steps=int(self.validation_cfg.get("num_inference_steps", 25)),
+                    guidance_scale=float(self.validation_cfg.get("guidance_scale", 7.5)),
+                ).images[0]
+                images.append(image)
+        finally:
+            pipeline.unet.forward = original_forward
+            pipeline.unet.config.in_channels = original_in_channels
+            if hasattr(pipeline.unet, "register_to_config"):
+                pipeline.unet.register_to_config(in_channels=original_in_channels)
 
         # Lightning TensorBoard logger exposes underlying SummaryWriter.
         if self.logger is not None and hasattr(self.logger, "experiment"):
