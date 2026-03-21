@@ -105,7 +105,7 @@ def build_callbacks(cfg: Dict[str, Any]) -> list:
             save_top_k=checkpoint_config.get("save_top_k", 3),
             monitor=checkpoint_config.get("monitor", "val/rec_loss"),
             mode=checkpoint_config.get("mode", "min"),
-            save_last=True,
+            save_last=checkpoint_config.get("save_last", True),
             every_n_train_steps=checkpoint_config.get("save_every_n_steps", 1000),
             save_hf_format=True,
         ),

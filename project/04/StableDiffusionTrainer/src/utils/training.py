@@ -30,13 +30,13 @@ def build_callbacks(cfg: Dict[str, Any]) -> list:
 
     ckpt_callback = CheckpointCallback(
         dirpath=checkpoint_cfg.get("dirpath", "outputs/checkpoints"),
-        filename="sd15-epoch={epoch:02d}-step={step:06d}-val",
+        filename="sd15-{epoch:02d}-{step:06d}-{train/loss:.4f}",
         monitor=checkpoint_cfg.get("monitor", "train/loss"),
         mode=checkpoint_cfg.get("mode", "min"),
         save_top_k=int(checkpoint_cfg.get("save_top_k", 3)),
         save_last=bool(checkpoint_cfg.get("save_last", True)),
         every_n_train_steps=int(checkpoint_cfg.get("every_n_train_steps", 100)),
-        auto_insert_metric_name=False,
+        save_hf_format=True,
     )
 
     return [

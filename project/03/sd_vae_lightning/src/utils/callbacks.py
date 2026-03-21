@@ -235,43 +235,10 @@ class VAELoggingCallback(Callback):
 
 
 class VAECheckpointCallback(ModelCheckpoint):
-    """
-    Extended ModelCheckpoint for VAE models.
-    Saves both Lightning checkpoint and HuggingFace-compatible weights.
+    """ModelCheckpoint with optional HF export delegated to LightningModule."""
 
-    Args:
-        dirpath: Directory to save checkpoints.
-        filename: Checkpoint filename template.
-        save_top_k: Number of best checkpoints to keep.
-        monitor: Metric to monitor for best checkpoint.
-        mode: 'min' or 'max' for monitored metric.
-        save_last: Whether to save the last checkpoint.
-        every_n_train_steps: Save every N training steps.
-        save_hf_format: Whether to save in HuggingFace format.
-    """
-
-    def __init__(
-            self,
-            dirpath: Optional[str] = None,
-            filename: str = "vae-{epoch:02d}-{step:06d}",
-            save_top_k: int = 3,
-            monitor: str = "val/rec_loss",
-            mode: str = "min",
-            save_last: bool = True,
-            every_n_train_steps: Optional[int] = None,
-            save_hf_format: bool = True,
-    ):
-        super().__init__(
-            dirpath=dirpath,
-            filename=filename,
-            save_top_k=save_top_k,
-            monitor=monitor,
-            mode=mode,
-            save_last=save_last,
-            every_n_train_steps=every_n_train_steps,
-            save_weights_only=False,
-            verbose=True,
-        )
+    def __init__(self, *args: Any, save_hf_format: bool = True, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
         self.save_hf_format = save_hf_format
 
     def _save_checkpoint(self, trainer: pl.Trainer, filepath: str) -> None:
