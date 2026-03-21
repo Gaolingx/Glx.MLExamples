@@ -862,19 +862,20 @@ class VAELightningModule(pl.LightningModule):
             checkpoint_filepath: Path to save directory.
         """
         save_path = Path(checkpoint_filepath)
-        save_path.mkdir(parents=True, exist_ok=True)
+        hf_dir = save_path / "hf_checkpoint"
+        hf_dir.mkdir(parents=True, exist_ok=True)
 
-        vae_save_dir = save_path / "vae"
+        vae_save_dir = hf_dir / "vae"
         self.vae.save_pretrained(vae_save_dir)
 
         # Save VAE (optionally use EMA weights)
         if self.use_ema and self.ema is not None:
-            ema_dir = save_path / "vae_ema"
+            ema_dir = hf_dir / "vae_ema"
             self.ema.save_pretrained(str(ema_dir))
             print(f"Saving EMA weights to {ema_dir}...")
 
         # Save training config
-        config_path = save_path / "training_config.json"
+        config_path = hf_dir / "training_config.json"
         save_json_config(self.config, str(config_path))
 
     @rank_zero_only

@@ -245,10 +245,13 @@ class VAECheckpointCallback(ModelCheckpoint):
         """Save checkpoint in both Lightning and HuggingFace formats."""
         super()._save_checkpoint(trainer, filepath)
 
-        if self.save_hf_format:
-            # Save HuggingFace format
+        if not self.save_hf_format or not trainer.is_global_zero:
+            return
+
+        pl_module = trainer.lightning_module
+        if hasattr(pl_module, "save_hf_checkpoint"):
             hf_dir = Path(filepath).parent / "hf_checkpoint"
-            trainer.lightning_module.save_hf_checkpoint(hf_dir)
+            pl_module.save_hf_checkpoint(hf_dir)
 
 
 class LRandSchedulerOverrideCallback(Callback):

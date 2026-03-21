@@ -356,7 +356,7 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
     def save_hf_checkpoint(self, checkpoint_filepath: str) -> None:
         """Export UNet-style HF checkpoint colocated with a Lightning .ckpt filepath."""
-        checkpoint_dir = Path(checkpoint_filepath).with_suffix("")
+        checkpoint_dir = Path(checkpoint_filepath)
         hf_dir = checkpoint_dir / "hf_checkpoint"
         hf_dir.mkdir(parents=True, exist_ok=True)
 

@@ -1,4 +1,5 @@
 from typing import Any, Dict, List, Optional
+from pathlib import Path
 
 import torch
 import pytorch_lightning as pl
@@ -102,7 +103,8 @@ class CheckpointCallback(ModelCheckpoint):
 
         pl_module = trainer.lightning_module
         if hasattr(pl_module, "save_hf_checkpoint"):
-            pl_module.save_hf_checkpoint(filepath)
+            hf_dir = Path(filepath).parent / "hf_checkpoint"
+            pl_module.save_hf_checkpoint(hf_dir)
 
 
 class GradParamNormCallback(Callback):
