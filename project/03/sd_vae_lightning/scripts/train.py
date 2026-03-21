@@ -28,11 +28,13 @@ import pytorch_lightning as pl
 from src.lightning.vae_module import VAELightningModule
 from src.data.dataset import VAEDataModule
 
-from src.utils.config import load_json_config
+from src.utils.config import (
+    load_json_config,
+    save_json_config,
+)
 from src.utils.training import (
     merge_configs,
     seed_everything,
-    save_runtime_config,
     build_callbacks,
     build_tensorboard_logger,
     build_trainer_kwargs,
@@ -111,7 +113,7 @@ def main():
 
     # Save config only once to avoid duplicated writes in DDP
     config_save_path = Path(output_dir) / "config.json"
-    save_runtime_config(config, config_save_path)
+    save_json_config(config, config_save_path)
 
     # Create data module
     data_module = VAEDataModule(config)

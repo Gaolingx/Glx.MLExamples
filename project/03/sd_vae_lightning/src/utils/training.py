@@ -28,13 +28,6 @@ def merge_configs(train_config: dict, model_config: dict) -> dict:
     return config
 
 
-@rank_zero_only
-def save_runtime_config(config: dict, config_save_path: str) -> None:
-    """Persist merged runtime config only once in distributed training."""
-    with open(config_save_path, "w") as f:
-        json.dump(config, f, indent=2)
-
-
 def find_resume_checkpoint(resume_arg: str, default_ckpt_dir: str) -> Optional[str]:
     """Resolve a checkpoint path for resuming training."""
     if not resume_arg:

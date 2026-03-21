@@ -4,7 +4,6 @@ Supports TensorBoard logging, checkpoint management, and various loss functions.
 """
 
 from typing import Optional, Dict, Any, Tuple, List
-import json
 from pathlib import Path
 
 import torch
@@ -19,6 +18,7 @@ from diffusers.optimization import get_scheduler
 import lpips
 import math
 
+from ..utils.config import save_json_config
 from ..utils.metrics import PSNR, SSIM, rFID, PSIM
 from ..models.discriminator import NLayerDiscriminator
 
@@ -875,8 +875,7 @@ class VAELightningModule(pl.LightningModule):
 
         # Save training config
         config_path = save_path / "training_config.json"
-        with open(config_path, "w") as f:
-            json.dump(self.config, f, indent=2)
+        save_json_config(self.config, str(config_path))
 
     @rank_zero_only
     def save_pretrained(self, save_directory: str) -> None:
@@ -905,5 +904,4 @@ class VAELightningModule(pl.LightningModule):
 
         # Save training config
         config_path = save_path / "training_config.json"
-        with open(config_path, "w") as f:
-            json.dump(self.config, f, indent=2)
+        save_json_config(self.config, str(config_path))
