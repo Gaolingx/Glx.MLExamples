@@ -62,4 +62,3 @@ class HuggingFaceImageTextDataset(TorchDataset):
             "input_ids": tokenized.input_ids.squeeze(0),
             "caption": caption,
         }
-

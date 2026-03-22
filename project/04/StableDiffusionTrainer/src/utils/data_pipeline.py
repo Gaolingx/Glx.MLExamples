@@ -21,12 +21,12 @@ def _stable_caption_hash_int(text: str) -> int:
 
 class BucketManager:
     def __init__(
-        self,
-        base_resolution=1024,
-        min_resolution=512,
-        max_resolution=2048,
-        resolution_step=64,
-        max_aspect_ratio=2.0,
+            self,
+            base_resolution=1024,
+            min_resolution=512,
+            max_resolution=2048,
+            resolution_step=64,
+            max_aspect_ratio=2.0,
     ):
         self.base_resolution = base_resolution
         self.min_resolution = min_resolution
@@ -37,7 +37,7 @@ class BucketManager:
 
     def _generate_buckets(self):
         buckets = []
-        base_area = self.base_resolution**2
+        base_area = self.base_resolution ** 2
         for w in range(self.min_resolution, self.max_resolution + 1, self.resolution_step):
             for h in range(self.min_resolution, self.max_resolution + 1, self.resolution_step):
                 area = w * h
@@ -103,21 +103,26 @@ class CaptionDataset(Dataset):
     SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
     def __init__(
-        self,
-        data_dir,
-        resolution=1024,
-        caption_extension=".txt",
-        enable_bucket=True,
-        min_bucket_reso=512,
-        max_bucket_reso=2048,
-        bucket_reso_steps=64,
-        max_bucket_aspect_ratio=2.0,
-        shuffle_caption=False,
-        keep_tokens=0,
-        keep_tokens_separator="",
-        caption_tag_dropout_rate=0.0,
-        flip_augment=False,
-        transform=None,
+            self,
+            data_dir,
+            resolution=1024,
+            caption_extension=".txt",
+            enable_bucket=True,
+            min_bucket_reso=512,
+            max_bucket_reso=2048,
+            bucket_reso_steps=64,
+            max_bucket_aspect_ratio=2.0,
+            shuffle_caption=False,
+            keep_tokens=0,
+            keep_tokens_separator="",
+            group_separator="",
+            group_shuffle=False,
+            caption_group_dropout_rate=0.0,
+            tag_separator=None,
+            output_separator=", ",
+            caption_tag_dropout_rate=0.0,
+            flip_augment=False,
+            transform=None,
     ):
         self.data_dir = Path(data_dir)
         self.resolution = resolution
@@ -128,6 +133,11 @@ class CaptionDataset(Dataset):
         self._caption_seed = 0
         self.keep_tokens = keep_tokens
         self.keep_tokens_separator = keep_tokens_separator
+        self.group_separator = group_separator or ""
+        self.group_shuffle = bool(group_shuffle)
+        self.caption_group_dropout_rate = max(0.0, min(1.0, float(caption_group_dropout_rate or 0.0)))
+        self.tag_separator = tag_separator
+        self.output_separator = output_separator or ", "
         self.caption_tag_dropout_rate = max(0.0, min(1.0, float(caption_tag_dropout_rate or 0.0)))
         self.flip_augment = flip_augment
         self.transform = transform
@@ -245,12 +255,24 @@ class CaptionDataset(Dataset):
             tags_text = caption.strip()
             nl_text = ""
 
-        use_comma_separator = "," in tags_text
+        tag_separator = self.tag_separator
+        if tag_separator is None:
+            tag_separator = "," if "," in tags_text else None
 
         def _split_tags(text: str):
-            if use_comma_separator:
-                return [t.strip() for t in text.split(",") if t.strip()]
+            if not text:
+                return []
+            if tag_separator:
+                return [t.strip() for t in text.split(tag_separator) if t.strip()]
             return [t.strip() for t in text.split() if t.strip()]
+
+        def _drop_tokens(tokens):
+            if self.caption_tag_dropout_rate <= 0.0 or not tokens:
+                return tokens
+            kept = [t for t in tokens if rng.random() >= self.caption_tag_dropout_rate]
+            if not kept:
+                kept = [rng.choice(tokens)]
+            return kept
 
         rng = random
         fixed_tokens = []
@@ -269,22 +291,40 @@ class CaptionDataset(Dataset):
             tokens = _split_tags(tags_text)
             if self.keep_tokens > 0:
                 fixed_tokens = tokens[: self.keep_tokens]
-                flex_tokens = tokens[self.keep_tokens :]
+                flex_tokens = tokens[self.keep_tokens:]
             else:
                 flex_tokens = tokens
 
-        if self.shuffle_caption:
-            rng.shuffle(flex_tokens)
-        if self.caption_tag_dropout_rate > 0.0 and flex_tokens:
-            keep = [t for t in flex_tokens if rng.random() >= self.caption_tag_dropout_rate]
-            if not keep:
-                keep = [rng.choice(flex_tokens)]
-            flex_tokens = keep
+        if self.group_separator:
+            grouped_tokens = []
+            for group_text in self.group_separator.join(flex_tokens).split(self.group_separator):
+                tokens = _split_tags(group_text)
+                if tokens:
+                    grouped_tokens.append(tokens)
+
+            if self.group_shuffle and len(grouped_tokens) > 1:
+                rng.shuffle(grouped_tokens)
+
+            processed_groups = []
+            for tokens in grouped_tokens:
+                if self.caption_group_dropout_rate > 0.0 and rng.random() < self.caption_group_dropout_rate:
+                    continue
+                tokens = _drop_tokens(tokens)
+                if self.shuffle_caption and len(tokens) > 1:
+                    rng.shuffle(tokens)
+                if tokens:
+                    processed_groups.append(tokens)
+
+            flex_tokens = [token for group in processed_groups for token in group]
+        else:
+            if self.shuffle_caption and len(flex_tokens) > 1:
+                rng.shuffle(flex_tokens)
+            flex_tokens = _drop_tokens(flex_tokens)
 
         tags = fixed_tokens + flex_tokens + fixed_suffix_tokens
-        tags_out = ", ".join(tags)
+        tags_out = self.output_separator.join(tags)
         if tags_out and nl_text:
-            return f"{tags_out}, {nl_text}"
+            return f"{tags_out}{self.output_separator}{nl_text}"
         if nl_text:
             return nl_text
         return tags_out
@@ -336,7 +376,7 @@ class CaptionDataset(Dataset):
 
 
 def _seed_worker(worker_id: int):
-    worker_seed = int(torch.initial_seed() % (2**32))
+    worker_seed = int(torch.initial_seed() % (2 ** 32))
     random.seed(worker_seed)
     try:
         import numpy as np
@@ -381,14 +421,14 @@ class _ListBatchSampler:
 
 
 def create_dataloader(
-    dataset,
-    batch_size=1,
-    shuffle=True,
-    num_workers=4,
-    pin_memory=True,
-    *,
-    seed=None,
-    persistent_workers=False,
+        dataset,
+        batch_size=1,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        *,
+        seed=None,
+        persistent_workers=False,
 ):
     def _get_sample_for_index(ds, idx):
         if hasattr(ds, "index_map"):
@@ -415,7 +455,7 @@ def create_dataloader(
             if do_shuffle:
                 rng.shuffle(indices)
             for i in range(0, len(indices), bs):
-                batch = indices[i : i + bs]
+                batch = indices[i: i + bs]
                 if batch:
                     batches.append(batch)
         if do_shuffle:
