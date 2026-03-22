@@ -180,10 +180,7 @@ class StableDiffusionLightningModule(pl.LightningModule):
         sigma = (1.0 - alpha).clamp(min=1e-8)
         return alpha / sigma
 
-    def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        pixel_values = batch["pixel_values"]
-        input_ids = batch["input_ids"]
-
+    def _encode_pixel_values(self, pixel_values: torch.Tensor) -> torch.Tensor:
         # VAE expects [B, C, H, W]. If an upstream batch of size 1 was flattened
         # to [C, H, W], recover the missing batch dimension.
         if pixel_values.ndim == 3:
@@ -191,13 +188,45 @@ class StableDiffusionLightningModule(pl.LightningModule):
         elif pixel_values.ndim != 4:
             raise ValueError(f"Expected pixel_values to be 4D [B, C, H, W], got shape {tuple(pixel_values.shape)}")
 
+        latents = self.vae.encode(pixel_values).latent_dist.sample()
+        return latents * self.vae.config.scaling_factor
+
+    def _get_latents_from_batch(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, bool]:
+        use_cached_latent = batch.get("use_cached_latent")
+        latent_batch = batch.get("latent")
+
+        if latent_batch is not None and use_cached_latent is not None:
+            if isinstance(use_cached_latent, torch.Tensor):
+                cached_mask = use_cached_latent.detach().cpu().bool().tolist()
+            else:
+                cached_mask = [bool(flag) for flag in use_cached_latent]
+
+            if all(cached_mask):
+                if isinstance(latent_batch, torch.Tensor):
+                    latents = latent_batch
+                else:
+                    latents = torch.stack(latent_batch)
+
+                if latents.ndim == 3:
+                    latents = latents.unsqueeze(0)
+
+                return latents.to(device=self.device, dtype=self.unet.dtype), True
+
+        pixel_values = batch.get("pixel_values")
+        if pixel_values is None:
+            raise ValueError("Batch must contain either cached `latent` values or `pixel_values`.")
+
+        return self._encode_pixel_values(pixel_values), False
+
+    def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]
+
         if input_ids.ndim == 3:
             input_ids = input_ids.squeeze(1)
         elif input_ids.ndim == 1:
             input_ids = input_ids.unsqueeze(0)
 
-        latents = self.vae.encode(pixel_values).latent_dist.sample()
-        latents = latents * self.vae.config.scaling_factor
+        latents, used_cached_latent = self._get_latents_from_batch(batch)
 
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
@@ -241,6 +270,7 @@ class StableDiffusionLightningModule(pl.LightningModule):
             "train/pred_std": model_pred.detach().float().std(unbiased=False),
             "train/target_std": target.detach().float().std(unbiased=False),
             "train/pred_target_mse": (model_pred.detach().float() - target.detach().float()).pow(2).mean(),
+            "train/used_cached_latent": float(used_cached_latent),
         }
         return loss, metrics
 
