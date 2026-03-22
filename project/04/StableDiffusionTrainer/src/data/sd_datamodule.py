@@ -1,17 +1,25 @@
-from collections import defaultdict
-from typing import Any, DefaultDict, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import pytorch_lightning as pl
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset as TorchDataset
+from torchvision import transforms
 from transformers import CLIPTokenizer
 
-from src.utils.kohya import (
-    AspectRatioBucketBatchSampler,
-    HuggingFaceImageTextDataset,
-    KohyaStyleDataset,
+from src.utils.data_pipeline import (
+    CaptionDataset,
+    KohyaRepeatDataset,
+    LatentCache,
+    LatentCacheDataset,
+    RepeatDataset,
+    build_latent_cache_namespace,
+    cache_all_latents,
+    create_dataloader,
+    detect_kohya_structure,
 )
+from src.utils.dataset import HuggingFaceImageTextDataset
 
 
 class StableDiffusionDataModule(pl.LightningDataModule):
@@ -33,7 +41,7 @@ class StableDiffusionDataModule(pl.LightningDataModule):
         self.caption_column = self.dataset_cfg.get("caption_column", "text")
 
         self.dataset: Optional[TorchDataset] = None
-        self.batch_sampler: Optional[AspectRatioBucketBatchSampler] = None
+        self.latent_cache: Optional[LatentCache] = None
 
     def prepare_data(self) -> None:
         if self.dataset_cfg.get("name"):
@@ -92,52 +100,90 @@ class StableDiffusionDataModule(pl.LightningDataModule):
         return []
 
     def _build_local_dataset(self) -> TorchDataset:
-        dataset_items = self._normalize_local_dataset_configs()
+        dataset_items = self.dataset_cfg.get("datasets", [])
         if not dataset_items:
             raise ValueError("No local dataset configuration found.")
 
-        use_arb = self.dataset_cfg.get("use_arb", True)
-        resolution = int(self.dataset_cfg.get("resolution", self.dataset_cfg.get("size", 512)))
-        shared_arb_config = self.dataset_cfg.get("arb_config", {})
-        shared_cache_dir = self.dataset_cfg.get("cache_dir")
+        transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+            ]
+        )
 
-        datasets: List[KohyaStyleDataset] = []
-        merged_bucket_indices: DefaultDict[Tuple[int, int], List[int]] = defaultdict(list)
-        offset = 0
-        for item in dataset_items:
-            item_cfg = dict(self.dataset_cfg)
-            item_cfg.update(item)
-            item_cfg.pop("datasets", None)
-            item_cfg.pop("name", None)
-            item_cfg.pop("split", None)
-            item_cfg["size"] = int(item_cfg.get("size", resolution))
-            item_cfg["use_arb"] = item_cfg.get("use_arb", use_arb)
-            item_cfg["arb_config"] = item_cfg.get("arb_config", shared_arb_config)
-            item_cfg["cache_dir"] = item_cfg.get("cache_dir", shared_cache_dir)
-            item_cfg["image_column"] = item_cfg.get("image_column", self.image_column)
-            item_cfg["caption_column"] = item_cfg.get("caption_column", self.caption_column)
-            item_cfg.pop("num_workers", None)
-            item_cfg.pop("max_train_samples", None)
-            item_cfg.pop("resolution", None)
-            item_cfg.pop("batch_size", None)
-            dataset = KohyaStyleDataset(tokenizer=self.tokenizer, **item_cfg)
-            datasets.append(dataset)
-            for bucket, indices in dataset.bucket_indices.items():
-                merged_bucket_indices[bucket].extend([offset + idx for idx in indices])
-            offset += len(dataset)
+        datasets: List[TorchDataset] = []
+        for item_cfg in dataset_items:
+            data_dir = item_cfg["dataset_folder"]
 
-        concatenated = torch.utils.data.ConcatDataset(datasets)
-        if use_arb:
-            self.batch_sampler = AspectRatioBucketBatchSampler(
-                buckets=dict(merged_bucket_indices),
-                batch_size=self.train_batch_size,
-                drop_last=True,
-                shuffle=True,
-                seed=self.seed,
+            dataset = CaptionDataset(
+                data_dir=data_dir,
+                resolution=item_cfg["resolution"],
+                caption_extension=item_cfg.get("caption_extension", ".txt"),
+                enable_bucket=item_cfg.get("use_bucket", True),
+                min_bucket_reso=item_cfg["min_bucket_reso"],
+                max_bucket_reso=item_cfg["max_bucket_reso"],
+                bucket_reso_steps=item_cfg.get("bucket_reso_steps", 64),
+                max_bucket_aspect_ratio=item_cfg.get("max_bucket_aspect_ratio", 2.0),
+                shuffle_caption=item_cfg.get("shuffle_caption", False),
+                keep_tokens=item_cfg.get("keep_tokens", 0),
+                keep_tokens_separator=item_cfg.get("keep_tokens_separator", ""),
+                caption_tag_dropout_rate=item_cfg.get("caption_tag_dropout_rate", 0.0),
+                flip_augment=item_cfg.get("random_flip", False),
+                transform=transform,
             )
-        else:
-            self.batch_sampler = None
-        return concatenated
+            dataset.shuffle_caption_per_epoch = False
+
+            working_dataset: TorchDataset = dataset
+
+            if item_cfg.get("cache_latents", False):
+                latent_cache = self._maybe_build_latent_cache(item_cfg, dataset)
+                if latent_cache is not None:
+                    working_dataset = LatentCacheDataset(dataset, latent_cache)
+
+            repeats = item_cfg.get("repeats", 1)
+            if detect_kohya_structure(data_dir):
+                working_dataset = KohyaRepeatDataset(working_dataset)
+            elif repeats > 1:
+                working_dataset = RepeatDataset(working_dataset, repeats)
+
+            datasets.append(working_dataset)
+
+        if len(datasets) == 1:
+            return datasets[0]
+        return torch.utils.data.ConcatDataset(datasets)
+
+    def _maybe_build_latent_cache(self, item_cfg: Dict[str, Any], dataset: CaptionDataset) -> Optional[LatentCache]:
+        trainer = getattr(self, "trainer", None)
+        model = getattr(trainer, "lightning_module", None) if trainer is not None else None
+        vae = getattr(model, "vae", None) if model is not None else None
+        if vae is None:
+            return None
+
+        cache_dir = item_cfg.get("cache_dir") or str(Path(item_cfg["dataset_folder"]) / ".latent_cache")
+        cache_namespace, cache_meta = build_latent_cache_namespace(
+            {
+                "resolution": item_cfg["resolution"],
+                "min_reso": item_cfg["min_bucket_reso"],
+                "max_reso": item_cfg["max_bucket_reso"],
+                "reso_step": item_cfg.get("bucket_reso_steps", 64),
+                "max_ar": item_cfg.get("max_bucket_aspect_ratio", 2.0),
+                "transformer": self.dataset_cfg.get("transformer", ""),
+                "vae": self.dataset_cfg.get("vae", ""),
+            }
+        )
+
+        latent_cache = LatentCache(
+            cache_dir=str(cache_dir),
+            vae=vae,
+            device=model.device,
+            dtype=next(vae.parameters()).dtype,
+            cache_namespace=cache_namespace,
+            cache_meta=cache_meta,
+        )
+
+        cache_all_latents(dataset, vae, latent_cache, model.device, next(vae.parameters()).dtype)
+        self.latent_cache = latent_cache
+        return latent_cache
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage not in (None, "fit"):
@@ -145,26 +191,48 @@ class StableDiffusionDataModule(pl.LightningDataModule):
 
         if self.dataset_cfg.get("name"):
             self.dataset = self._build_hf_dataset()
-            self.batch_sampler = None
             return
 
         self.dataset = self._build_local_dataset()
 
-    @staticmethod
-    def collate_fn(examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        input_ids = torch.stack([example["input_ids"] for example in examples])
+    def collate_fn(self, examples: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if "pixel_values" in examples[0]:
+            pixel_values = torch.stack([example["pixel_values"] for example in examples])
+            pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+            input_ids = torch.stack([example["input_ids"] for example in examples])
 
-        batch: Dict[str, Any] = {
-            "pixel_values": pixel_values,
-            "input_ids": input_ids,
+            batch: Dict[str, Any] = {
+                "pixel_values": pixel_values,
+                "input_ids": input_ids,
+            }
+
+            if "caption" in examples[0]:
+                batch["captions"] = [example["caption"] for example in examples]
+            if "bucket" in examples[0]:
+                batch["bucket"] = torch.stack([example["bucket"] for example in examples])
+            return batch
+
+        images = torch.stack([example["image"] for example in examples])
+        images = images.to(memory_format=torch.contiguous_format).float()
+        tokenized = self.tokenizer(
+            [example.get("caption", "") for example in examples],
+            truncation=True,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            return_tensors="pt",
+        )
+
+        batch = {
+            "pixel_values": images,
+            "input_ids": tokenized.input_ids,
+            "captions": [example.get("caption", "") for example in examples],
+            "original_sizes": [example.get("original_size") for example in examples],
+            "target_sizes": [example.get("target_size") for example in examples],
+            "crop_coords": [example.get("crop_coords") for example in examples],
         }
-
-        if "caption" in examples[0]:
-            batch["captions"] = [example["caption"] for example in examples]
-        if "bucket" in examples[0]:
-            batch["bucket"] = torch.stack([example["bucket"] for example in examples])
+        if "latent" in examples[0]:
+            batch["latent"] = [example["latent"] for example in examples]
+            batch["use_cached_latent"] = [example.get("use_cached_latent", False) for example in examples]
         return batch
 
     def train_dataloader(self) -> DataLoader:
@@ -174,15 +242,16 @@ class StableDiffusionDataModule(pl.LightningDataModule):
         num_workers = int(self.dataset_cfg.get("num_workers", 4))
         persistent_workers = self.dataset_cfg.get("persistent_workers", False) and num_workers > 0
         pin_memory = self.dataset_cfg.get("pin_memory", True)
-
-        if self.batch_sampler is not None:
+        if self.dataset_cfg.get("name"):
             return DataLoader(
                 self.dataset,
-                batch_sampler=self.batch_sampler,
+                batch_size=self.train_batch_size,
+                shuffle=True,
                 num_workers=num_workers,
                 collate_fn=self.collate_fn,
                 pin_memory=pin_memory,
                 persistent_workers=persistent_workers,
+                drop_last=True,
             )
 
         return DataLoader(
