@@ -1,11 +1,15 @@
-import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+import json
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import LearningRateMonitor
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks import (
+    LearningRateMonitor,
+    EarlyStopping,
+    RichProgressBar,
+)
 
 from src.utils.callbacks import (
     CheckpointCallback,
@@ -39,14 +43,27 @@ def build_callbacks(cfg: Dict[str, Any]) -> list:
         save_hf_format=True,
     )
 
-    return [
+    callbacks = [
         ckpt_callback,
         LearningRateMonitor(logging_interval="step"),
         NaNLossCallback(),
         LRandSchedulerOverrideCallback(cfg),
         GradParamNormCallback(log_every_n_steps=int(logging_cfg.get("norm_log_every_n_steps", 1))),
         LoggingCallback(log_every_n_steps=int(logging_cfg.get("log_every_n_steps", 10))),
+        RichProgressBar(),
     ]
+
+    # Optional early stopping
+    if checkpoint_cfg.get("early_stopping", False):
+        callbacks.append(
+            EarlyStopping(
+                monitor=checkpoint_cfg.get("monitor", "val/rec_loss"),
+                patience=checkpoint_cfg.get("patience", 10),
+                mode=checkpoint_cfg.get("mode", "min"),
+            )
+        )
+
+    return callbacks
 
 
 def find_resume_checkpoint(resume_arg: str, default_ckpt_dir: str) -> Optional[str]:
