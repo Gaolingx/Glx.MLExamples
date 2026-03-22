@@ -594,7 +594,7 @@ def build_latent_cache_namespace(args: dict | object) -> tuple[str, dict]:
     return namespace, payload
 
 
-def cache_all_latents(dataset, vae, cache: LatentCache, device, dtype):
+def cache_all_latents(dataset, vae, cache: LatentCache, device, dtype, progress_log_interval=10):
     import numpy as np
     from PIL import Image
 
@@ -603,7 +603,6 @@ def cache_all_latents(dataset, vae, cache: LatentCache, device, dtype):
     skipped_count = 0
     failed_count = 0
     total = len(dataset.samples)
-    progress_log_interval = 10
 
     def _log_progress(processed_count: int):
         rank_zero_info(
@@ -640,11 +639,12 @@ def cache_all_latents(dataset, vae, cache: LatentCache, device, dtype):
                 img_tensor = torch.from_numpy(np.array(image))
                 img_tensor = img_tensor.permute(2, 0, 1).float() / 255.0
                 img_tensor = img_tensor * 2.0 - 1.0
-                img_tensor = img_tensor.unsqueeze(0).unsqueeze(2)
+                img_tensor = img_tensor.unsqueeze(0)
                 img_tensor = img_tensor.to(device, dtype=dtype)
 
                 with torch.no_grad():
-                    latent = vae.model.encode(img_tensor, vae.scale)
+                    latent = vae.encode(img_tensor).latent_dist.sample()
+                    latent = latent * vae.config.scaling_factor
 
                 cache.save_cache(image_path, latent.squeeze(0))
                 cached_count += 1

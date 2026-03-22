@@ -77,8 +77,7 @@ class StableDiffusionDataModule(pl.LightningDataModule):
             random_flip=random_flip,
         )
 
-    def _normalize_local_dataset_configs(self) -> List[Dict[str, Any]]:
-        raw_datasets = self.dataset_cfg.get("datasets")
+    def _normalize_local_dataset_configs(self, raw_datasets) -> List[Dict[str, Any]]:
         if isinstance(raw_datasets, list) and raw_datasets:
             normalized: List[Dict[str, Any]] = []
             for item in raw_datasets:
@@ -100,7 +99,7 @@ class StableDiffusionDataModule(pl.LightningDataModule):
         return []
 
     def _build_local_dataset(self) -> TorchDataset:
-        dataset_items = self.dataset_cfg.get("datasets", [])
+        dataset_items = self._normalize_local_dataset_configs(self.dataset_cfg.get("datasets", []))
         if not dataset_items:
             raise ValueError("No local dataset configuration found.")
 
