@@ -62,11 +62,6 @@ class StableDiffusionDataModule(pl.LightningDataModule):
             cache_dir=self.dataset_cfg.get("cache_dir"),
         )
 
-        max_train_samples = self.dataset_cfg.get("max_train_samples")
-        if max_train_samples is not None:
-            max_train_samples = min(int(max_train_samples), len(dataset))
-            dataset = dataset.shuffle(seed=self.seed).select(range(max_train_samples))
-
         return HuggingFaceImageTextDataset(
             dataset=dataset,
             tokenizer=self.tokenizer,
@@ -124,6 +119,7 @@ class StableDiffusionDataModule(pl.LightningDataModule):
                 bucket_reso_steps=item_cfg.get("bucket_reso_steps", 64),
                 max_bucket_aspect_ratio=item_cfg.get("max_bucket_aspect_ratio", 2.0),
                 shuffle_caption=item_cfg.get("shuffle_caption", False),
+                shuffle_caption_per_epoch=item_cfg.get("shuffle_caption_per_epoch", False),
                 keep_tokens=item_cfg.get("keep_tokens", 0),
                 keep_tokens_separator=item_cfg.get("keep_tokens_separator", "|||"),
                 group_separator=item_cfg.get("group_separator", "%%"),
@@ -135,7 +131,6 @@ class StableDiffusionDataModule(pl.LightningDataModule):
                 flip_augment=item_cfg.get("random_flip", False),
                 transform=transform,
             )
-            dataset.shuffle_caption_per_epoch = False
 
             working_dataset: TorchDataset = dataset
 
@@ -244,7 +239,7 @@ class StableDiffusionDataModule(pl.LightningDataModule):
             raise RuntimeError("DataModule is not set up. Call setup('fit') before requesting dataloader.")
 
         num_workers = int(self.dataset_cfg.get("num_workers", 4))
-        persistent_workers = self.dataset_cfg.get("persistent_workers", False) and num_workers > 0
+        persistent_workers = self.dataset_cfg.get("persistent_workers", False)
         pin_memory = self.dataset_cfg.get("pin_memory", True)
         if self.dataset_cfg.get("name"):
             return create_dataloader(

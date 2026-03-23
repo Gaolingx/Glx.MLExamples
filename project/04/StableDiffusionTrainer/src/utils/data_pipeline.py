@@ -113,6 +113,7 @@ class CaptionDataset(Dataset):
             bucket_reso_steps=64,
             max_bucket_aspect_ratio=2.0,
             shuffle_caption=False,
+            shuffle_caption_per_epoch=False,
             keep_tokens=0,
             keep_tokens_separator="",
             group_separator="",
@@ -128,7 +129,7 @@ class CaptionDataset(Dataset):
         self.resolution = resolution
         self.caption_extension = caption_extension
         self.shuffle_caption = shuffle_caption
-        self.shuffle_caption_per_epoch = False
+        self.shuffle_caption_per_epoch = shuffle_caption_per_epoch
         self._epoch = 0
         self._caption_seed = 0
         self.keep_tokens = keep_tokens
@@ -247,6 +248,11 @@ class CaptionDataset(Dataset):
         if not caption:
             return ""
 
+        rng = random
+        if self.shuffle_caption_per_epoch:
+            seed_value = self._caption_seed ^ self._epoch ^ _stable_caption_hash_int(caption)
+            rng = random.Random(seed_value)
+
         lines = [line.strip() for line in caption.splitlines() if line.strip()]
         if lines:
             tags_text = lines[0]
@@ -274,7 +280,6 @@ class CaptionDataset(Dataset):
                 kept = [rng.choice(tokens)]
             return kept
 
-        rng = random
         fixed_tokens = []
         flex_tokens = []
         fixed_suffix_tokens = []
