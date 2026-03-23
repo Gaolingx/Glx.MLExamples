@@ -17,6 +17,7 @@ from src.utils.callbacks import (
     VAECheckpointCallback,
     LRandSchedulerOverrideCallback,
     NaNLossCallback,
+    ConfigSnapshotCallback,
 )
 
 
@@ -89,55 +90,71 @@ def build_trainer_kwargs(config: dict) -> Dict[str, Any]:
     return trainer_kwargs
 
 
+def build_early_stopping_callback(early_stopping_config: Dict[str, Any], checkpoint_config: Dict[str, Any]) -> EarlyStopping | None:
+    """Create an early stopping callback when the feature is enabled."""
+
+    if not early_stopping_config.get("enabled", False):
+        return None
+
+    return EarlyStopping(
+        monitor=early_stopping_config.get("monitor") or checkpoint_config.get("monitor"),
+        mode=early_stopping_config.get("mode") or checkpoint_config.get("mode"),
+        patience=max(0, early_stopping_config.get("patience", 3)),
+        min_delta=early_stopping_config.get("min_delta", 0.0),
+        check_finite=early_stopping_config.get("check_finite", True),
+        stopping_threshold=early_stopping_config.get("stopping_threshold", None),
+        divergence_threshold=early_stopping_config.get("divergence_threshold", None),
+        verbose=early_stopping_config.get("verbose", False),
+    )
+
+
 def build_callbacks(cfg: Dict[str, Any]) -> list:
-    training_config = cfg.get("training", {})
-    path_config = cfg.get("paths", {})
-    checkpoint_config = cfg.get("checkpoint", {})
-    logging_config = cfg.get("logging", {})
+    training_cfg = cfg.get("training", {})
+    path_cfg = cfg.get("paths", {})
+    checkpoint_cfg = cfg.get("checkpoint", {})
+    logging_cfg = cfg.get("logging", {})
+    early_stopping_cfg = cfg.get("early_stopping", {})
 
     callbacks = [
         # NaN/Inf loss guard
         NaNLossCallback(),
         # Checkpoint callback
         VAECheckpointCallback(
-            dirpath=path_config.get("checkpoint_dir", "./checkpoints"),
+            dirpath=path_cfg.get("checkpoint_dir", "./checkpoints"),
             filename="vae-{epoch:02d}-{step:06d}-{val/rec_loss:.4f}",
-            save_top_k=checkpoint_config.get("save_top_k", 3),
-            monitor=checkpoint_config.get("monitor", "val/rec_loss"),
-            mode=checkpoint_config.get("mode", "min"),
-            save_last=checkpoint_config.get("save_last", True),
-            every_n_train_steps=checkpoint_config.get("save_every_n_steps", 1000),
+            save_top_k=checkpoint_cfg.get("save_top_k", 3),
+            monitor=checkpoint_cfg.get("monitor", "val/rec_loss"),
+            mode=checkpoint_cfg.get("mode", "min"),
+            save_last=checkpoint_cfg.get("save_last", True),
+            every_n_train_steps=checkpoint_cfg.get("save_every_n_steps", 1000),
             save_hf_format=True,
         ),
         # Learning rate monitor
         LearningRateMonitor(logging_interval="step"),
         # Unified VAE metrics/images logging
         VAELoggingCallback(
-            num_val_images=logging_config.get("num_val_images", 4),
+            num_val_images=logging_cfg.get("num_val_images", 4),
             log_to_tensorboard=True,
-            log_images_every_n_steps=logging_config.get("log_images_every_n_steps", 500),
+            log_images_every_n_steps=logging_cfg.get("log_images_every_n_steps", 500),
         ),
         # LR and Scheduler Override callback for resume
         LRandSchedulerOverrideCallback(
-            override_lr_on_resume=training_config.get("override_lr_on_resume", False),
-            reset_scheduler_on_resume=training_config.get("reset_scheduler_on_resume", False),
-            gen_opt_config=training_config.get("generator_optimizer", {}),
-            disc_opt_config=training_config.get("discriminator_optimizer", {}),
+            override_lr_on_resume=training_cfg.get("override_lr_on_resume", False),
+            reset_scheduler_on_resume=training_cfg.get("reset_scheduler_on_resume", False),
+            gen_opt_config=training_cfg.get("generator_optimizer", {}),
+            disc_opt_config=training_cfg.get("discriminator_optimizer", {}),
             verbose=True,
         ),
+        # Config snapshot callback
+        ConfigSnapshotCallback(cfg),
         # Progress bar
         RichProgressBar(),
     ]
 
     # Optional early stopping
-    if checkpoint_config.get("early_stopping", False):
-        callbacks.append(
-            EarlyStopping(
-                monitor=checkpoint_config.get("monitor", "val/rec_loss"),
-                patience=checkpoint_config.get("patience", 10),
-                mode=checkpoint_config.get("mode", "min"),
-            )
-        )
+    early_stopping_callback = build_early_stopping_callback(early_stopping_cfg, checkpoint_cfg)
+    if early_stopping_cfg.get("early_stopping", False):
+        callbacks.append(early_stopping_callback)
 
     return callbacks
 

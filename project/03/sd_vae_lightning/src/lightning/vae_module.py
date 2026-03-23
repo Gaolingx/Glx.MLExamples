@@ -18,9 +18,8 @@ from diffusers.optimization import get_scheduler
 import lpips
 import math
 
-from ..utils.config import save_json_config
-from ..utils.metrics import PSNR, SSIM, rFID, PSIM
-from ..models.discriminator import NLayerDiscriminator
+from src.utils.metrics import PSNR, SSIM, rFID, PSIM
+from src.models.discriminator import NLayerDiscriminator
 
 
 class VAELightningModule(pl.LightningModule):
@@ -874,10 +873,6 @@ class VAELightningModule(pl.LightningModule):
             self.ema.save_pretrained(str(ema_dir))
             print(f"Saving EMA weights to {ema_dir}...")
 
-        # Save training config
-        config_path = hf_dir / "training_config.json"
-        save_json_config(self.config, str(config_path))
-
     @rank_zero_only
     def save_pretrained(self, save_directory: str) -> None:
         """
@@ -902,7 +897,3 @@ class VAELightningModule(pl.LightningModule):
         if self.discriminator is not None:
             disc_path = save_path / "discriminator.pt"
             torch.save(self.discriminator.state_dict(), disc_path)
-
-        # Save training config
-        config_path = save_path / "training_config.json"
-        save_json_config(self.config, str(config_path))

@@ -17,6 +17,7 @@ from src.utils.callbacks import (
     LRandSchedulerOverrideCallback,
     GradParamNormCallback,
     LoggingCallback,
+    ConfigSnapshotCallback,
 )
 
 
@@ -28,9 +29,28 @@ def build_tensorboard_logger(logging_cfg: Dict[str, Any]) -> TensorBoardLogger:
     )
 
 
+def build_early_stopping_callback(early_stopping_config: Dict[str, Any], checkpoint_config: Dict[str, Any]) -> EarlyStopping | None:
+    """Create an early stopping callback when the feature is enabled."""
+
+    if not early_stopping_config.get("enabled", False):
+        return None
+
+    return EarlyStopping(
+        monitor=early_stopping_config.get("monitor") or checkpoint_config.get("monitor"),
+        mode=early_stopping_config.get("mode") or checkpoint_config.get("mode"),
+        patience=max(0, early_stopping_config.get("patience", 3)),
+        min_delta=early_stopping_config.get("min_delta", 0.0),
+        check_finite=early_stopping_config.get("check_finite", True),
+        stopping_threshold=early_stopping_config.get("stopping_threshold", None),
+        divergence_threshold=early_stopping_config.get("divergence_threshold", None),
+        verbose=early_stopping_config.get("verbose", False),
+    )
+
+
 def build_callbacks(cfg: Dict[str, Any]) -> list:
     checkpoint_cfg = cfg.get("checkpoint", {})
     logging_cfg = cfg.get("logging", {})
+    early_stopping_cfg = cfg.get("early_stopping", {})
 
     ckpt_callback = CheckpointCallback(
         dirpath=checkpoint_cfg.get("dirpath", "outputs/checkpoints"),
@@ -51,17 +71,13 @@ def build_callbacks(cfg: Dict[str, Any]) -> list:
         GradParamNormCallback(log_every_n_steps=int(logging_cfg.get("norm_log_every_n_steps", 1))),
         LoggingCallback(log_every_n_steps=int(logging_cfg.get("log_every_n_steps", 10))),
         RichProgressBar(),
+        ConfigSnapshotCallback(cfg),
     ]
 
     # Optional early stopping
-    if checkpoint_cfg.get("early_stopping", False):
-        callbacks.append(
-            EarlyStopping(
-                monitor=checkpoint_cfg.get("monitor", "val/rec_loss"),
-                patience=checkpoint_cfg.get("patience", 10),
-                mode=checkpoint_cfg.get("mode", "min"),
-            )
-        )
+    early_stopping_callback = build_early_stopping_callback(early_stopping_cfg, checkpoint_cfg)
+    if early_stopping_cfg.get("early_stopping", False):
+        callbacks.append(early_stopping_callback)
 
     return callbacks
 

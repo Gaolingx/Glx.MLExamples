@@ -12,9 +12,11 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from pytorch_lightning.utilities.types import STEP_OUTPUT
-from pytorch_lightning.utilities.rank_zero import rank_zero_info
+from pytorch_lightning.utilities.rank_zero import rank_zero_info, rank_zero_only
 import torchvision
 import math
+
+from src.utils.config import save_json_config
 
 
 class VAELoggingCallback(Callback):
@@ -436,3 +438,19 @@ class NaNLossCallback(Callback):
                 f"Stopping training."
             )
             trainer.should_stop = True
+
+
+class ConfigSnapshotCallback(Callback):
+    """Persist the resolved experiment config next to checkpoints."""
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self.config = config
+
+    @rank_zero_only
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        """Write the experiment configuration once at the start of training."""
+
+        output_dir = Path(trainer.default_root_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        config_path = output_dir / "resolved_config.json"
+        save_json_config(self.config, config_path)

@@ -1,4 +1,3 @@
-import json
 import importlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -18,7 +17,7 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_info
 from PIL import Image
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from src.utils.config import load_json_config, save_json_config
+from src.utils.config import load_json_config
 
 
 class StableDiffusionLightningModule(pl.LightningModule):
@@ -386,14 +385,6 @@ class StableDiffusionLightningModule(pl.LightningModule):
             lora_dir = save_dir / "unet_lora"
             self.unet.save_lora_adapter(str(lora_dir), adapter_name=self.lora_adapter_name)
 
-            export_payload = {
-                "base_model_name_or_path": self.cfg.get("pretrained_model_name_or_path"),
-                "adapter_name": self.lora_adapter_name,
-                "lora": self.lora_cfg,
-            }
-
-            save_json_config(export_payload, str(save_dir / "lora_config.json"))
-            save_json_config(self.cfg, str(save_dir / "training_config.json"))
             return
 
         pipeline = StableDiffusionPipeline(
@@ -408,8 +399,6 @@ class StableDiffusionLightningModule(pl.LightningModule):
         )
         pipeline.save_pretrained(str(save_dir), safe_serialization=True)
 
-        save_json_config(self.cfg, str(save_dir / "training_config.json"))
-
     def save_hf_checkpoint(self, checkpoint_filepath: str) -> None:
         """Export UNet-style HF checkpoint colocated with a Lightning .ckpt filepath."""
         hf_dir = Path(checkpoint_filepath)
@@ -419,14 +408,6 @@ class StableDiffusionLightningModule(pl.LightningModule):
             lora_dir = hf_dir / "unet_lora"
             self.unet.save_lora_adapter(str(lora_dir), adapter_name=self.lora_adapter_name)
 
-            export_payload = {
-                "base_model_name_or_path": self.cfg.get("pretrained_model_name_or_path"),
-                "adapter_name": self.lora_adapter_name,
-                "lora": self.lora_cfg,
-            }
-
-            save_json_config(export_payload, str(hf_dir / "lora_config.json"))
-            save_json_config(self.cfg, str(hf_dir / "training_config.json"))
             return
 
         unet_save_dir = hf_dir / "unet"
@@ -442,8 +423,6 @@ class StableDiffusionLightningModule(pl.LightningModule):
                 ema_obj.save_pretrained(str(ema_save_dir))
             elif ema_unet is not None and hasattr(ema_unet, "save_pretrained"):
                 ema_unet.save_pretrained(str(ema_save_dir))
-
-        save_json_config(self.cfg, str(hf_dir / "training_config.json"))
 
     def configure_optimizers(self):
         use_8bit_adam = bool(self.training_cfg.get("use_8bit_adam", False))

@@ -5,8 +5,10 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning import Callback, Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.utilities.rank_zero import rank_zero_info
+from pytorch_lightning.utilities.rank_zero import rank_zero_info, rank_zero_only
 from diffusers.optimization import get_scheduler
+
+from src.utils.config import save_json_config
 
 
 class NaNLossCallback(Callback):
@@ -242,3 +244,19 @@ class LoggingCallback(Callback):
                 prog_bar=self._is_prog_bar_metric(train_key),
                 sync_dist=True,
             )
+
+
+class ConfigSnapshotCallback(Callback):
+    """Persist the resolved experiment config next to checkpoints."""
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self.config = config
+
+    @rank_zero_only
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        """Write the experiment configuration once at the start of training."""
+
+        output_dir = Path(trainer.default_root_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        config_path = output_dir / "resolved_config.json"
+        save_json_config(self.config, config_path)
