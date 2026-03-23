@@ -33,7 +33,7 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
         model_name = cfg.get("pretrained_model_name_or_path")
         clip_model_name = cfg.get("clip_model_name_or_path", "CompVis/stable-diffusion-v1-4")
-        vae_name = cfg.get("vae_model_name_or_path", "stabilityai/sd-vae-ft-mse")
+        vae_model_name = cfg.get("vae_model_name_or_path", "stabilityai/sd-vae-ft-mse")
         unet_config_path = cfg.get("unet_config_path")
         scheduler_config_path = cfg.get("scheduler_config_path")
 
@@ -46,7 +46,7 @@ class StableDiffusionLightningModule(pl.LightningModule):
         else:
             self.tokenizer = CLIPTokenizer.from_pretrained(clip_model_name, subfolder="tokenizer")
             self.text_encoder = CLIPTextModel.from_pretrained(clip_model_name, subfolder="text_encoder")
-            self.vae = AutoencoderKL.from_pretrained(vae_name)
+            self.vae = AutoencoderKL.from_pretrained(vae_model_name, subfolder="vae")
 
             if scheduler_config_path:
                 scheduler_config = load_json_config(scheduler_config_path)
