@@ -247,7 +247,7 @@ class StableDiffusionDataModule(pl.LightningDataModule):
         persistent_workers = self.dataset_cfg.get("persistent_workers", False) and num_workers > 0
         pin_memory = self.dataset_cfg.get("pin_memory", True)
         if self.dataset_cfg.get("name"):
-            return DataLoader(
+            return create_dataloader(
                 self.dataset,
                 batch_size=self.train_batch_size,
                 shuffle=True,
@@ -256,9 +256,10 @@ class StableDiffusionDataModule(pl.LightningDataModule):
                 pin_memory=pin_memory,
                 persistent_workers=persistent_workers,
                 drop_last=True,
+                seed=self.seed,
             )
 
-        return DataLoader(
+        return create_dataloader(
             self.dataset,
             batch_size=self.train_batch_size,
             shuffle=True,
@@ -267,4 +268,5 @@ class StableDiffusionDataModule(pl.LightningDataModule):
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
             drop_last=True,
+            seed=self.seed,
         )

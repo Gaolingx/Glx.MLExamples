@@ -188,6 +188,8 @@ class StableDiffusionLightningModule(pl.LightningModule):
         elif pixel_values.ndim != 4:
             raise ValueError(f"Expected pixel_values to be 4D [B, C, H, W], got shape {tuple(pixel_values.shape)}")
 
+        pixel_values = pixel_values.to(device=self.device, dtype=self.vae.dtype)
+
         latents = self.vae.encode(pixel_values).latent_dist.sample()
         return latents * self.vae.config.scaling_factor
 
@@ -410,8 +412,7 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
     def save_hf_checkpoint(self, checkpoint_filepath: str) -> None:
         """Export UNet-style HF checkpoint colocated with a Lightning .ckpt filepath."""
-        checkpoint_dir = Path(checkpoint_filepath)
-        hf_dir = checkpoint_dir / "hf_checkpoint"
+        hf_dir = Path(checkpoint_filepath)
         hf_dir.mkdir(parents=True, exist_ok=True)
 
         if self.lora_enabled:

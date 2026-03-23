@@ -429,6 +429,8 @@ def create_dataloader(
         *,
         seed=None,
         persistent_workers=False,
+        collate_fn=None,
+        drop_last=False,
 ):
     def _get_sample_for_index(ds, idx):
         if hasattr(ds, "index_map"):
@@ -470,7 +472,8 @@ def create_dataloader(
                 batch_sampler=_ListBatchSampler(bucketed_batches),
                 num_workers=num_workers,
                 pin_memory=pin_memory,
-                collate_fn=_default_collate_fn,
+                collate_fn=collate_fn or _default_collate_fn,
+                drop_last=drop_last,
                 persistent_workers=bool(int(num_workers or 0) > 0 and persistent_workers),
                 worker_init_fn=_seed_worker if int(num_workers or 0) > 0 else None,
             )
@@ -486,8 +489,9 @@ def create_dataloader(
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        collate_fn=_default_collate_fn,
+        collate_fn=collate_fn or _default_collate_fn,
         generator=g,
+        drop_last=drop_last,
         persistent_workers=bool(int(num_workers or 0) > 0 and persistent_workers),
         worker_init_fn=_seed_worker if int(num_workers or 0) > 0 else None,
     )
@@ -547,9 +551,33 @@ class LatentCacheDataset(Dataset):
     def __len__(self):
         return len(self.dataset)
 
+    def _resolve_sample_for_index(self, idx: int):
+        dataset = self.dataset
+
+        if hasattr(dataset, "index_map") and hasattr(dataset, "dataset"):
+            base_idx = dataset.index_map[idx]
+            base_dataset = dataset.dataset
+            if hasattr(base_dataset, "samples"):
+                return base_dataset.samples[base_idx]
+
+        if hasattr(dataset, "repeats") and hasattr(dataset, "dataset"):
+            base_dataset = dataset.dataset
+            base_len = len(base_dataset)
+            if base_len <= 0:
+                raise IndexError("Cannot resolve sample from empty repeated dataset.")
+            base_idx = idx % base_len
+            if hasattr(base_dataset, "samples"):
+                return base_dataset.samples[base_idx]
+
+        if hasattr(dataset, "samples"):
+            return dataset.samples[idx]
+
+        raise AttributeError("Wrapped dataset does not expose sample metadata required for latent cache lookup.")
+
     def __getitem__(self, idx):
         item = self.dataset[idx]
-        image_path = self.samples[idx]["image_path"]
+        sample = self._resolve_sample_for_index(idx)
+        image_path = sample["image_path"]
 
         if self.cache.has_cache(image_path):
             item["latent"] = self.cache.load_cache(image_path)
