@@ -96,8 +96,6 @@ def run_validation_inference(
         device: torch.device,
         clip_skip: int,
         validation_cfg: Dict[str, Any],
-        training_cfg: Dict[str, Any],
-        inference_cfg: Dict[str, Any],
         scheduler: Any,
 ) -> List[Image.Image]:
     """Run validation-time inference and return generated images."""
@@ -118,7 +116,7 @@ def run_validation_inference(
     pipeline = pipeline.to(device)
     pipeline.set_progress_bar_config(disable=True)
 
-    validation_seed = validation_cfg.get("seed", training_cfg.get("seed", 42))
+    validation_seed = validation_cfg.get("seed", 42)
     generator_device = device.type if isinstance(device, torch.device) else str(device)
 
     images: List[Image.Image] = []
@@ -134,8 +132,8 @@ def run_validation_inference(
                 num_inference_steps=int(validation_cfg.get("num_inference_steps", 25)),
                 guidance_scale=float(validation_cfg.get("guidance_scale", 7.5)),
                 negative_prompt=validation_cfg.get("negative_prompt"),
-                height=int(validation_cfg.get("height", inference_cfg.get("height", 512))),
-                width=int(validation_cfg.get("width", inference_cfg.get("width", 512))),
+                height=int(validation_cfg.get("height", 512)),
+                width=int(validation_cfg.get("width", 512)),
                 clip_skip=clip_skip,
                 generator=generator,
             ).images[0]

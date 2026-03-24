@@ -37,27 +37,68 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def load_inference_runtime_config(args: argparse.Namespace) -> dict:
+    cfg = load_json_config(args.config)
+
+    overrides = {
+        "inference": {
+            "negative_prompt": args.negative_prompt,
+            "seed": args.seed,
+            "sampler": args.sampler,
+            "scheduler": args.scheduler,
+            "num_inference_steps": args.steps,
+            "guidance_scale": args.cfg_scale,
+            "height": args.height,
+            "width": args.width,
+            "denoise_strength": args.denoise_strength,
+        },
+        "clip": {
+            "skip": args.clip_skip,
+        },
+        "runtime": {
+            "ckpt_path": args.ckpt_path,
+            "base_model": args.base_model,
+            "lora_path": args.lora_path,
+            "init_image": args.init_image,
+        },
+    }
+
+    for section, values in overrides.items():
+        section_cfg = cfg.setdefault(section, {})
+        for key, value in values.items():
+            if value is not None:
+                section_cfg[key] = value
+
+    return cfg
+
+
 @torch.no_grad()
 def main() -> None:
     args = parse_args()
-    cfg = load_json_config(args.config)
+    cfg = load_inference_runtime_config(args)
     infer_cfg = cfg.get("inference", {})
     lora_cfg = cfg.get("lora", {})
     clip_cfg = cfg.get("clip", {})
 
-    if args.ckpt_path is None and (args.base_model is None or args.lora_path is None):
+    runtime_cfg = cfg.get("runtime", {})
+    ckpt_path = runtime_cfg.get("ckpt_path")
+    base_model = runtime_cfg.get("base_model")
+    lora_path = runtime_cfg.get("lora_path")
+    init_image_path = runtime_cfg.get("init_image")
+
+    if ckpt_path is None and (base_model is None or lora_path is None):
         raise ValueError("Provide either --ckpt_path, or both --base_model and --lora_path.")
 
-    if args.ckpt_path is not None:
-        module = StableDiffusionLightningModule.load_from_checkpoint(args.ckpt_path, cfg=cfg, map_location="cpu")
+    if ckpt_path is not None:
+        module = StableDiffusionLightningModule.load_from_checkpoint(ckpt_path, cfg=cfg, map_location="cpu")
         module.eval()
 
         scheduler = build_inference_scheduler(
             module.noise_scheduler.config,
-            args.sampler or infer_cfg.get("sampler", "dpmpp_2m"),
-            args.scheduler or infer_cfg.get("scheduler", "default"),
+            infer_cfg.get("sampler", "dpmpp_2m"),
+            infer_cfg.get("scheduler", "default"),
         )
-        pipe_cls = StableDiffusionImg2ImgPipeline if args.init_image else StableDiffusionPipeline
+        pipe_cls = StableDiffusionImg2ImgPipeline if init_image_path else StableDiffusionPipeline
         pipe = pipe_cls(
             vae=module.vae,
             text_encoder=module.text_encoder,
@@ -69,34 +110,32 @@ def main() -> None:
             requires_safety_checker=False,
         )
     else:
-        pipe_cls = StableDiffusionImg2ImgPipeline if args.init_image else StableDiffusionPipeline
+        pipe_cls = StableDiffusionImg2ImgPipeline if init_image_path else StableDiffusionPipeline
         pipe = pipe_cls.from_pretrained(
-            args.base_model,
+            base_model,
             safety_checker=None,
             feature_extractor=None,
             requires_safety_checker=False,
         )
         pipe.scheduler = build_inference_scheduler(
             pipe.scheduler.config,
-            args.sampler or infer_cfg.get("sampler", "dpmpp_2m"),
-            args.scheduler or infer_cfg.get("scheduler", "default"),
+            infer_cfg.get("sampler", "dpmpp_2m"),
+            infer_cfg.get("scheduler", "default"),
         )
-        pipe.unet.load_lora_adapter(args.lora_path, prefix=None, adapter_name=lora_cfg.get("adapter_name", "default"))
+        pipe.unet.load_lora_adapter(lora_path, prefix=None, adapter_name=lora_cfg.get("adapter_name", "default"))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     pipe = pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
 
-    negative_prompt = args.negative_prompt
-    if negative_prompt is None:
-        negative_prompt = infer_cfg.get("negative_prompt")
-    clip_skip = args.clip_skip if args.clip_skip is not None else int(clip_cfg.get("skip", 1))
-    seed = args.seed if args.seed is not None else infer_cfg.get("seed")
-    num_inference_steps = args.steps if args.steps is not None else int(infer_cfg.get("num_inference_steps", 30))
-    guidance_scale = args.cfg_scale if args.cfg_scale is not None else float(infer_cfg.get("guidance_scale", 7.5))
-    height = args.height if args.height is not None else int(infer_cfg.get("height", 512))
-    width = args.width if args.width is not None else int(infer_cfg.get("width", 512))
-    denoise_strength = args.denoise_strength if args.denoise_strength is not None else float(infer_cfg.get("denoise_strength", 0.75))
+    negative_prompt = infer_cfg.get("negative_prompt")
+    clip_skip = int(clip_cfg.get("skip", 1))
+    seed = infer_cfg.get("seed")
+    num_inference_steps = int(infer_cfg.get("num_inference_steps", 30))
+    guidance_scale = float(infer_cfg.get("guidance_scale", 7.5))
+    height = int(infer_cfg.get("height", 512))
+    width = int(infer_cfg.get("width", 512))
+    denoise_strength = float(infer_cfg.get("denoise_strength", 0.75))
     if not 0.0 <= denoise_strength <= 1.0:
         raise ValueError("denoise_strength must be in [0, 1].")
 
@@ -104,9 +143,9 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     init_image = None
-    if args.init_image is not None:
-        init_image = Image.open(args.init_image).convert("RGB")
-        if args.height is None or args.width is None:
+    if init_image_path is not None:
+        init_image = Image.open(init_image_path).convert("RGB")
+        if "height" not in infer_cfg or "width" not in infer_cfg:
             width, height = init_image.size
 
     generator_device = device

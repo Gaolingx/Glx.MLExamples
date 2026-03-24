@@ -75,7 +75,6 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
         self.training_cfg = cfg["training"]
         self.validation_cfg = cfg.get("validation", {})
-        self.inference_cfg = cfg.get("inference", {})
         self.clip_cfg = cfg.get("clip", {})
         self.clip_skip = max(1, int(self.clip_cfg.get("skip", 1)))
 
@@ -353,8 +352,6 @@ class StableDiffusionLightningModule(pl.LightningModule):
             device=self.device,
             clip_skip=self.clip_skip,
             validation_cfg=self.validation_cfg,
-            training_cfg=self.training_cfg,
-            inference_cfg=self.inference_cfg,
             scheduler=build_inference_scheduler(
                 self.noise_scheduler.config,
                 self.validation_cfg.get("sampler"),
@@ -380,9 +377,10 @@ class StableDiffusionLightningModule(pl.LightningModule):
             text_encoder=self.text_encoder,
             tokenizer=self.tokenizer,
             unet=self.unet,
-            scheduler=self._build_inference_scheduler(
-                self.inference_cfg.get("sampler"),
-                self.inference_cfg.get("scheduler"),
+            scheduler=build_inference_scheduler(
+                self.noise_scheduler.config,
+                self.validation_cfg.get("sampler"),
+                self.validation_cfg.get("scheduler"),
             ),
             safety_checker=None,
             feature_extractor=None,
