@@ -1,7 +1,6 @@
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import shutil
 import numpy as np
 import torch
 from diffusers import (
@@ -16,48 +15,6 @@ from diffusers import (
     StableDiffusionPipeline,
 )
 from PIL import Image
-
-
-def prepare_hub_upload_folder(
-        *,
-        export_dir: Path,
-        destination_dir: Path,
-        lora_enabled: bool,
-        source_readme: Optional[Path] = None,
-) -> Path:
-    """Prepare a Hugging Face Hub upload folder that matches Diffusers layout expectations."""
-    export_dir = Path(export_dir)
-    destination_dir = Path(destination_dir)
-
-    if destination_dir.exists():
-        shutil.rmtree(destination_dir)
-    shutil.copytree(export_dir, destination_dir)
-
-    if lora_enabled:
-        _normalize_lora_export_layout(destination_dir)
-
-    if source_readme is not None and source_readme.exists():
-        shutil.copy2(source_readme, destination_dir / "README.md")
-
-    return destination_dir
-
-
-def _normalize_lora_export_layout(destination_dir: Path) -> None:
-    """Map local LoRA export names to Hub-friendly Diffusers adapter names."""
-    rename_pairs = {
-        "unet_lora": "unet",
-        "text_encoder_lora": "text_encoder",
-    }
-
-    for source_name, target_name in rename_pairs.items():
-        source_path = destination_dir / source_name
-        target_path = destination_dir / target_name
-        if source_path.exists() and not target_path.exists():
-            source_path.rename(target_path)
-
-    model_index_path = destination_dir / "model_index.json"
-    if model_index_path.exists():
-        model_index_path.unlink()
 
 
 def resolve_lora_init_path(init_path: str | Path) -> str:

@@ -26,7 +26,6 @@ from src.utils.train_utils import (
     log_validation_images,
     run_validation_inference,
     build_inference_scheduler,
-    prepare_hub_upload_folder,
 )
 
 
@@ -376,7 +375,6 @@ class StableDiffusionLightningModule(pl.LightningModule):
             "train/target_std": target.detach().float().std(unbiased=False),
             "train/pred_target_mse": (model_pred.detach().float() - target.detach().float()).pow(2).mean(),
             "train/latent_cache_hit_rate": float(cache_hit_rate),
-            "train/noise_offset": float(noise_offset),
         }
         if snr_gamma is not None:
             metrics["train/snr_gamma"] = float(snr_gamma)
@@ -446,13 +444,15 @@ class StableDiffusionLightningModule(pl.LightningModule):
         save_dir.mkdir(parents=True, exist_ok=True)
 
         if self.lora_enabled:
-            if self.train_unet_lora:
-                lora_dir = save_dir / "unet_lora"
-                self.unet.save_lora_adapter(str(lora_dir), adapter_name=self.lora_adapter_name)
-            if self.train_text_encoder_lora:
-                text_lora_dir = save_dir / "text_encoder_lora"
-                self.text_encoder.save_pretrained(str(text_lora_dir), safe_serialization=True)
-
+            StableDiffusionPipeline.save_lora_weights(
+                save_directory=str(save_dir),
+                unet_lora_layers=self.unet.get_adapter_state_dict() if self.train_unet_lora else None,
+                text_encoder_lora_layers=(
+                    self.text_encoder.get_adapter_state_dict() if self.train_text_encoder_lora else None
+                ),
+                weight_name="pytorch_lora_weights.safetensors",
+                safe_serialization=True,
+            )
             return
 
         pipeline = StableDiffusionPipeline(
@@ -489,17 +489,6 @@ class StableDiffusionLightningModule(pl.LightningModule):
         unet_save_dir = hf_dir / "unet"
         self.unet.save_pretrained(str(unet_save_dir))
 
-        use_ema = bool(getattr(self, "use_ema", False))
-        if use_ema:
-            ema_obj = getattr(self, "ema", None)
-            ema_unet = getattr(self, "ema_unet", None)
-            ema_save_dir = hf_dir / "unet_ema"
-
-            if ema_obj is not None and hasattr(ema_obj, "save_pretrained"):
-                ema_obj.save_pretrained(str(ema_save_dir))
-            elif ema_unet is not None and hasattr(ema_unet, "save_pretrained"):
-                ema_unet.save_pretrained(str(ema_save_dir))
-
     def on_train_end(self) -> None:
         if self.trainer is None or not self.trainer.is_global_zero:
             return
@@ -510,8 +499,17 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
         output_dir = Path(self.cfg.get("output_dir", self.trainer.default_root_dir))
         export_dir = output_dir / ("final_lora" if self.lora_enabled else "final_model")
-        if not export_dir.exists():
-            return
+        project_root = Path(__file__).resolve().parents[2]
+        source_readme = project_root / "README.md"
+
+        def ensure_hub_readme() -> None:
+            if source_readme.exists():
+                (export_dir / "README.md").write_text(source_readme.read_text(encoding="utf-8"), encoding="utf-8")
+
+        if not export_dir.is_dir():
+            rank_zero_info(f"[Hub] Export directory `{export_dir}` is missing or incomplete. Re-exporting before upload.")
+            self.save_pretrained(str(export_dir))
+            ensure_hub_readme()
 
         token = hub_cfg.get("token") or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
         repo_id = hub_cfg.get("model_id")
@@ -522,20 +520,9 @@ class StableDiffusionLightningModule(pl.LightningModule):
         repo_id = str(repo_id)
         create_repo(repo_id=repo_id, token=token, exist_ok=True)
 
-        upload_dir = output_dir / "hf_hub"
-        project_root = Path(__file__).resolve().parents[2]
-        source_readme = project_root / "README.md"
-
-        prepare_hub_upload_folder(
-            export_dir=export_dir,
-            destination_dir=upload_dir,
-            lora_enabled=self.lora_enabled,
-            source_readme=source_readme if source_readme.exists() else None,
-        )
-
         upload_folder(
             repo_id=repo_id,
-            folder_path=str(upload_dir),
+            folder_path=str(export_dir),
             token=token,
             commit_message="Upload Diffusers model artifacts",
         )
