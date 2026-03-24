@@ -8,16 +8,21 @@ import torch.nn.functional as F
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
-    DPMSolverMultistepScheduler,
     StableDiffusionPipeline,
     UNet2DConditionModel,
 )
 from diffusers.optimization import get_scheduler
-from pytorch_lightning.utilities.rank_zero import rank_zero_info
-from PIL import Image
+from pytorch_lightning.utilities.rank_zero import rank_zero_info, rank_zero_warn
 from transformers import CLIPTextModel, CLIPTokenizer
+from transformers.modeling_outputs import BaseModelOutputWithPooling
 
 from src.utils.config import load_json_config
+from src.utils.train_utils import (
+    resolve_lora_init_path,
+    log_validation_images,
+    run_validation_inference,
+    build_inference_scheduler,
+)
 
 
 class StableDiffusionLightningModule(pl.LightningModule):
@@ -70,6 +75,9 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
         self.training_cfg = cfg["training"]
         self.validation_cfg = cfg.get("validation", {})
+        self.inference_cfg = cfg.get("inference", {})
+        self.clip_cfg = cfg.get("clip", {})
+        self.clip_skip = max(1, int(self.clip_cfg.get("skip", 1)))
 
         # Runtime metric cache for callback-side unified stdout logging.
         self.runtime_log_dict: Dict[str, float] = {}
@@ -82,7 +90,7 @@ class StableDiffusionLightningModule(pl.LightningModule):
             try:
                 self.unet.enable_xformers_memory_efficient_attention()
             except Exception as exc:
-                rank_zero_info(
+                rank_zero_warn(
                     f"[warning] xFormers attention requested but unavailable; falling back to standard attention. ({exc})"
                 )
 
@@ -96,7 +104,7 @@ class StableDiffusionLightningModule(pl.LightningModule):
             raise ValueError("`pretrained_model_name_or_path` must be provided when `lora.enabled=true`.")
 
         init_path = self.lora_cfg.get("init_path")
-        resolved_init_path = self._resolve_lora_init_path(init_path) if init_path else None
+        resolved_init_path = resolve_lora_init_path(init_path) if init_path else None
 
         if resolved_init_path is None:
             target_modules = self.lora_cfg.get("target_modules", ["to_q", "to_k", "to_v", "to_out.0"])
@@ -132,38 +140,6 @@ class StableDiffusionLightningModule(pl.LightningModule):
             f"({(100.0 * trainable_params / max(all_params, 1)):.4f}%)."
         )
 
-    def _resolve_lora_init_path(self, init_path: str) -> str:
-        path = Path(init_path)
-
-        if path.is_dir():
-            candidate_dirs = [
-                path,
-                path / "unet_lora",
-                path / "hf_checkpoint" / "unet_lora",
-            ]
-            for candidate in candidate_dirs:
-                if candidate.is_dir():
-                    return str(candidate)
-
-        if path.is_file() and path.suffix == ".ckpt":
-            checkpoint_dir = path.with_suffix("")
-            candidate_dirs = [
-                checkpoint_dir / "hf_checkpoint" / "unet_lora",
-                path.parent / "hf_checkpoint" / "unet_lora",
-            ]
-            for candidate in candidate_dirs:
-                if candidate.is_dir():
-                    return str(candidate)
-            raise FileNotFoundError(
-                "LoRA init checkpoint was provided, but no exported adapter directory was found next to it. "
-                "Expected `hf_checkpoint/unet_lora`."
-            )
-
-        if path.exists():
-            return str(path)
-
-        raise FileNotFoundError(f"LoRA init path not found: {init_path}")
-
     def on_fit_start(self) -> None:
         # Keep frozen modules in eval mode during training.
         self.vae.eval()
@@ -171,7 +147,36 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
     @torch.no_grad()
     def encode_prompt(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.text_encoder(input_ids, attention_mask=None)[0]
+        if self.clip_skip <= 1:
+            return self.text_encoder(input_ids, attention_mask=None)[0]
+
+        text_encoder_output = self.text_encoder(
+            input_ids,
+            attention_mask=None,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        return self._select_text_encoder_hidden_state(text_encoder_output)
+
+    def _select_text_encoder_hidden_state(
+            self,
+            text_encoder_output: BaseModelOutputWithPooling,
+    ) -> torch.Tensor:
+        hidden_states = text_encoder_output.hidden_states
+        if hidden_states is None:
+            raise ValueError("CLIP hidden states are unavailable; cannot apply clip skip.")
+
+        max_skip = len(hidden_states) - 1
+        if self.clip_skip > max_skip:
+            raise ValueError(
+                f"clip.skip={self.clip_skip} exceeds available hidden-state depth ({max_skip})."
+            )
+
+        selected_hidden_state = hidden_states[-self.clip_skip]
+        final_layer_norm = getattr(self.text_encoder.text_model, "final_layer_norm", None)
+        if final_layer_norm is not None:
+            selected_hidden_state = final_layer_norm(selected_hidden_state)
+        return selected_hidden_state
 
     def _compute_snr(self, timesteps: torch.Tensor) -> torch.Tensor:
         alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(device=timesteps.device, dtype=torch.float32)
@@ -331,50 +336,33 @@ class StableDiffusionLightningModule(pl.LightningModule):
         if self.trainer is not None and not self.trainer.is_global_zero:
             return
 
-        every_n_steps = int(self.validation_cfg.get("every_n_steps", 0))
-        if every_n_steps <= 0:
-            return
-
         global_step = int(self.global_step)
-        if global_step == 0 or global_step % every_n_steps != 0:
+        every_n_steps = int(self.validation_cfg.get("every_n_steps", 0))
+        if global_step == 0 or every_n_steps <= 0 or global_step % every_n_steps != 0:
             return
 
         prompts = self.validation_cfg.get("prompts", [])
         if len(prompts) == 0:
             return
 
-        pipeline = StableDiffusionPipeline(
+        images = run_validation_inference(
             vae=self.vae,
             text_encoder=self.text_encoder,
             tokenizer=self.tokenizer,
             unet=self.unet,
-            scheduler=DPMSolverMultistepScheduler.from_config(self.noise_scheduler.config),
-            safety_checker=None,
-            feature_extractor=None,
-            requires_safety_checker=False,
+            device=self.device,
+            clip_skip=self.clip_skip,
+            validation_cfg=self.validation_cfg,
+            training_cfg=self.training_cfg,
+            inference_cfg=self.inference_cfg,
+            scheduler=build_inference_scheduler(
+                self.noise_scheduler.config,
+                self.validation_cfg.get("sampler"),
+                self.validation_cfg.get("scheduler"),
+            ),
         )
-        pipeline = pipeline.to(self.device)
-        pipeline.set_progress_bar_config(disable=True)
 
-        images: List[Image.Image] = []
-        for prompt in prompts:
-            image = pipeline(
-                prompt,
-                num_inference_steps=int(self.validation_cfg.get("num_inference_steps", 25)),
-                guidance_scale=float(self.validation_cfg.get("guidance_scale", 7.5)),
-            ).images[0]
-            images.append(image)
-
-        # Lightning TensorBoard logger exposes underlying SummaryWriter.
-        if self.logger is not None and hasattr(self.logger, "experiment"):
-            import numpy as np
-
-            writer = self.logger.experiment
-            for idx, image in enumerate(images):
-                image_tensor = torch.from_numpy(np.asarray(image)).permute(2, 0, 1).float() / 255.0
-                writer.add_image(f"validation/sample_{idx}", image_tensor, global_step)
-
-        del pipeline
+        log_validation_images(self.logger, images, global_step)
 
     def save_pretrained(self, save_directory: str) -> None:
         """Export current training state to a Diffusers-compatible checkpoint folder."""
@@ -392,7 +380,10 @@ class StableDiffusionLightningModule(pl.LightningModule):
             text_encoder=self.text_encoder,
             tokenizer=self.tokenizer,
             unet=self.unet,
-            scheduler=DPMSolverMultistepScheduler.from_config(self.noise_scheduler.config),
+            scheduler=self._build_inference_scheduler(
+                self.inference_cfg.get("sampler"),
+                self.inference_cfg.get("scheduler"),
+            ),
             safety_checker=None,
             feature_extractor=None,
             requires_safety_checker=False,

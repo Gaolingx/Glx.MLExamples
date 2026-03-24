@@ -63,11 +63,20 @@
     "init_lora_weights": true,
     "init_path": null
   },
+  "clip": {
+    "skip": 1
+  },
   "validation": {
     "enabled": true,
     "every_n_steps": 500,
+    "seed": 42,
+    "sampler": "dpmpp_2m",
+    "scheduler": "karras",
     "num_inference_steps": 25,
     "guidance_scale": 7.5,
+    "height": 512,
+    "width": 512,
+    "negative_prompt": "low quality, blurry",
     "prompts": [
       "portrait photo of a girl, photograph, highly detailed face, depth of field, moody light, golden hour",
       "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k"
@@ -87,10 +96,14 @@
     "log_every_n_steps": 10
   },
   "inference": {
+    "seed": 42,
+    "sampler": "dpmpp_2m",
+    "scheduler": "karras",
     "num_inference_steps": 100,
     "guidance_scale": 7.5,
     "height": 512,
     "width": 512,
+    "denoise_strength": 0.75,
     "negative_prompt": "low quality, blurry",
     "output_dir": "outputs/sd15-lightning/inference"
   }
