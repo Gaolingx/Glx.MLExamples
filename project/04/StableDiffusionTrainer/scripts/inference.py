@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cfg_scale", type=float, default=None, help="CFG/guidance scale.")
     parser.add_argument("--height", type=int, default=None, help="Output image height.")
     parser.add_argument("--width", type=int, default=None, help="Output image width.")
+    parser.add_argument("--output", type=str, default=None, help="Output image directory.")
     parser.add_argument("--init_image", type=str, default=None, help="Optional init image path for img2img.")
     parser.add_argument("--denoise_strength", type=float, default=None, help="Img2img denoise strength in [0, 1].")
     return parser.parse_args()
@@ -50,6 +51,7 @@ def load_inference_runtime_config(args: argparse.Namespace) -> dict:
             "guidance_scale": args.cfg_scale,
             "height": args.height,
             "width": args.width,
+            "output_dir": args.output,
             "denoise_strength": args.denoise_strength,
         },
         "clip": {
