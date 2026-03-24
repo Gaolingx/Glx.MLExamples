@@ -31,6 +31,8 @@
     "max_grad_norm": 1.0,
     "lr_scheduler": "cosine",
     "lr_warmup_steps": 100,
+    "snr_gamma": null,
+    "noise_offset": 0.0,
     "override_lr_on_resume": false,
     "reset_scheduler_on_resume": false,
     "num_train_timesteps": 1000,
@@ -49,19 +51,34 @@
   },
   "lora": {
     "enabled": false,
+    "train_unet": true,
+    "train_text_encoder": false,
     "adapter_name": "default",
     "rank": 16,
     "alpha": 16,
     "dropout": 0.0,
     "bias": "none",
+    "use_dora": false,
     "target_modules": [
       "to_q",
       "to_k",
       "to_v",
       "to_out.0"
     ],
+    "text_encoder_target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "out_proj"
+    ],
     "init_lora_weights": true,
     "init_path": null
+  },
+  "hub": {
+    "push_to_hub": false,
+    "model_id": null,
+    "token": null,
+    "private": false
   },
   "clip": {
     "skip": 1

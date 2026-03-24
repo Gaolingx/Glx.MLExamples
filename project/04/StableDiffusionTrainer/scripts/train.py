@@ -60,6 +60,23 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional LoRA init path. Supports adapter dir or Lightning ckpt exported with hf_checkpoint/unet_lora.",
     )
+    parser.add_argument(
+        "--push_to_hub",
+        action="store_true",
+        help="Upload final exported model artifacts to the Hugging Face Hub.",
+    )
+    parser.add_argument(
+        "--hub_model_id",
+        type=str,
+        default=None,
+        help="Optional Hub repo id used when --push_to_hub is enabled.",
+    )
+    parser.add_argument(
+        "--hub_token",
+        type=str,
+        default=None,
+        help="Optional Hugging Face token used for uploads.",
+    )
     return parser.parse_args()
 
 
@@ -81,6 +98,12 @@ def main() -> None:
     if args.lora_init_path is not None:
         cfg.setdefault("lora", {})["enabled"] = True
         cfg["lora"]["init_path"] = args.lora_init_path
+    if args.push_to_hub:
+        cfg.setdefault("hub", {})["push_to_hub"] = True
+    if args.hub_model_id is not None:
+        cfg.setdefault("hub", {})["model_id"] = args.hub_model_id
+    if args.hub_token is not None:
+        cfg.setdefault("hub", {})["token"] = args.hub_token
 
     seed_everything(int(training_cfg.get("seed", 42)))
 

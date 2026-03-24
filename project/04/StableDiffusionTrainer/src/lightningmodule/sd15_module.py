@@ -1,10 +1,12 @@
 import importlib
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+from packaging import version
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
@@ -12,7 +14,9 @@ from diffusers import (
     UNet2DConditionModel,
 )
 from diffusers.optimization import get_scheduler
+from diffusers.utils.import_utils import is_xformers_available
 from pytorch_lightning.utilities.rank_zero import rank_zero_info, rank_zero_warn
+from huggingface_hub import create_repo, upload_folder
 from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 
@@ -22,6 +26,7 @@ from src.utils.train_utils import (
     log_validation_images,
     run_validation_inference,
     build_inference_scheduler,
+    prepare_hub_upload_folder,
 )
 
 
@@ -35,6 +40,9 @@ class StableDiffusionLightningModule(pl.LightningModule):
         self.lora_cfg = cfg.get("lora", {})
         self.lora_enabled = bool(self.lora_cfg.get("enabled", False))
         self.lora_adapter_name = str(self.lora_cfg.get("adapter_name", "default"))
+        self.train_unet_lora = bool(self.lora_cfg.get("train_unet", self.lora_enabled))
+        self.train_text_encoder_lora = bool(self.lora_cfg.get("train_text_encoder", False))
+        self.model_card_path: Optional[Path] = None
 
         model_name = cfg.get("pretrained_model_name_or_path")
         clip_model_name = cfg.get("clip_model_name_or_path", "CompVis/stable-diffusion-v1-4")
@@ -72,6 +80,7 @@ class StableDiffusionLightningModule(pl.LightningModule):
             self._setup_lora()
         else:
             self.unet.requires_grad_(True)
+            self.text_encoder.requires_grad_(False)
 
         self.training_cfg = cfg["training"]
         self.validation_cfg = cfg.get("validation", {})
@@ -84,18 +93,27 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
         if bool(self.training_cfg.get("gradient_checkpointing", False)):
             self.unet.enable_gradient_checkpointing()
+            if self.train_text_encoder_lora:
+                self.text_encoder.gradient_checkpointing_enable()
 
         if bool(self.training_cfg.get("enable_xformers_memory_efficient_attention", False)):
-            try:
+            if is_xformers_available():
+                import xformers
+
+                xformers_version = version.parse(xformers.__version__)
+                if xformers_version == version.parse("0.0.16"):
+                    rank_zero_warn(
+                        "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, "
+                        "please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+                    )
                 self.unet.enable_xformers_memory_efficient_attention()
-            except Exception as exc:
-                rank_zero_warn(
-                    f"[warning] xFormers attention requested but unavailable; falling back to standard attention. ({exc})"
-                )
+            else:
+                raise ValueError("xformers is not available. Make sure it is installed correctly")
 
     def _setup_lora(self) -> None:
         try:
-            LoraConfig = importlib.import_module("peft").LoraConfig
+            peft_module = importlib.import_module("peft")
+            LoraConfig = peft_module.LoraConfig
         except ImportError as exc:
             raise ImportError("LoRA training requires `peft`. Please install it with `pip install peft`.") from exc
 
@@ -104,33 +122,57 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
         init_path = self.lora_cfg.get("init_path")
         resolved_init_path = resolve_lora_init_path(init_path) if init_path else None
+        use_dora = bool(self.lora_cfg.get("use_dora", False))
+        target_modules = self.lora_cfg.get("target_modules", ["to_q", "to_k", "to_v", "to_out.0"])
 
-        if resolved_init_path is None:
-            target_modules = self.lora_cfg.get("target_modules", ["to_q", "to_k", "to_v", "to_out.0"])
+        if self.train_unet_lora:
+            if resolved_init_path is None:
+                lora_config = LoraConfig(
+                    r=int(self.lora_cfg.get("rank", 16)),
+                    lora_alpha=int(self.lora_cfg.get("alpha", 16)),
+                    lora_dropout=float(self.lora_cfg.get("dropout", 0.0)),
+                    bias=str(self.lora_cfg.get("bias", "none")),
+                    target_modules=target_modules,
+                    init_lora_weights=self.lora_cfg.get("init_lora_weights", True),
+                    use_dora=use_dora,
+                )
+                self.unet.add_adapter(lora_config, adapter_name=self.lora_adapter_name)
+                rank_zero_info(
+                    f"[LoRA] Added UNet adapter '{self.lora_adapter_name}' with rank={lora_config.r}, alpha={lora_config.lora_alpha}, dora={use_dora}."
+                )
+            else:
+                self.unet.load_lora_adapter(
+                    resolved_init_path,
+                    prefix=None,
+                    adapter_name=self.lora_adapter_name,
+                )
+                rank_zero_info(f"[LoRA] Loaded UNet adapter '{self.lora_adapter_name}' from {resolved_init_path}.")
+
+            self.unet.set_adapter(self.lora_adapter_name)
+            self.unet.requires_grad_(False)
+            for name, parameter in self.unet.named_parameters():
+                parameter.requires_grad = "lora_" in name
+        else:
+            self.unet.requires_grad_(False)
+
+        if self.train_text_encoder_lora:
+            text_encoder_targets = self.lora_cfg.get("text_encoder_target_modules", ["q_proj", "k_proj", "v_proj", "out_proj"])
             lora_config = LoraConfig(
                 r=int(self.lora_cfg.get("rank", 16)),
                 lora_alpha=int(self.lora_cfg.get("alpha", 16)),
                 lora_dropout=float(self.lora_cfg.get("dropout", 0.0)),
                 bias=str(self.lora_cfg.get("bias", "none")),
-                target_modules=target_modules,
+                target_modules=text_encoder_targets,
                 init_lora_weights=self.lora_cfg.get("init_lora_weights", True),
+                use_dora=use_dora,
             )
-            self.unet.add_adapter(lora_config, adapter_name=self.lora_adapter_name)
+            self.text_encoder.add_adapter(lora_config)
+            self.text_encoder.requires_grad_(False)
+            for name, parameter in self.text_encoder.named_parameters():
+                parameter.requires_grad = "lora_" in name
             rank_zero_info(
-                f"[LoRA] Added new adapter '{self.lora_adapter_name}' with rank={lora_config.r}, alpha={lora_config.lora_alpha}."
+                f"[LoRA] Added text encoder adapter with rank={lora_config.r}, alpha={lora_config.lora_alpha}, dora={use_dora}."
             )
-        else:
-            self.unet.load_lora_adapter(
-                resolved_init_path,
-                prefix=None,
-                adapter_name=self.lora_adapter_name,
-            )
-            rank_zero_info(f"[LoRA] Loaded adapter '{self.lora_adapter_name}' from {resolved_init_path}.")
-
-        self.unet.set_adapter(self.lora_adapter_name)
-        self.unet.requires_grad_(False)
-        for name, parameter in self.unet.named_parameters():
-            parameter.requires_grad = "lora_" in name
 
         trainable_params = sum(param.numel() for param in self.unet.parameters() if param.requires_grad)
         all_params = sum(param.numel() for param in self.unet.parameters())
@@ -138,14 +180,30 @@ class StableDiffusionLightningModule(pl.LightningModule):
             f"[LoRA] Training {trainable_params:,} / {all_params:,} UNet parameters "
             f"({(100.0 * trainable_params / max(all_params, 1)):.4f}%)."
         )
+        if self.train_text_encoder_lora:
+            text_trainable = sum(param.numel() for param in self.text_encoder.parameters() if param.requires_grad)
+            text_total = sum(param.numel() for param in self.text_encoder.parameters())
+            rank_zero_info(
+                f"[LoRA] Training {text_trainable:,} / {text_total:,} text encoder parameters "
+                f"({(100.0 * text_trainable / max(text_total, 1)):.4f}%)."
+            )
 
     def on_fit_start(self) -> None:
         # Keep frozen modules in eval mode during training.
         self.vae.eval()
-        self.text_encoder.eval()
+        if self.train_text_encoder_lora:
+            self.text_encoder.train()
+        else:
+            self.text_encoder.eval()
 
-    @torch.no_grad()
     def encode_prompt(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.train_text_encoder_lora:
+            return self._encode_prompt_impl(input_ids)
+
+        with torch.no_grad():
+            return self._encode_prompt_impl(input_ids)
+
+    def _encode_prompt_impl(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self.clip_skip <= 1:
             return self.text_encoder(input_ids, attention_mask=None)[0]
 
@@ -258,6 +316,13 @@ class StableDiffusionLightningModule(pl.LightningModule):
         latents, cache_hit_rate = self._get_latents_from_batch(batch)
 
         noise = torch.randn_like(latents)
+        noise_offset = float(self.training_cfg.get("noise_offset", 0.0))
+        if noise_offset != 0.0:
+            noise = noise + noise_offset * torch.randn(
+                (latents.shape[0], latents.shape[1], 1, 1),
+                device=latents.device,
+                dtype=latents.dtype,
+            )
         bsz = latents.shape[0]
         timesteps = torch.randint(
             0,
@@ -284,8 +349,19 @@ class StableDiffusionLightningModule(pl.LightningModule):
         else:
             raise ValueError(f"Unknown prediction type: {prediction_type}")
 
-        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
         snr = self._compute_snr(timesteps)
+        loss_per_sample = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+        loss_per_sample = loss_per_sample.mean(dim=tuple(range(1, loss_per_sample.ndim)))
+
+        snr_gamma = self.training_cfg.get("snr_gamma")
+        if snr_gamma is not None:
+            gamma = float(snr_gamma)
+            snr_weights = torch.minimum(snr, torch.full_like(snr, gamma)) / snr.clamp(min=1e-8)
+            if self.noise_scheduler.config.prediction_type == "v_prediction":
+                snr_weights = snr_weights + 1.0
+            loss = (loss_per_sample * snr_weights).mean()
+        else:
+            loss = loss_per_sample.mean()
 
         metrics: Dict[str, Any] = {
             "train/loss": loss.detach(),
@@ -300,7 +376,10 @@ class StableDiffusionLightningModule(pl.LightningModule):
             "train/target_std": target.detach().float().std(unbiased=False),
             "train/pred_target_mse": (model_pred.detach().float() - target.detach().float()).pow(2).mean(),
             "train/latent_cache_hit_rate": float(cache_hit_rate),
+            "train/noise_offset": float(noise_offset),
         }
+        if snr_gamma is not None:
+            metrics["train/snr_gamma"] = float(snr_gamma)
         return loss, metrics
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, Any]:
@@ -367,8 +446,12 @@ class StableDiffusionLightningModule(pl.LightningModule):
         save_dir.mkdir(parents=True, exist_ok=True)
 
         if self.lora_enabled:
-            lora_dir = save_dir / "unet_lora"
-            self.unet.save_lora_adapter(str(lora_dir), adapter_name=self.lora_adapter_name)
+            if self.train_unet_lora:
+                lora_dir = save_dir / "unet_lora"
+                self.unet.save_lora_adapter(str(lora_dir), adapter_name=self.lora_adapter_name)
+            if self.train_text_encoder_lora:
+                text_lora_dir = save_dir / "text_encoder_lora"
+                self.text_encoder.save_pretrained(str(text_lora_dir), safe_serialization=True)
 
             return
 
@@ -394,8 +477,12 @@ class StableDiffusionLightningModule(pl.LightningModule):
         hf_dir.mkdir(parents=True, exist_ok=True)
 
         if self.lora_enabled:
-            lora_dir = hf_dir / "unet_lora"
-            self.unet.save_lora_adapter(str(lora_dir), adapter_name=self.lora_adapter_name)
+            if self.train_unet_lora:
+                lora_dir = hf_dir / "unet_lora"
+                self.unet.save_lora_adapter(str(lora_dir), adapter_name=self.lora_adapter_name)
+            if self.train_text_encoder_lora:
+                text_lora_dir = hf_dir / "text_encoder_lora"
+                self.text_encoder.save_pretrained(str(text_lora_dir), safe_serialization=True)
 
             return
 
@@ -413,6 +500,47 @@ class StableDiffusionLightningModule(pl.LightningModule):
             elif ema_unet is not None and hasattr(ema_unet, "save_pretrained"):
                 ema_unet.save_pretrained(str(ema_save_dir))
 
+    def on_train_end(self) -> None:
+        if self.trainer is None or not self.trainer.is_global_zero:
+            return
+
+        hub_cfg = self.cfg.get("hub", {})
+        if not bool(hub_cfg.get("push_to_hub", False)):
+            return
+
+        output_dir = Path(self.cfg.get("output_dir", self.trainer.default_root_dir))
+        export_dir = output_dir / ("final_lora" if self.lora_enabled else "final_model")
+        if not export_dir.exists():
+            return
+
+        token = hub_cfg.get("token") or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        repo_id = hub_cfg.get("model_id")
+        if not repo_id:
+            rank_zero_warn("[Hub] `hub.model_id` is missing, skipping upload.")
+            return
+
+        repo_id = str(repo_id)
+        create_repo(repo_id=repo_id, token=token, exist_ok=True)
+
+        upload_dir = output_dir / "hf_hub"
+        project_root = Path(__file__).resolve().parents[2]
+        source_readme = project_root / "README.md"
+
+        prepare_hub_upload_folder(
+            export_dir=export_dir,
+            destination_dir=upload_dir,
+            lora_enabled=self.lora_enabled,
+            source_readme=source_readme if source_readme.exists() else None,
+        )
+
+        upload_folder(
+            repo_id=repo_id,
+            folder_path=str(upload_dir),
+            token=token,
+            commit_message="Upload Diffusers model artifacts",
+        )
+        rank_zero_info(f"[Hub] Uploaded artifacts to https://huggingface.co/{repo_id}")
+
     def configure_optimizers(self):
         use_8bit_adam = bool(self.training_cfg.get("use_8bit_adam", False))
         optimizer_cls = torch.optim.AdamW
@@ -426,8 +554,11 @@ class StableDiffusionLightningModule(pl.LightningModule):
                 )
             optimizer_cls = bnb.optim.AdamW8bit
 
+        trainable_parameters = [param for param in self.unet.parameters() if param.requires_grad]
+        trainable_parameters.extend(param for param in self.text_encoder.parameters() if param.requires_grad)
+
         optimizer = optimizer_cls(
-            [param for param in self.unet.parameters() if param.requires_grad],
+            trainable_parameters,
             lr=float(self.training_cfg.get("learning_rate", 1e-4)),
             betas=(
                 float(self.training_cfg.get("adam_beta1", 0.9)),
