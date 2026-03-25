@@ -75,6 +75,12 @@ def parse_args():
         default=None,
         help="Number of GPUs to use",
     )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Output directory",
+    )
     return parser.parse_args()
 
 
@@ -94,6 +100,8 @@ def main():
         config["training"]["precision"] = args.precision
     if args.gpus is not None:
         config["distributed"]["devices"] = args.gpus
+    if args.output_dir is not None:
+        config["output_dir"] = args.output_dir
 
     training_config = config.get("training", {})
     logging_config = config.get("logging", {})

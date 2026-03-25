@@ -55,6 +55,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs to use",
     )
     parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Output directory",
+    )
+    parser.add_argument(
         "--lora_init_path",
         type=str,
         default=None,
@@ -95,6 +101,8 @@ def main() -> None:
         cfg["training"]["precision"] = args.precision
     if args.gpus is not None:
         cfg["distributed"]["devices"] = args.gpus
+    if args.output_dir is not None:
+        cfg["output_dir"] = args.output_dir
     if args.lora_init_path is not None:
         cfg.setdefault("lora", {})["enabled"] = True
         cfg["lora"]["init_path"] = args.lora_init_path
