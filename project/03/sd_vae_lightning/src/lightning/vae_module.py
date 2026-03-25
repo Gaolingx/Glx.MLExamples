@@ -197,6 +197,17 @@ class VAELightningModule(pl.LightningModule):
 
             self.ema.load_state_dict(checkpoint["ema_state"])
 
+    @rank_zero_only
+    def on_train_end(self) -> None:
+        """Save final trained model when training ends."""
+        paths = self.config.get("paths", {}) if isinstance(self.config, dict) else {}
+        output_dir = Path(paths.get("output_dir", "./outputs")) / "final_model"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save weights (VAE + EMA + discriminator)
+        self.save_pretrained(str(output_dir))
+        print(f"Final model saved to: {output_dir}")
+
     def forward_with_latent(
             self,
             x: torch.Tensor,
@@ -871,7 +882,6 @@ class VAELightningModule(pl.LightningModule):
         if self.use_ema and self.ema is not None:
             ema_dir = hf_dir / "vae_ema"
             self.ema.save_pretrained(str(ema_dir))
-            print(f"Saving EMA weights to {ema_dir}...")
 
     @rank_zero_only
     def save_pretrained(self, save_directory: str) -> None:

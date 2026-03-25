@@ -1,5 +1,4 @@
 import importlib
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,7 +15,6 @@ from diffusers import (
 from diffusers.optimization import get_scheduler
 from diffusers.utils.import_utils import is_xformers_available
 from pytorch_lightning.utilities.rank_zero import rank_zero_info, rank_zero_warn
-from huggingface_hub import create_repo, upload_folder
 from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 
@@ -26,6 +24,8 @@ from src.utils.train_utils import (
     log_validation_images,
     run_validation_inference,
     build_inference_scheduler,
+    build_diffusers_lora_state_dicts,
+    upload_model_artifacts_to_hub,
 )
 
 
@@ -376,8 +376,6 @@ class StableDiffusionLightningModule(pl.LightningModule):
             "train/pred_target_mse": (model_pred.detach().float() - target.detach().float()).pow(2).mean(),
             "train/latent_cache_hit_rate": float(cache_hit_rate),
         }
-        if snr_gamma is not None:
-            metrics["train/snr_gamma"] = float(snr_gamma)
         return loss, metrics
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, Any]:
@@ -443,17 +441,41 @@ class StableDiffusionLightningModule(pl.LightningModule):
         save_dir = Path(save_directory)
         save_dir.mkdir(parents=True, exist_ok=True)
 
+        pipeline = StableDiffusionPipeline(
+            vae=self.vae,
+            text_encoder=self.text_encoder,
+            tokenizer=self.tokenizer,
+            unet=self.unet,
+            scheduler=build_inference_scheduler(
+                self.noise_scheduler.config,
+                self.validation_cfg.get("sampler"),
+                self.validation_cfg.get("scheduler"),
+            ),
+            safety_checker=None,
+            feature_extractor=None,
+            requires_safety_checker=False,
+        )
+
         if self.lora_enabled:
-            StableDiffusionPipeline.save_lora_weights(
-                save_directory=str(save_dir),
-                unet_lora_layers=self.unet.get_adapter_state_dict() if self.train_unet_lora else None,
-                text_encoder_lora_layers=(
-                    self.text_encoder.get_adapter_state_dict() if self.train_text_encoder_lora else None
-                ),
-                weight_name="pytorch_lora_weights.safetensors",
-                safe_serialization=True,
+            lora_save_dir = save_dir / "lora"
+            unet_lora_layers, text_encoder_lora_layers = build_diffusers_lora_state_dicts(
+                unet=self.unet,
+                train_unet_lora=self.train_unet_lora,
+                text_encoder=self.text_encoder,
+                train_text_encoder_lora=self.train_text_encoder_lora,
+            )
+            pipeline.save_lora_weights(
+                save_directory=str(lora_save_dir),
+                unet_lora_layers=unet_lora_layers,
+                text_encoder_lora_layers=text_encoder_lora_layers,
             )
             return
+        pipeline.save_pretrained(str(save_dir), safe_serialization=True)
+
+    def save_hf_checkpoint(self, checkpoint_filepath: str) -> None:
+        """Export UNet-style HF checkpoint colocated with a Lightning .ckpt filepath."""
+        hf_dir = Path(checkpoint_filepath)
+        hf_dir.mkdir(parents=True, exist_ok=True)
 
         pipeline = StableDiffusionPipeline(
             vae=self.vae,
@@ -469,21 +491,20 @@ class StableDiffusionLightningModule(pl.LightningModule):
             feature_extractor=None,
             requires_safety_checker=False,
         )
-        pipeline.save_pretrained(str(save_dir), safe_serialization=True)
-
-    def save_hf_checkpoint(self, checkpoint_filepath: str) -> None:
-        """Export UNet-style HF checkpoint colocated with a Lightning .ckpt filepath."""
-        hf_dir = Path(checkpoint_filepath)
-        hf_dir.mkdir(parents=True, exist_ok=True)
 
         if self.lora_enabled:
-            if self.train_unet_lora:
-                lora_dir = hf_dir / "unet_lora"
-                self.unet.save_lora_adapter(str(lora_dir), adapter_name=self.lora_adapter_name)
-            if self.train_text_encoder_lora:
-                text_lora_dir = hf_dir / "text_encoder_lora"
-                self.text_encoder.save_pretrained(str(text_lora_dir), safe_serialization=True)
-
+            lora_save_dir = hf_dir / "lora"
+            unet_lora_layers, text_encoder_lora_layers = build_diffusers_lora_state_dicts(
+                unet=self.unet,
+                train_unet_lora=self.train_unet_lora,
+                text_encoder=self.text_encoder,
+                train_text_encoder_lora=self.train_text_encoder_lora,
+            )
+            pipeline.save_lora_weights(
+                save_directory=str(lora_save_dir),
+                unet_lora_layers=unet_lora_layers,
+                text_encoder_lora_layers=text_encoder_lora_layers,
+            )
             return
 
         unet_save_dir = hf_dir / "unet"
@@ -491,10 +512,6 @@ class StableDiffusionLightningModule(pl.LightningModule):
 
     def on_train_end(self) -> None:
         if self.trainer is None or not self.trainer.is_global_zero:
-            return
-
-        hub_cfg = self.cfg.get("hub", {})
-        if not bool(hub_cfg.get("push_to_hub", False)):
             return
 
         output_dir = Path(self.cfg.get("output_dir", self.trainer.default_root_dir))
@@ -506,27 +523,16 @@ class StableDiffusionLightningModule(pl.LightningModule):
             if source_readme.exists():
                 (export_dir / "README.md").write_text(source_readme.read_text(encoding="utf-8"), encoding="utf-8")
 
-        if not export_dir.is_dir():
-            rank_zero_info(f"[Hub] Export directory `{export_dir}` is missing or incomplete. Re-exporting before upload.")
-            self.save_pretrained(str(export_dir))
-            ensure_hub_readme()
+        rank_zero_info(f"[Train] Saving final model to: {export_dir}")
+        self.save_pretrained(str(export_dir))
+        ensure_hub_readme()
 
-        token = hub_cfg.get("token") or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-        repo_id = hub_cfg.get("model_id")
-        if not repo_id:
-            rank_zero_warn("[Hub] `hub.model_id` is missing, skipping upload.")
-            return
-
-        repo_id = str(repo_id)
-        create_repo(repo_id=repo_id, token=token, exist_ok=True)
-
-        upload_folder(
-            repo_id=repo_id,
-            folder_path=str(export_dir),
-            token=token,
-            commit_message="Upload Diffusers model artifacts",
+        upload_model_artifacts_to_hub(
+            hub_cfg=self.cfg.get("hub", {}),
+            export_dir=export_dir,
+            rank_zero_warn_fn=rank_zero_warn,
+            rank_zero_info_fn=rank_zero_info,
         )
-        rank_zero_info(f"[Hub] Uploaded artifacts to https://huggingface.co/{repo_id}")
 
     def configure_optimizers(self):
         use_8bit_adam = bool(self.training_cfg.get("use_8bit_adam", False))

@@ -148,12 +148,6 @@ def main() -> None:
 
     trainer.fit(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
 
-    # Save final model
-    if trainer.is_global_zero:
-        final_model_path = Path(output_dir) / ("final_lora" if cfg.get("lora", {}).get("enabled", False) else "final_model")
-        trainer.lightning_module.save_pretrained(final_model_path)
-        print(f"Final model saved to: {final_model_path}")
-
 
 if __name__ == "__main__":
     main()

@@ -1,8 +1,11 @@
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+from safetensors.torch import save_file
+from huggingface_hub import create_repo, upload_folder
 from diffusers import (
     DDPMScheduler,
     DDIMScheduler,
@@ -14,40 +17,83 @@ from diffusers import (
     DPMSolverMultistepScheduler,
     StableDiffusionPipeline,
 )
+from diffusers.utils import convert_state_dict_to_diffusers
 from PIL import Image
 
 
 def resolve_lora_init_path(init_path: str | Path) -> str:
     path = Path(init_path)
+    candidate_paths = []
 
-    if path.is_dir():
-        candidate_dirs = [
-            path,
-            path / "unet_lora",
-            path / "hf_checkpoint" / "unet_lora",
-        ]
-        for candidate in candidate_dirs:
-            if candidate.is_dir():
-                return str(candidate)
+    def add_candidate(candidate: Path) -> None:
+        if candidate not in candidate_paths:
+            candidate_paths.append(candidate)
 
-    if path.is_file() and path.suffix == ".ckpt":
-        checkpoint_dir = path.with_suffix("")
-        candidate_dirs = [
-            checkpoint_dir / "hf_checkpoint" / "unet_lora",
-            path.parent / "hf_checkpoint" / "unet_lora",
-        ]
-        for candidate in candidate_dirs:
-            if candidate.is_dir():
-                return str(candidate)
-        raise FileNotFoundError(
-            "LoRA init checkpoint was provided, but no exported adapter directory was found next to it. "
-            "Expected `hf_checkpoint/unet_lora`."
-        )
+    # 1) Direct adapter export directory, e.g. final_lora/ or checkpoints/.../hf_checkpoint/lora/
+    add_candidate(path)
 
-    if path.exists():
-        return str(path)
+    # 2) A Lightning .ckpt file path or checkpoint directory beside the exported HF adapter.
+    if path.suffix == ".ckpt":
+        checkpoint_dir = path.parent
+        add_candidate(checkpoint_dir / "hf_checkpoint" / "lora")
+        add_candidate(checkpoint_dir / "lora")
+    else:
+        add_candidate(path / "hf_checkpoint" / "lora")
+        add_candidate(path / "lora")
 
-    raise FileNotFoundError(f"LoRA init path not found: {init_path}")
+    # 3) Common project export layout under outputs/*/final_lora.
+    add_candidate(path / "final_lora")
+
+    adapter_filenames = (
+        "pytorch_lora_weights.safetensors",
+        "pytorch_lora_weights.bin",
+        "adapter_model.safetensors",
+        "adapter_model.bin",
+    )
+
+    for candidate in candidate_paths:
+        if candidate.is_file():
+            if candidate.name in adapter_filenames:
+                return str(candidate.parent)
+            continue
+
+        if not candidate.is_dir():
+            continue
+
+        if any((candidate / filename).is_file() for filename in adapter_filenames):
+            return str(candidate)
+
+    searched_locations = "\n - ".join(str(candidate) for candidate in candidate_paths)
+    raise FileNotFoundError(
+        "LoRA init path not found. Expected a Diffusers LoRA adapter directory or a checkpoint-related path. "
+        f"Input: {init_path}\nSearched:\n - {searched_locations}"
+    )
+
+
+def build_diffusers_lora_state_dicts(
+        *,
+        unet: Any,
+        train_unet_lora: bool,
+        text_encoder: Any = None,
+        train_text_encoder_lora: bool = False,
+) -> tuple[Optional[Dict[str, torch.Tensor]], Optional[Dict[str, torch.Tensor]]]:
+    """Collect diffusers-formatted LoRA weights for pipeline.save_lora_weights."""
+    unet_state_dict: Optional[Dict[str, torch.Tensor]] = None
+    text_encoder_state_dict: Optional[Dict[str, torch.Tensor]] = None
+
+    if train_unet_lora:
+        unet_state_dict = {
+            key: value.detach().cpu()
+            for key, value in convert_state_dict_to_diffusers(unet.get_adapter_state_dict()).items()
+        }
+
+    if train_text_encoder_lora and text_encoder is not None:
+        text_encoder_state_dict = {
+            key: value.detach().cpu()
+            for key, value in convert_state_dict_to_diffusers(text_encoder.get_adapter_state_dict()).items()
+        }
+
+    return unet_state_dict, text_encoder_state_dict
 
 
 def build_inference_scheduler(base_config, sampler_name: Optional[str], scheduler_name: Optional[str]):
@@ -153,3 +199,32 @@ def log_validation_images(logger: Optional[Any], images: List[Image.Image], glob
     for idx, image in enumerate(images):
         image_tensor = torch.from_numpy(np.asarray(image)).permute(2, 0, 1).float() / 255.0
         writer.add_image(f"validation/sample_{idx}", image_tensor, global_step)
+
+
+def upload_model_artifacts_to_hub(
+        *,
+        hub_cfg: Dict[str, Any],
+        export_dir: str | Path,
+        rank_zero_warn_fn: Any,
+        rank_zero_info_fn: Any,
+) -> None:
+    """Upload exported artifacts to the Hugging Face Hub when configured."""
+    if not bool(hub_cfg.get("push_to_hub", False)):
+        return
+
+    token = hub_cfg.get("token") or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    repo_id = hub_cfg.get("model_id")
+    if not repo_id:
+        rank_zero_warn_fn("[Hub] `hub.model_id` is missing, skipping upload.")
+        return
+
+    repo_id = str(repo_id)
+    create_repo(repo_id=repo_id, token=token, exist_ok=True)
+
+    upload_folder(
+        repo_id=repo_id,
+        folder_path=str(export_dir),
+        token=token,
+        commit_message="Upload Diffusers model artifacts",
+    )
+    rank_zero_info_fn(f"[Hub] Uploaded artifacts to https://huggingface.co/{repo_id}")
