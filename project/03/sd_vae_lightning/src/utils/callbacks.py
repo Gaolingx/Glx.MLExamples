@@ -117,12 +117,12 @@ class VAELoggingCallback(Callback):
         comparison = torch.cat([targets[:n], latent_vis[:n], reconstructions[:n]], dim=0)
         grid = torchvision.utils.make_grid(comparison, nrow=n, padding=2)
 
-        if isinstance(logger, WandbLogger):
+        if hasattr(logger, "experiment") and isinstance(logger, WandbLogger):
             # wandb.Image expects (H, W, C) numpy array; grid is (C, H, W) tensor
             grid_np = grid.permute(1, 2, 0).cpu().numpy()
             logger.experiment.log(
                 {f"{prefix}/reconstruction": wandb.Image(grid_np)},
-                step=step,
+                commit=False,
             )
 
     def on_train_batch_end(

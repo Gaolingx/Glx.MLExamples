@@ -463,9 +463,6 @@ class VAELightningModule(pl.LightningModule):
                 loss = nll_loss + self.kl_weight * kl_loss + g_loss_weighted
             else:
                 loss = nll_loss + self.kl_weight * kl_loss
-                loss_dict["g_loss"] = torch.tensor(0.0, device=targets.device)
-                loss_dict["disc_weight"] = torch.tensor(0.0, device=targets.device)
-                loss_dict["g_loss_weighted"] = torch.tensor(0.0, device=targets.device)
 
             loss_dict["loss"] = loss
             return loss, loss_dict
