@@ -16,11 +16,12 @@ Usage:
 
 import argparse
 import sys
+import os
 from pathlib import Path
 
 # Add project root to path
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+__package__ = "scripts"
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import torch
 import pytorch_lightning as pl
@@ -28,14 +29,14 @@ import pytorch_lightning as pl
 from src.lightning.vae_module import VAELightningModule
 from src.data.dataset import VAEDataModule
 
-from src.utils.config import load_json_config
+from src.config.loader import load_vae_training_config
 from src.utils.training import (
-    merge_configs,
     seed_everything,
     build_callbacks,
     build_wandb_logger,
     build_trainer_kwargs,
     find_resume_checkpoint,
+    configure_cuda_precision,
 )
 
 
@@ -89,29 +90,27 @@ def main():
     args = parse_args()
 
     # Load configs
-    train_config = load_json_config(args.config)
-    model_config = load_json_config(train_config.get("vae_config_path", "./configs/model_config.json"))
-    config = merge_configs(train_config, model_config)
+    config = load_vae_training_config(args.config)
 
     # Override with command line arguments
     if args.seed is not None:
-        config["training"]["seed"] = args.seed
+        config.training.seed = args.seed
     if args.precision is not None:
-        config["training"]["precision"] = args.precision
+        config.training.precision = args.precision
     if args.gpus is not None:
-        config["distributed"]["devices"] = args.gpus
+        config.distributed.devices = args.gpus
     if args.output_dir is not None:
-        config["output_dir"] = args.output_dir
+        config.paths.output_dir = args.output_dir
 
-    training_config = config.get("training", {})
-    logging_config = config.get("logging", {})
-    path_config = config.get("paths", {})
+    training_config = config.training
+    logging_config = config.logging
+    path_config = config.paths
 
     # Set seed
-    seed_everything(int(training_config.get("seed", 42)))
+    seed_everything(int(training_config.seed))
 
     # Get paths
-    output_dir = Path(path_config.get("output_dir", "./outputs"))
+    output_dir = Path(path_config.output_dir)
 
     # Create directories
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -128,10 +127,7 @@ def main():
     # Setup logger
     logger = build_wandb_logger(config)
 
-    # Enable TF32 for faster training on Ampere GPUs,
-    # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
-    torch.backends.cudnn.allow_tf32 = training_config.get("allow_tf32", False)
-    torch.set_float32_matmul_precision("high" if training_config.get("allow_tf32", False) else "highest")
+    configure_cuda_precision(config.training)
 
     # Create trainer
     # NOTE: accumulate_grad_batches is set to 1 because we handle gradient accumulation
@@ -140,12 +136,12 @@ def main():
     trainer_kwargs = build_trainer_kwargs(config)
     trainer = pl.Trainer(
         default_root_dir=output_dir,
-        max_epochs=training_config.get("num_epochs", 100),
-        max_steps=training_config.get("max_train_steps", -1),
-        precision=training_config.get("precision", "16-mixed"),
+        max_epochs=training_config.num_epochs,
+        max_steps=training_config.max_train_steps,
+        precision=training_config.precision,
         accumulate_grad_batches=1,  # Manual accumulation in training_step
-        log_every_n_steps=logging_config.get("log_every_n_steps", 50),
-        val_check_interval=logging_config.get("val_check_interval", 500),
+        log_every_n_steps=logging_config.log_every_n_steps,
+        val_check_interval=logging_config.val_check_interval,
         logger=logger,
         callbacks=callbacks,
         enable_checkpointing=True,
@@ -155,10 +151,13 @@ def main():
 
     ckpt_path = None
     if args.resume_from_checkpoint:
-        ckpt_dir = path_config.get("checkpoint_dir", "./checkpoints")
-        ckpt_path = find_resume_checkpoint(args.resume_from_checkpoint, ckpt_dir)
+        ckpt_path = find_resume_checkpoint(
+            args.resume_from_checkpoint,
+            path_config.checkpoint_dir,
+        )
 
     trainer.fit(model, datamodule=data_module, ckpt_path=ckpt_path)
+
 
 if __name__ == "__main__":
     main()

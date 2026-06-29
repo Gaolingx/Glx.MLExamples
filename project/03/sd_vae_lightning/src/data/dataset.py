@@ -12,6 +12,8 @@ import pytorch_lightning as pl
 from torchvision import transforms
 from PIL import Image
 
+from src.config.base import VAETrainingConfig
+
 try:
     from datasets import load_dataset
 
@@ -101,25 +103,24 @@ class VAEDataModule(pl.LightningDataModule):
         config: Configuration dictionary.
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: VAETrainingConfig):
         super().__init__()
-        self.config = config
-        self.data_config = config.get("data", {})
-        self.train_config = config.get("training", {})
-
-        self.dataset_name = self.data_config.get("dataset_name")
-        self.cache_dir = self.data_config.get("cache_dir")
-        self.dataset_config = self.data_config.get("dataset_config")
-        self.train_data_dir = self.data_config.get("train_data_dir")
-        self.val_data_dir = self.data_config.get("val_data_dir")
-        self.image_column = self.data_config.get("image_column", "image")
-        self.resolution = self.data_config.get("resolution", 512)
-        self.center_crop = self.data_config.get("center_crop", True)
-        self.random_flip = self.data_config.get("random_flip", True)
-
-        self.batch_size = self.train_config.get("batch_size", 4)
-        self.num_workers = self.train_config.get("num_workers", 4)
-
+        data_cfg = config.data
+        train_cfg = config.training
+    
+        self.dataset_name = data_cfg.dataset_name
+        self.cache_dir = data_cfg.cache_dir
+        self.dataset_config = data_cfg.dataset_config
+        self.train_data_dir = data_cfg.train_data_dir
+        self.val_data_dir = data_cfg.val_data_dir
+        self.image_column = data_cfg.image_column
+        self.resolution = data_cfg.resolution
+        self.center_crop = data_cfg.center_crop
+        self.random_flip = data_cfg.random_flip
+    
+        self.batch_size = train_cfg.batch_size
+        self.num_workers = train_cfg.num_workers
+    
         self.train_dataset = None
         self.val_dataset = None
 

@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+from dataclasses import asdict, is_dataclass
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from diffusers import AutoencoderKL
@@ -20,6 +21,7 @@ import math
 
 from src.utils.metrics import PSNR, SSIM, rFID, PSIM
 from src.models.discriminator import NLayerDiscriminator
+from src.config.base import VAETrainingConfig, OptimizerConfig
 
 
 class VAELightningModule(pl.LightningModule):
@@ -38,23 +40,24 @@ class VAELightningModule(pl.LightningModule):
         config: Configuration dictionary containing model and training parameters.
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: VAETrainingConfig):
         super().__init__()
         self.config = config
-        self.save_hyperparameters({"config": config})
+        self.save_hyperparameters(asdict(config))
 
-        model_config = config.get("model", {})
-        loss_config = config.get("loss", {})
-        disc_config = config.get("discriminator", {})
-        train_config = config.get("training", {})
+        model_config = config.model
+        loss_config = config.loss
+        disc_config = config.discriminator
+        train_config = config.training
+        compile_config = config.compile
 
         # Disable automatic optimization for GAN training with manual gradient accumulation
         self.automatic_optimization = False
 
         # Build VAE model
-        pretrained_path = model_config.get("pretrained_model_name_or_path")
-        model_config_name_or_path = model_config.get("model_config_name_or_path")
-        inline_vae_config = model_config.get("vae_config")
+        pretrained_path = model_config.pretrained_model_name_or_path
+        model_config_name_or_path = model_config.model_config_name_or_path
+        inline_vae_config = model_config.vae_config
 
         if pretrained_path:
             self.vae = AutoencoderKL.from_pretrained(pretrained_path)
@@ -70,28 +73,28 @@ class VAELightningModule(pl.LightningModule):
             )
 
         self.vae.requires_grad_(True)
-        if model_config.get("decoder_only", False):
+        if model_config.decoder_only:
             self.vae.encoder.requires_grad_(False)
             if getattr(self.vae, "quant_conv", None):
                 self.vae.quant_conv.requires_grad_(False)
         self.vae.train()
 
         # Enable gradient checkpointing for memory savings
-        if model_config.get("gradient_checkpointing", False):
+        if model_config.gradient_checkpointing:
             self.vae.enable_gradient_checkpointing()
 
         # Build discriminator
-        self.use_discriminator = loss_config.get("disc_weight", 1.0) > 0
+        self.use_discriminator = loss_config.disc_weight > 0
 
         if self.use_discriminator:
             self.discriminator = NLayerDiscriminator(
-                input_nc=disc_config.get("input_nc", 3),
-                ndf=disc_config.get("ndf", 64),
-                n_layers=disc_config.get("n_layers", 3),
-                norm_type=disc_config.get("norm_type", "spectral_group"),
-                num_groups=disc_config.get("num_groups", 32),
+                input_nc=disc_config.input_nc,
+                ndf=disc_config.ndf,
+                n_layers=disc_config.n_layers,
+                norm_type=disc_config.norm_type,
+                num_groups=disc_config.num_groups,
             )
-            self.disc_start_step = loss_config.get("disc_start_step", 50001)
+            self.disc_start_step = loss_config.disc_start_step
 
             self.discriminator.requires_grad_(True)
             self.discriminator.train()
@@ -100,7 +103,7 @@ class VAELightningModule(pl.LightningModule):
             self.disc_start_step = float("inf")
 
         # Perceptual loss
-        self.perceptual_weight = loss_config.get("perceptual_weight", 0.5)
+        self.perceptual_weight = loss_config.perceptual_weight
         if self.perceptual_weight > 0:
             self.perceptual_loss = lpips.LPIPS(net="vgg")
             self.perceptual_loss.requires_grad_(False)
@@ -109,55 +112,24 @@ class VAELightningModule(pl.LightningModule):
             self.perceptual_loss = None
 
         # Loss weights
-        self.rec_loss_type = loss_config.get("rec_loss_type", "l2")
-        self.kl_weight = loss_config.get("kl_weight", 1e-6)
-        self.disc_weight = loss_config.get("disc_weight", 1.0)
-        self.disc_loss_type = loss_config.get("disc_loss_type", "hinge")
-        self.disc_factor = loss_config.get("disc_factor", 1.0)
-        self.use_adaptive_disc_weight = loss_config.get("use_adaptive_disc_weight", True)
-        self.adaptive_weight_max = loss_config.get("adaptive_weight_max", 10.0)
+        self.rec_loss_type = loss_config.rec_loss_type
+        self.kl_weight = loss_config.kl_weight
+        self.disc_weight = loss_config.disc_weight
+        self.disc_loss_type = loss_config.disc_loss_type
+        self.disc_factor = loss_config.disc_factor
+        self.use_adaptive_disc_weight = loss_config.use_adaptive_disc_weight
+        self.adaptive_weight_max = loss_config.adaptive_weight_max
 
-        # Generator optimizer config
-        gen_opt_cfg = train_config.get("generator_optimizer", {})
-        self.gen_opt_config = {
-            "type": gen_opt_cfg.get("type", "AdamW"),
-            "learning_rate": gen_opt_cfg.get("learning_rate", 4.5e-6),
-            "adam_beta1": gen_opt_cfg.get("adam_beta1", 0.9),
-            "adam_beta2": gen_opt_cfg.get("adam_beta2", 0.999),
-            "weight_decay": gen_opt_cfg.get("weight_decay", 0.01),
-            "lr_scheduler": gen_opt_cfg.get("lr_scheduler", "constant_with_warmup"),
-            "lr_warmup_steps": gen_opt_cfg.get("lr_warmup_steps", 500),
-            "lr_num_cycles": gen_opt_cfg.get("lr_num_cycles", 1),
-            "lr_power": gen_opt_cfg.get("lr_power", 1.0),
-            "use_8bit_adam": gen_opt_cfg.get("use_8bit_adam", False),
-        }
+        self.gen_opt_config = train_config.generator_optimizer
+        self.disc_opt_config = train_config.discriminator_optimizer
 
-        # Discriminator optimizer config
-        disc_opt_cfg = train_config.get("discriminator_optimizer", {})
-        self.disc_opt_config = {
-            "type": disc_opt_cfg.get("type", "AdamW"),
-            "learning_rate": disc_opt_cfg.get("learning_rate", 4.5e-6),
-            "adam_beta1": disc_opt_cfg.get("adam_beta1", 0.9),
-            "adam_beta2": disc_opt_cfg.get("adam_beta2", 0.999),
-            "weight_decay": disc_opt_cfg.get("weight_decay", 0.01),
-            "lr_scheduler": disc_opt_cfg.get("lr_scheduler", "constant_with_warmup"),
-            "lr_warmup_steps": disc_opt_cfg.get("lr_warmup_steps", 500),
-            "lr_num_cycles": disc_opt_cfg.get("lr_num_cycles", 1),
-            "lr_power": disc_opt_cfg.get("lr_power", 1.0),
-            "use_8bit_adam": disc_opt_cfg.get("use_8bit_adam", False),
-        }
-
-        # Keep top-level attributes for backward compatibility with training_step logging
-        self.learning_rate = self.gen_opt_config["learning_rate"]
-        self.disc_learning_rate = self.disc_opt_config["learning_rate"]
-
-        self.accumulate_grad_batches = train_config.get("accumulate_grad_batches", 1)
-        self.gradient_clip_val = train_config.get("gradient_clip_val", 1.0)
+        self.accumulate_grad_batches = train_config.accumulate_grad_batches
+        self.gradient_clip_val = train_config.gradient_clip_val
 
         # EMA configuration
-        self.use_ema = train_config.get("use_ema", True)
-        self.ema_decay = train_config.get("ema_decay", 0.9999)
-        self.ema_update_interval = train_config.get("ema_update_interval", 1)
+        self.use_ema = train_config.use_ema
+        self.ema_decay = train_config.ema_decay
+        self.ema_update_interval = train_config.ema_update_interval
         self.ema: Optional[EMAModel] = None
 
         # Validation metrics
@@ -169,9 +141,8 @@ class VAELightningModule(pl.LightningModule):
         self.rfid_metric = rFID(feature_dim=2048, reset_real_features=True)
 
         # Torch compile configuration
-        compile_config = config.get("compile", {})
-        self.use_torch_compile = compile_config.get("enabled", False)
-        self.compile_kwargs = compile_config.get("kwargs", {})
+        self.use_torch_compile = compile_config.enabled
+        self.compile_kwargs = compile_config.kwargs
 
     def configure_model(self) -> None:
         """Compile models with torch.compile after moving to device."""
@@ -214,8 +185,7 @@ class VAELightningModule(pl.LightningModule):
     @rank_zero_only
     def on_train_end(self) -> None:
         """Save final trained model when training ends."""
-        paths = self.config.get("paths", {}) if isinstance(self.config, dict) else {}
-        output_dir = Path(paths.get("output_dir", "./outputs")) / "final_model"
+        output_dir = Path(self.config.paths.output_dir) / "final_model"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Save weights (VAE + EMA + discriminator)
@@ -716,21 +686,14 @@ class VAELightningModule(pl.LightningModule):
     def _build_optimizer(
             self,
             params,
-            opt_config: Dict[str, Any],
+            opt_config: OptimizerConfig,
     ) -> torch.optim.Optimizer:
         """
-        Build an optimizer from a per-role config dict.
+        Build an optimizer from a per-role config object.
 
         Args:
             params: Iterable of parameters to optimise.
-            opt_config: Dictionary with keys:
-                - type: Optimizer class name ('AdamW', 'Adam', 'SGD', 'RMSprop').
-                - learning_rate: Base learning rate.
-                - adam_beta1: Beta1 for Adam-family optimizers.
-                - adam_beta2: Beta2 for Adam-family optimizers.
-                - weight_decay: Weight decay coefficient.
-                - momentum: Momentum for SGD (default 0.9).
-                - use_8bit_adam: Whether to use bitsandbytes 8-bit Adam/AdamW.
+            opt_config: OptimizerConfig instance.
 
         Returns:
             Configured optimizer instance.
@@ -738,11 +701,12 @@ class VAELightningModule(pl.LightningModule):
         Raises:
             ValueError: If optimizer type is not supported.
         """
-        opt_type = opt_config.get("type", "AdamW").lower()
-        lr = opt_config["learning_rate"]
-        betas = (opt_config.get("adam_beta1", 0.9), opt_config.get("adam_beta2", 0.999))
-        weight_decay = opt_config.get("weight_decay", 0.01)
-        use_8bit_adam = opt_config.get("use_8bit_adam", False)
+        opt_type      = opt_config.type.lower()
+        lr            = opt_config.learning_rate
+        betas         = (opt_config.adam_beta1, opt_config.adam_beta2)
+        weight_decay  = opt_config.weight_decay
+        momentum      = opt_config.momentum
+        use_8bit_adam = opt_config.use_8bit_adam
 
         if use_8bit_adam:
             try:
@@ -766,7 +730,6 @@ class VAELightningModule(pl.LightningModule):
         elif opt_type == "adam":
             return torch.optim.Adam(params, lr=lr, betas=betas, weight_decay=weight_decay)
         elif opt_type == "sgd":
-            momentum = opt_config.get("momentum", 0.9)
             return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
         elif opt_type == "rmsprop":
             return torch.optim.RMSprop(params, lr=lr, weight_decay=weight_decay)
@@ -779,40 +742,33 @@ class VAELightningModule(pl.LightningModule):
     def _build_scheduler(
             self,
             optimizer: torch.optim.Optimizer,
-            opt_config: Dict[str, Any],
+            opt_config: OptimizerConfig,
             num_training_steps: int,
             last_epoch: int = -1,
     ):
         """
-        Build a learning rate scheduler from the optimizer config.
+        Build a learning rate scheduler from the optimizer config object.
 
         Args:
             optimizer: Optimizer to schedule.
-            opt_config: Scheduler-related optimizer config.
+            opt_config: OptimizerConfig instance.
             num_training_steps: Total scheduler steps.
             last_epoch: Last epoch index when resuming training.
 
         Returns:
             Scheduler created by ``diffusers.optimization.get_scheduler``.
         """
-        scheduler_type = opt_config.get("lr_scheduler", "constant_with_warmup")
         num_training_steps = max(1, num_training_steps)
-
-        num_warmup_steps = opt_config.get("lr_warmup_steps", 500)
-        num_warmup_steps = min(num_warmup_steps, num_training_steps)
-
-        num_cycles = opt_config.get("lr_num_cycles", 1)
-        power = opt_config.get("lr_power", 1.0)
-        step_rules = opt_config.get("lr_step_rules", None)
+        num_warmup_steps   = min(opt_config.lr_warmup_steps, num_training_steps)
 
         return get_scheduler(
-            name=scheduler_type,
+            name=opt_config.lr_scheduler,
             optimizer=optimizer,
-            step_rules=step_rules,
+            step_rules=opt_config.lr_step_rules,
             num_warmup_steps=num_warmup_steps,
             num_training_steps=num_training_steps,
-            num_cycles=num_cycles,
-            power=power,
+            num_cycles=opt_config.lr_num_cycles,
+            power=opt_config.lr_power,
             last_epoch=last_epoch,
         )
 

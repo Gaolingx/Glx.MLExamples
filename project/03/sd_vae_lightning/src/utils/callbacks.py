@@ -4,6 +4,7 @@ Includes image logging, checkpoint management, and training monitoring.
 """
 
 from typing import Optional, Dict, Any, Tuple, List
+from dataclasses import asdict
 from pathlib import Path
 import json
 
@@ -19,6 +20,7 @@ from pytorch_lightning.utilities.types import STEP_OUTPUT
 from pytorch_lightning.utilities.rank_zero import rank_zero_info, rank_zero_only
 
 from src.utils.config import save_json_config
+from src.config.base import OptimizerConfig
 
 
 class VAELoggingCallback(Callback):
@@ -43,6 +45,7 @@ class VAELoggingCallback(Callback):
         self.log_to_tensorboard = log_to_tensorboard
         self.log_images_every_n_steps = log_images_every_n_steps
         self._val_outputs: List[Dict[str, torch.Tensor]] = []
+        self._last_logged_step: int = -1
 
     @staticmethod
     def _format_metric_value(value: Any) -> Optional[float]:
@@ -133,7 +136,7 @@ class VAELoggingCallback(Callback):
             batch: Any,
             batch_idx: int,
     ) -> None:
-        if not isinstance(outputs, dict):
+        if not isinstance(outputs, dict) and not isinstance(batch, dict):
             return
 
         metrics = outputs.get("train_metrics", {})
@@ -171,7 +174,7 @@ class VAELoggingCallback(Callback):
                 and trainer.logger is not None
                 and trainer.is_global_zero
                 and trainer.global_step % self.log_images_every_n_steps == 0
-                and isinstance(batch, dict)
+                and trainer.global_step != self._last_logged_step
                 and "pixel_values" in batch
         ):
             with torch.no_grad():
@@ -181,6 +184,7 @@ class VAELoggingCallback(Callback):
                 reconstructions = pl_module.vae.decode(latent).sample
 
             self._log_images(trainer.logger, targets, reconstructions, latent, "train", trainer.global_step)
+            self._last_logged_step = trainer.global_step
 
     def on_validation_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         self._val_outputs = []
@@ -271,15 +275,15 @@ class LRandSchedulerOverrideCallback(Callback):
             self,
             override_lr_on_resume: bool = False,
             reset_scheduler_on_resume: bool = False,
-            gen_opt_config: Optional[Dict[str, Any]] = None,
-            disc_opt_config: Optional[Dict[str, Any]] = None,
+            gen_opt_config: Optional[OptimizerConfig] = None,
+            disc_opt_config: Optional[OptimizerConfig] = None,
             verbose: bool = True,
     ) -> None:
         super().__init__()
         self.override_lr_on_resume = override_lr_on_resume
         self.reset_scheduler_on_resume = reset_scheduler_on_resume
-        self.gen_opt_config = gen_opt_config or {}
-        self.disc_opt_config = disc_opt_config or {}
+        self.gen_opt_config = gen_opt_config
+        self.disc_opt_config = disc_opt_config
         self.verbose = verbose
         self.applied = False
 
@@ -313,10 +317,10 @@ class LRandSchedulerOverrideCallback(Callback):
             self,
             trainer: pl.Trainer,
             optimizer: torch.optim.Optimizer,
-            opt_config: Dict[str, Any],
+            opt_config: OptimizerConfig,
             optimizer_name: str,
     ) -> None:
-        target_lr = float(opt_config.get("learning_rate", 1e-4))
+        target_lr = float(opt_config.learning_rate)
 
         for group in optimizer.param_groups:
             group["lr"] = target_lr
@@ -336,7 +340,7 @@ class LRandSchedulerOverrideCallback(Callback):
             trainer: pl.Trainer,
             pl_module: pl.LightningModule,
             optimizer: torch.optim.Optimizer,
-            opt_config: Dict[str, Any],
+            opt_config: OptimizerConfig,
             scheduler_idx: int,
             scheduler_name: str,
             total_steps: int,
@@ -351,7 +355,7 @@ class LRandSchedulerOverrideCallback(Callback):
         if scheduler_idx < len(trainer.lr_scheduler_configs):
             trainer.lr_scheduler_configs[scheduler_idx].scheduler = new_scheduler
 
-        scheduler_type = opt_config.get("lr_scheduler", "constant_with_warmup")
+        scheduler_type = opt_config.lr_scheduler
         self._log(
             f"Reset scheduler for {scheduler_name} "
             f"(type={scheduler_type}, total_steps={total_steps})."
@@ -372,7 +376,7 @@ class LRandSchedulerOverrideCallback(Callback):
 
         total_steps = self._compute_total_steps(trainer, pl_module)
 
-        if len(trainer.optimizers) >= 1 and self.gen_opt_config:
+        if len(trainer.optimizers) >= 1 and self.gen_opt_config is not None:
             if self.override_lr_on_resume:
                 self._override_optimizer_lr(trainer, trainer.optimizers[0], self.gen_opt_config, "generator")
             if self.reset_scheduler_on_resume and trainer.lr_scheduler_configs:
@@ -386,7 +390,7 @@ class LRandSchedulerOverrideCallback(Callback):
                     total_steps=total_steps,
                 )
 
-        if len(trainer.optimizers) >= 2 and self.disc_opt_config:
+        if len(trainer.optimizers) >= 2 and self.disc_opt_config is not None:
             disc_total_steps = total_steps
             if getattr(pl_module, "use_discriminator", False):
                 disc_start_step = int(getattr(pl_module, "disc_start_step", 0))
@@ -406,12 +410,10 @@ class LRandSchedulerOverrideCallback(Callback):
                 )
 
         if self.override_lr_on_resume:
-            if hasattr(pl_module, "learning_rate") and self.gen_opt_config:
-                pl_module.learning_rate = float(self.gen_opt_config.get("learning_rate", pl_module.learning_rate))
-            if hasattr(pl_module, "disc_learning_rate") and self.disc_opt_config:
-                pl_module.disc_learning_rate = float(
-                    self.disc_opt_config.get("learning_rate", pl_module.disc_learning_rate)
-                )
+            if hasattr(pl_module, "learning_rate") and self.gen_opt_config is not None:
+                pl_module.learning_rate = self.gen_opt_config.learning_rate
+            if hasattr(pl_module, "disc_learning_rate") and self.disc_opt_config is not None:
+                pl_module.disc_learning_rate = self.disc_opt_config.learning_rate
 
         self.applied = True
 
@@ -461,4 +463,4 @@ class ConfigSnapshotCallback(Callback):
         output_dir = Path(trainer.default_root_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         config_path = output_dir / "resolved_config.json"
-        save_json_config(self.config, config_path)
+        save_json_config(asdict(self.config), config_path)
