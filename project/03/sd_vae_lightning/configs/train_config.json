@@ -3,27 +3,27 @@
     "training": {
         "seed": 42,
         "batch_size": 4,
-        "num_epochs": 100,
+        "num_epochs": 20,
         "gradient_clip_val": 1.0,
-        "accumulate_grad_batches": 1,
-        "precision": "16-mixed",
-        "num_workers": 4,
+        "accumulate_grad_batches": 8,
+        "precision": "bf16-mixed",
+        "num_workers": 0,
         "use_ema": true,
         "ema_decay": 0.9999,
         "ema_update_interval": 1,
         "max_train_steps": -1,
         "override_lr_on_resume": false,
         "reset_scheduler_on_resume": false,
-        "allow_tf32": false,
+        "allow_tf32": true,
         "generator_optimizer": {
             "type": "AdamW",
             "learning_rate": 4.5e-6,
             "adam_beta1": 0.9,
             "adam_beta2": 0.999,
             "weight_decay": 0.01,
-            "lr_scheduler": "constant",
+            "lr_scheduler": "cosine",
             "lr_warmup_steps": 500,
-            "lr_num_cycles": 1,
+            "lr_num_cycles": 0.5,
             "lr_power": 1.0
         },
         "discriminator_optimizer": {
@@ -32,11 +32,14 @@
             "adam_beta1": 0.5,
             "adam_beta2": 0.9,
             "weight_decay": 0.0,
-            "lr_scheduler": "constant",
+            "lr_scheduler": "cosine",
             "lr_warmup_steps": 0,
-            "lr_num_cycles": 1,
+            "lr_num_cycles": 0.5,
             "lr_power": 1.0
         }
+    },
+    "compile": {
+        "enabled": true
     },
     "distributed": {
         "accelerator": "gpu",
@@ -58,17 +61,17 @@
         "kl_weight": 1e-6,
         "perceptual_weight": 0.5,
         "disc_weight": 1.0,
-        "disc_factor": 1.0,
+        "disc_factor": 0.5,
         "disc_start_step": 50001,
         "disc_loss_type": "hinge",
         "use_adaptive_disc_weight": true,
         "adaptive_weight_max": 10.0
     },
     "data": {
-        "dataset_name": "huggan/flowers-102-categories",
+        "dataset_name": "clane9/imagenet-100",
         "image_column": "image",
         "cache_dir": "./.cache/huggingface",
-        "resolution": 512,
+        "resolution": 256,
         "center_crop": true,
         "random_flip": true
     },
@@ -79,6 +82,7 @@
         "mode": "min"
     },
     "logging": {
+        "project": "sd_vae_baseline",
         "name": "vae_training",
         "log_every_n_steps": 5,
         "val_check_interval": 500,

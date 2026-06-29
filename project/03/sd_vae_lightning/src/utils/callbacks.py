@@ -9,12 +9,14 @@ import json
 
 import torch
 import torch.nn.functional as F
+import torchvision
+import math
+import wandb
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 from pytorch_lightning.utilities.rank_zero import rank_zero_info, rank_zero_only
-import torchvision
-import math
 
 from src.utils.config import save_json_config
 
@@ -63,8 +65,9 @@ class VAELoggingCallback(Callback):
         return metric_name in {
             "train/rec_loss",
             "train/nll_loss",
-            "train/lr",
-            "train/disc_lr",
+            "train/kl_loss",
+            "train/g_loss",
+            "train/d_loss",
         }
 
     def _visualize_latent(
@@ -114,8 +117,13 @@ class VAELoggingCallback(Callback):
         comparison = torch.cat([targets[:n], latent_vis[:n], reconstructions[:n]], dim=0)
         grid = torchvision.utils.make_grid(comparison, nrow=n, padding=2)
 
-        if hasattr(logger, "experiment"):
-            logger.experiment.add_image(f"{prefix}/reconstruction", grid, step)
+        if isinstance(logger, WandbLogger):
+            # wandb.Image expects (H, W, C) numpy array; grid is (C, H, W) tensor
+            grid_np = grid.permute(1, 2, 0).cpu().numpy()
+            logger.experiment.log(
+                {f"{prefix}/reconstruction": wandb.Image(grid_np)},
+                step=step,
+            )
 
     def on_train_batch_end(
             self,

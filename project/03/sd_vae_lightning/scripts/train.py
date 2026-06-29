@@ -33,7 +33,7 @@ from src.utils.training import (
     merge_configs,
     seed_everything,
     build_callbacks,
-    build_tensorboard_logger,
+    build_wandb_logger,
     build_trainer_kwargs,
     find_resume_checkpoint,
 )
@@ -126,7 +126,7 @@ def main():
     callbacks = build_callbacks(config)
 
     # Setup logger
-    logger = build_tensorboard_logger(config)
+    logger = build_wandb_logger(config)
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices

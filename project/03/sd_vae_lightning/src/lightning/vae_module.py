@@ -168,6 +168,20 @@ class VAELightningModule(pl.LightningModule):
         # rFID metric for reconstruction quality evaluation
         self.rfid_metric = rFID(feature_dim=2048, reset_real_features=True)
 
+        # Torch compile configuration
+        compile_config = config.get("compile", {})
+        self.use_torch_compile = compile_config.get("enabled", False)
+        self.compile_kwargs = compile_config.get("kwargs", {})
+
+    def configure_model(self) -> None:
+        """Compile models with torch.compile after moving to device."""
+        if self.use_torch_compile:
+            self.print(f"Compiling VAE with torch.compile (kwargs={self.compile_kwargs})")
+            self.vae = torch.compile(self.vae, **self.compile_kwargs)
+            if self.discriminator is not None:
+                self.print("Compiling discriminator with torch.compile")
+                self.discriminator = torch.compile(self.discriminator, **self.compile_kwargs)
+
     def on_fit_start(self) -> None:
         # Initialize EMA model at the start of training.
         if self.use_ema:

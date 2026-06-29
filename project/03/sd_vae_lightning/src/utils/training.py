@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import pytorch_lightning as pl
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.callbacks import (
     LearningRateMonitor,
@@ -159,14 +159,14 @@ def build_callbacks(cfg: Dict[str, Any]) -> list:
     return callbacks
 
 
-def build_tensorboard_logger(cfg: Dict[str, Any]) -> TensorBoardLogger:
+def build_wandb_logger(cfg: Dict[str, Any]) -> WandbLogger:
     path_config = cfg.get("paths", {})
     logging_config = cfg.get("logging", {})
 
-    return TensorBoardLogger(
-        save_dir=path_config.get("log_dir", "./logs"),
+    return WandbLogger(
+        project=logging_config.get("project", "default"),
         name=logging_config.get("name", "vae_training"),
-        default_hp_metric=False,
+        save_dir=path_config.get("log_dir", "./logs"),
     )
 
 
