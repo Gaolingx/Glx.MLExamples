@@ -13,13 +13,13 @@ import pytorch_lightning as pl
 from dataclasses import asdict, is_dataclass
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
-from diffusers import AutoencoderKL
 from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_scheduler
 import lpips
 import math
 
 from src.utils.metrics import PSNR, SSIM, rFID, PSIM
+from src.models.autoencoder_kl import AutoencoderKL
 from src.models.discriminator import NLayerDiscriminator
 from src.config.base import VAETrainingConfig, OptimizerConfig
 
