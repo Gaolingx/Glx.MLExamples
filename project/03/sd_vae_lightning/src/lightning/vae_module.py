@@ -149,9 +149,6 @@ class VAELightningModule(pl.LightningModule):
         if self.use_torch_compile:
             self.print(f"Compiling VAE with torch.compile (kwargs={self.compile_kwargs})")
             self.vae = torch.compile(self.vae, **self.compile_kwargs)
-            if self.discriminator is not None:
-                self.print("Compiling discriminator with torch.compile")
-                self.discriminator = torch.compile(self.discriminator, **self.compile_kwargs)
 
     def on_fit_start(self) -> None:
         # Initialize EMA model at the start of training.
@@ -440,8 +437,12 @@ class VAELightningModule(pl.LightningModule):
         else:
             # ========== Discriminator losses ==========
 
-            logits_real = self.discriminator(targets.detach())
-            logits_fake = self.discriminator(reconstructions.detach())
+            # Merge real/fake into a single forward pass
+            combined = torch.cat(
+                [targets.detach(), reconstructions.detach()], dim=0
+            )
+            logits_combined = self.discriminator(combined)
+            logits_real, logits_fake = torch.chunk(logits_combined, 2, dim=0)
             disc_loss = self._hinge_d_loss if self.disc_loss_type == "hinge" else self._vanilla_d_loss
 
             # Compute disc_factor based on disc_start_step
