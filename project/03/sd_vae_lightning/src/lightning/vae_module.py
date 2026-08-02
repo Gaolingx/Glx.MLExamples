@@ -545,7 +545,6 @@ class VAELightningModule(pl.LightningModule):
                 gradient_clip_val=self.gradient_clip_val,
                 gradient_clip_algorithm="norm",
             )
-            grad_norm_vae_clip = self._compute_global_norm(self.vae.parameters(), use_grad=True)
             opt_vae.step()
             opt_vae.zero_grad()
 
@@ -566,7 +565,6 @@ class VAELightningModule(pl.LightningModule):
             train_metrics["lr"] = torch.tensor(vae_lr, device=targets.device)
 
             train_metrics["grad_norm_vae"] = grad_norm_vae
-            train_metrics["grad_norm_vae_clip"] = grad_norm_vae_clip
 
         for key, value in vae_loss_dict.items():
             train_metrics[key] = value
@@ -597,7 +595,6 @@ class VAELightningModule(pl.LightningModule):
                     gradient_clip_val=self.gradient_clip_val,
                     gradient_clip_algorithm="norm"
                 )
-                grad_norm_disc_clip = self._compute_global_norm(self.discriminator.parameters(), use_grad=True)
                 opt_disc.step()
                 opt_disc.zero_grad()
 
@@ -610,7 +607,6 @@ class VAELightningModule(pl.LightningModule):
                     train_metrics["disc_lr"] = torch.tensor(disc_lr, device=targets.device)
 
                 train_metrics["grad_norm_disc"] = grad_norm_disc
-                train_metrics["grad_norm_disc_clip"] = grad_norm_disc_clip
 
             g_loss = vae_loss_dict.get("g_loss", torch.tensor(0.0, device=targets.device))
             d_loss = disc_loss_dict.get("d_loss", torch.tensor(1.0, device=targets.device))
